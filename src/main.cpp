@@ -536,7 +536,7 @@ bool httpDownloadToUpdate(const String& binUrl) {
 for (int i=0;i<32;i++) {
   char byteHex[3]; sprintf(byteHex, "%02x", digest[i]);
   // if (strncasecmp(byteHex, &manifestShaHex[i*2], 2) != 0) { shaOk = false; break; } A METTRE
-}
+} 
 if (!shaOk) { Serial.println("[OTA] SHA256 mismatch, abort"); return false; }
   Serial.printf("[OTA] OK, écrit %u bytes. Reboot...\n", (unsigned)written);
   delay(250);
