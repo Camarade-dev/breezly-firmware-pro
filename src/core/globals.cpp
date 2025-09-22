@@ -1,0 +1,31 @@
+#include "globals.h"
+#include <Adafruit_NeoPixel.h>
+#include "../app_config.h"
+bool wifiConnected = false;
+bool needToConnectWiFi = false;
+volatile bool otaInProgress = false;
+unsigned long lastOtaCheck = 0;
+
+Preferences prefs;
+String wifiSSID = "";
+String wifiPassword = "";
+String sensorId = "";
+String userId = "";
+
+WiFiClientSecure tlsClient;
+PubSubClient     mqttClient(tlsClient);
+
+Adafruit_AHTX0   aht;
+ScioSense_ENS160 ens160(0x52);
+
+HardwareSerial& PMS = Serial2;
+PmsData gPms;
+SemaphoreHandle_t gPmsMutex = nullptr;
+
+Adafruit_NeoPixel led(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+volatile LedMode currentLedMode = LED_BOOT;
+volatile bool    ledOverride = false;
+
+unsigned long lastPublish = 0;
+
+uint16_t be16(const uint8_t *b){ return (uint16_t)b[0]<<8 | b[1]; }
