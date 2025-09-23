@@ -118,8 +118,10 @@ void loop(){
     lastOtaCheck = millis();
     s_otaBootTaskScheduled = true;
     xTaskCreatePinnedToCore([](void*){
-      checkAndPerformCloudOTA();
-      s_otaBootTaskScheduled = false;   // libérer le guard si besoin
+      ledSuspend();
+      checkAndPerformCloudOTA();   // reboot si update OK
+      ledResume();                 // relance seulement si pas de reboot
+      s_otaBootTaskScheduled = false;
       vTaskDelete(NULL);
     }, "OTA_BOOT", 16384, NULL, 1, NULL, 0);
   }
@@ -131,7 +133,9 @@ void loop(){
       lastOtaCheck = now;
       s_otaTickTaskScheduled = true;
       xTaskCreatePinnedToCore([](void*){
-        checkAndPerformCloudOTA();
+          ledSuspend();
+          checkAndPerformCloudOTA();   // reboot si update OK
+          ledResume();                 // relance seulement si pas de reboot
         s_otaTickTaskScheduled = false;
         vTaskDelete(NULL);
       }, "OTA_TICK", 16384, NULL, 1, NULL, 0);
