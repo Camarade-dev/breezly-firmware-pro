@@ -20,6 +20,17 @@ static bool s_advertising   = false;
 
 extern bool bleInited;  // exporté via header
 
+void provisioningSetStatus(const char* json){
+  if (statusCharacteristic){
+    statusCharacteristic->setValue(json);
+    statusCharacteristic->notify();
+  }
+}
+
+void provisioningNotifyConnected(){
+  provisioningSetStatus("{\"status\":\"connected\"}");
+}
+
 // --- Helpers -----------------------------------------------------------------
 static void configureAdvertising() {
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
@@ -88,10 +99,7 @@ class CredentialsCallback : public NimBLECharacteristicCallbacks {
 
     needToConnectWiFi = true;
 
-    if (statusCharacteristic){
-      statusCharacteristic->setValue("{\"status\":\"credentials_ok\"}");
-      statusCharacteristic->notify();
-    }
+    provisioningSetStatus("{\"status\":\"connecting\"}");
   }
 };
 
