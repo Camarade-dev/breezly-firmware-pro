@@ -34,7 +34,6 @@ void setup(){
   
 
   WiFi.disconnect(true);
-
   prefs.begin("myApp", true);
   wifiSSID     = prefs.getString("wifiSSID", "");
   wifiPassword = prefs.getString("wifiPassword", "");
@@ -81,6 +80,12 @@ void setup(){
   }
   esp_task_wdt_init(30, true);
   esp_task_wdt_add(NULL);
+  if (wifiConnected && !mqttClient.connected()) {
+    Serial.println("[MQTT] Tentative initiale post-WiFi");
+    if (connectToMQTT()) {
+      mqttSubscribeOtaTopic();
+    }
+  }
   sensorsInit();
   gPmsMutex = xSemaphoreCreateMutex();
   pmsTaskStart(16, 17);
@@ -98,8 +103,18 @@ void setup(){
 }
 
 void loop(){
+  if (otaIsInProgress()) {
+    // Pas de publish capteurs, pas de mqttClient.loop()
+    esp_task_wdt_reset();
+    delay(10);
+  } 
+  else{
+    // <- ton code “normal” (publish capteurs, mqttClient.loop(), etc.)
+  
+
   // ★ Check OTA au premier boot Wi-Fi, 1 seule fois
-  if (wifiConnected && !otaInProgress && lastOtaCheck==0 && !s_otaBootTaskScheduled){
+  if (wifiConnected && !otaIsInProgress() && lastOtaCheck==0 && !s_otaBootTaskScheduled){
+    Serial.println("[OTA] Check au boot Wi-Fi");
     lastOtaCheck = millis();
     s_otaBootTaskScheduled = true;
     xTaskCreatePinnedToCore([](void*){
@@ -173,6 +188,8 @@ void loop(){
       }
     }
   }
+  }
+
 
   mqttLoopOnce();
   esp_task_wdt_reset();

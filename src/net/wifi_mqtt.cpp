@@ -10,7 +10,9 @@ static const char* MQTT_HOST = "607207c4394d44b8bad11a33e8ed591d.s1.eu.hivemq.cl
 static const int   MQTT_PORT = 8883;
 static const char* MQTT_USER = "admin";
 static const char* MQTT_PASS = "26052004Sg";
-
+static unsigned long s_lastMqttAttemptMs = 0;
+static uint32_t      s_mqttBackoffMs     = 1000;   // 1s initial
+static const uint32_t MQTT_BACKOFF_MAX   = 60000;  // 60s max
 static void mqttCallback(char* topic, byte* payload, unsigned int length){
   String msg; msg.reserve(length);
   for (unsigned i=0;i<length;i++) msg += (char)payload[i];
@@ -85,4 +87,32 @@ void mqttSubscribeOtaTopic(){
   else                                        Serial.printf("[MQTT] Subscribe FAIL: %s\n", otaTopic.c_str());
 }
 
-void mqttLoopOnce(){ mqttClient.loop(); }
+void mqttLoopOnce(){
+  // Si Wi-Fi KO → on s’assure que MQTT est down proprement
+  if (!wifiConnected){
+    if (mqttClient.connected()){
+      // mqttPublishOnlineStatus(false); // si utilisé
+      mqttClient.disconnect();
+      Serial.println("[MQTT] Déconnecté (WiFi KO)");
+    }
+    return;
+  }
+
+  // Wi-Fi OK
+  if (mqttClient.connected()){
+    mqttClient.loop();
+    return;
+  }
+
+  // Wi-Fi OK mais MQTT KO → retry avec backoff
+  unsigned long now = millis();
+  if ((long)(now - s_lastMqttAttemptMs) >= (long)s_mqttBackoffMs){
+    s_lastMqttAttemptMs = now;
+    if (!connectToMQTT()){
+      s_mqttBackoffMs = s_mqttBackoffMs < MQTT_BACKOFF_MAX
+        ? min<uint32_t>(MQTT_BACKOFF_MAX, s_mqttBackoffMs << 1)
+        : MQTT_BACKOFF_MAX;
+      Serial.printf("[MQTT] Retry dans %lums\n", (unsigned long)s_mqttBackoffMs);
+    }
+  }
+}
