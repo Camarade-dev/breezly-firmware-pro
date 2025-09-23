@@ -147,15 +147,15 @@ static bool verifyManifestSignature(const String& canonical, const String& sigB6
   OTA_LOG("[OTA] manifest signature %s", ok==0 ? "OK" : "INVALID");
   return ok==0;
 }
+// ====== DOWNLOAD & FLASH : TLS manuel simple + retries ======
 static bool httpDownloadToUpdate(const String& binUrl,
                                  uint32_t expectedSize,
                                  const String& expectedSha256Hex,
                                  WiFiClientSecure& wcs) {
-  OTA_LOG("[OTA] Download start (manual TLS GET)");
+  OTA_LOG("[OTA] Download start (TLS manual)");
   OTA_HEAP("before tls");
+  logPartitions();
 
-  // --- parse URL ---
-  // binUrl = https://host/path...
   if (!binUrl.startsWith("https://")) { OTA_LOG("[OTA] URL must be https"); return false; }
   String hostPath = binUrl.substring(strlen("https://"));
   int slash = hostPath.indexOf('/');
@@ -163,40 +163,42 @@ static bool httpDownloadToUpdate(const String& binUrl,
   String host = hostPath.substring(0, slash);
   String path = hostPath.substring(slash);
 
-  // --- MQTT off, LED, flags ---
   if (mqttClient.connected()) { mqttClient.disconnect(); OTA_LOG("[OTA] MQTT disconnected for OTA"); }
   g_otaInProgress = true; otaInProgress = true; updateLedState(LED_UPDATING);
 
-  // --- TLS connect ---
   wcs.setCACert(CA_BUNDLE_PEM);
-  wcs.setTimeout(15000);
-  OTA_LOG("[OTA] TLS connect to %s:443", host.c_str());
-  if (!wcs.connect(host.c_str(), 443)) {
+  wcs.setTimeout(30000);
+
+  bool tlsOK = false;
+  for (int i=1;i<=3 && !tlsOK;i++){
+    OTA_LOG("[OTA] TLS connect to %s:443 (try %d/3)", host.c_str(), i);
+    if (wcs.connect(host.c_str(), 443)) tlsOK = true;
+    else delay(300);
+  }
+  if (!tlsOK){
     OTA_LOG("[OTA] TLS connect FAIL");
     g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD);
     return false;
   }
 
-  // --- HTTP/1.0 GET (Connection: close) ---
   String req;
   req.reserve(256);
-  req += "GET " + path + " HTTP/1.0\r\n";
+  req += "GET " + path + " HTTP/1.1\r\n";
   req += "Host: " + host + "\r\n";
   req += "User-Agent: esp32-ota\r\n";
   req += "Accept: */*\r\n";
   req += "Accept-Encoding: identity\r\n";
   req += "Connection: close\r\n\r\n";
+
   if (wcs.print(req) != (int)req.length()) {
     OTA_LOG("[OTA] write request FAIL");
     wcs.stop(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD);
     return false;
   }
 
-  // --- lire l'entête ---
   OTA_LOG("[OTA] waiting headers...");
   unsigned long t0 = millis();
-  String statusLine = wcs.readStringUntil('\n'); // inclut le \r éventuellement
-  statusLine.trim();
+  String statusLine = wcs.readStringUntil('\n'); statusLine.trim();
   OTA_LOG("[OTA] status: %s", statusLine.c_str());
   if (!statusLine.startsWith("HTTP/1.1 200") && !statusLine.startsWith("HTTP/1.0 200")) {
     OTA_LOG("[OTA] HTTP not 200");
@@ -208,21 +210,19 @@ static bool httpDownloadToUpdate(const String& binUrl,
   bool chunked = false;
   while (true) {
     String h = wcs.readStringUntil('\n'); h.trim();
-    if (h.length()==0) break; // fin des headers
-    if (h.startsWith("Content-Length:") || h.startsWith("content-length:")) {
+    if (h.length()==0) break;
+    if (h.startsWith("Content-Length:") || h.startsWith("content-length:"))
       contentLen = h.substring(h.indexOf(':')+1).toInt();
-    } else if (h.startsWith("Transfer-Encoding:") && h.indexOf("chunked")>0) {
+    else if (h.startsWith("Transfer-Encoding:") && h.indexOf("chunked")>0)
       chunked = true;
-    }
   }
   OTA_LOG("[OTA] headers: len=%d chunked=%d", contentLen, (int)chunked);
-  if (chunked) { OTA_LOG("[OTA] chunked not supported here"); wcs.stop(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false; }
+  if (chunked) { OTA_LOG("[OTA] chunked not supported"); wcs.stop(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false; }
   if (expectedSize>0 && contentLen>0 && (uint32_t)contentLen!=expectedSize) {
     OTA_LOG("[OTA] length mismatch hdr=%d expected=%u", contentLen, (unsigned)expectedSize);
     wcs.stop(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false;
   }
 
-  // --- préparer Update ---
   const esp_partition_t* next = esp_ota_get_next_update_partition(NULL);
   if (!next){ OTA_LOG("[OTA] No OTA partition"); wcs.stop(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false; }
   size_t beginSize = (expectedSize>0)? expectedSize : (contentLen>0? (size_t)contentLen : UPDATE_SIZE_UNKNOWN);
@@ -235,7 +235,6 @@ static bool httpDownloadToUpdate(const String& binUrl,
     wcs.stop(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false;
   }
 
-  // --- boucle lecture/copie ---
   const size_t CH = 2048;
   uint8_t* buf = (uint8_t*)heap_caps_malloc(CH, MALLOC_CAP_8BIT);
   if (!buf) { OTA_LOG("[OTA] malloc FAIL"); wcs.stop(); Update.end(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false; }
@@ -267,6 +266,7 @@ static bool httpDownloadToUpdate(const String& binUrl,
         OTA_HEAP("stream");
       }
     } else {
+      if (!wcs.connected() && wcs.available()==0) break;
       if (millis()-lastProgress > NO_PROGRESS_ABORT_MS) {
         OTA_LOG("[OTA] no progress for %lu ms → abort", (unsigned long)(millis()-lastProgress));
         free(buf); wcs.stop(); Update.abort(); mbedtls_sha256_free(&sha);
@@ -276,10 +276,10 @@ static bool httpDownloadToUpdate(const String& binUrl,
     }
     esp_task_wdt_reset();
   }
+
   free(buf);
   wcs.stop();
 
-  // --- finalisation ---
   if (!Update.end()) {
     OTA_LOG("[OTA] end err=%u", Update.getError());
     mbedtls_sha256_free(&sha); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false;
@@ -300,7 +300,9 @@ static bool httpDownloadToUpdate(const String& binUrl,
   }
 
   unsigned long dt = millis()-t0;
-  OTA_LOG("[OTA] OK flashed %u bytes in %lums", (unsigned)written, dt);
+  float kb = written/1024.0f;
+  float kbps = dt? (1000.0f*kb/dt) : 0.0f;
+  OTA_LOG("[OTA] OK flashed %u bytes in %lums (%.1f KB/s)", (unsigned)written, dt, kbps);
 
   Preferences p; p.begin("ota", false); p.putBool("pending", true); p.putUShort("fail", 0); p.end();
 
@@ -309,6 +311,7 @@ static bool httpDownloadToUpdate(const String& binUrl,
   ESP.restart();
   return true;
 }
+
 
 // ====== 4) CHECK CLOUD OTA ======
 static unsigned long g_lastCheckMs = 0;

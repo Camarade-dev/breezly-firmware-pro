@@ -1,9 +1,30 @@
 #include "led_status.h"
+#include <Arduino.h>
+// (assume: objet global Adafruit_NeoPixel led; currentLedMode/ledOverride existent)
+
+static TaskHandle_t s_ledTask = nullptr;
+static volatile bool s_ledMuted = false;
 
 void ledInit(uint8_t, uint8_t){
   led.begin();
   led.setBrightness(50);
   led.show();
+}
+
+bool ledIsMuted(){ return s_ledMuted; }
+
+// Coupe toute activité LED (aucun show RMT pendant TLS/OTA)
+void ledSuspend(){
+  s_ledMuted = true;
+  // Option dur : gel de la tâche (facultatif si le check dans la loop suffit)
+  if (s_ledTask) vTaskSuspend(s_ledTask);
+  // NE PAS faire de led.show() ici → on veut zéro RMT pendant l’OTA
+}
+
+// Relance l’anim LED après l’OTA (si pas de reboot)
+void ledResume(){
+  if (s_ledTask) vTaskResume(s_ledTask);
+  s_ledMuted = false;
 }
 
 void updateLedState(LedMode mode){
@@ -15,6 +36,13 @@ static void ledTask(void *){
   bool up = true;
 
   for(;;){
+
+    // --- MUTE GLOBAL : aucune écriture RMT tant que c'est vrai ---
+    if (s_ledMuted){
+      vTaskDelay(40/portTICK_PERIOD_MS);
+      continue;
+    }
+
     switch (currentLedMode) {
       case LED_BOOT:
         led.setPixelColor(0, led.Color(0,0,150)); 
@@ -46,29 +74,21 @@ static void ledTask(void *){
         led.show(); 
         break;
 
-      case LED_UPDATING: // 👈 cyan breathing (plus lent)
-        // Cyan = G/B synchronisés ; distinct du GOOD/MODERATE
+      case LED_UPDATING: // cyan breathing (lent)
         led.setPixelColor(0, led.Color(0, brightness, brightness)); 
         led.show(); 
         break;
     }
 
-    // Animation “breathing” avec vitesse différente pour UPDATING
+    // Breathing
     if (currentLedMode==LED_GOOD || currentLedMode==LED_MODERATE || currentLedMode==LED_UPDATING){
-      // montée/descente
       brightness += (up ? 5 : -5);
-      // bornes
-      int maxB = 150;         // pic lumière
-      int minB = 10;          // plancher
+      int maxB = 150, minB = 10;
       if (brightness >= maxB){ brightness = maxB; up = false; }
       if (brightness <= minB){ brightness = minB; up = true; }
-
-      // vitesse : UPDATING un poil plus lent → 40ms
       int delayMs = (currentLedMode==LED_UPDATING) ? 40 : 30;
       vTaskDelay(delayMs/portTICK_PERIOD_MS);
-
     } else if (currentLedMode==LED_BAD){
-      // rouge fixe : tempo courte pour libérer le CPU
       brightness = 255; 
       up = true; 
       vTaskDelay(100/portTICK_PERIOD_MS);
@@ -77,5 +97,6 @@ static void ledTask(void *){
 }
 
 void ledTaskStart(){ 
-  xTaskCreatePinnedToCore(ledTask, "LED", 8192, 0, 1, 0, 1); 
+  // >>> garde le handle pour suspend/resume
+  xTaskCreatePinnedToCore(ledTask, "LED", 8192, nullptr, 1, &s_ledTask, 1);
 }
