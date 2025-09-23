@@ -10,7 +10,7 @@
 #include <freertos/semphr.h>
 
 // === LED modes (même noms qu'avant)
-enum LedMode { LED_BOOT, LED_PAIRING, LED_GOOD, LED_MODERATE, LED_BAD };
+enum LedMode { LED_BOOT, LED_PAIRING, LED_GOOD, LED_MODERATE, LED_BAD, LED_UPDATING, LED_OFF };
 
 // === PMS
 struct PmsData {
@@ -27,7 +27,9 @@ extern bool wifiConnected;
 extern bool needToConnectWiFi;
 extern volatile bool otaInProgress;
 extern unsigned long lastOtaCheck;
-
+extern uint8_t      wifiFailCount;
+extern unsigned long lastWifiAttemptMs;
+extern bool         bleInited;
 extern Preferences prefs;
 extern String wifiSSID, wifiPassword, sensorId, userId;
 
