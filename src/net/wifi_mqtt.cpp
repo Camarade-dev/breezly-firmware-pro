@@ -4,6 +4,7 @@
 #include "../core/globals.h"
 #include "../ota/ota.h"
 #include "ble/provisioning.h"
+
 // Broker: tes valeurs
 static const char* MQTT_HOST = "607207c4394d44b8bad11a33e8ed591d.s1.eu.hivemq.cloud";
 static const int   MQTT_PORT = 8883;
@@ -29,21 +30,29 @@ static bool bleInitStarted = false;
 bool connectToWiFi(){
   if (wifiSSID.isEmpty() || wifiPassword.isEmpty()){
     Serial.println("[WiFi] SSID/PWD manquants");
+    provisioningSetStatus("{\"status\":\"missing_fields\"}");
     return false;
   }
+
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
   Serial.printf("[WiFi] Connexion à '%s'...\n", wifiSSID.c_str());
   for (int i=0;i<20 && WiFi.status()!=WL_CONNECTED;i++){ delay(500); Serial.print("."); }
+
   if (WiFi.status()==WL_CONNECTED){
     Serial.printf("\n[WiFi] OK IP=%s\n", WiFi.localIP().toString().c_str());
     wifiConnected = true;
+
+    // ✅ C’est ICI qu’on notifie l’app que c’est bon
+    provisioningNotifyConnected();
+
     return true;
   } else {
     Serial.println("\n[WiFi] ÉCHEC");
     wifiConnected = false;
 
-    // ✅ démarre proprement BLE si pas déjà fait
+    provisioningSetStatus("{\"status\":\"error\"}");
+
     if (!bleInited && !bleInitStarted) {
       bleInitStarted = true;
       Serial.println("[BLE] Init différée -> démarrage maintenant (après échec Wi-Fi).");
@@ -51,11 +60,9 @@ bool connectToWiFi(){
     } else if (bleInited) {
       restartBLEAdvertising();
     }
-
     return false;
   }
 }
-
 
 
 bool connectToMQTT(){
