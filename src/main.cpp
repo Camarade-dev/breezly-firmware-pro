@@ -12,7 +12,8 @@
 
 #include "esp_task_wdt.h"
 #include <ArduinoJson.h>
-
+static volatile bool s_otaBootTaskScheduled = false;
+static volatile bool s_otaTickTaskScheduled = false;
 static const unsigned long WIFI_RETRY_BACKOFF_MS = 15000; // 15s
 static const uint8_t WIFI_FAILS_BEFORE_PROV = 1;          // dès le 1er échec, on ouvre BLE
 
@@ -24,7 +25,7 @@ void setup(){
   delay(4000);
   Serial.begin(115200);
   Serial.printf("Flash chip size: %u MB\n", ESP.getFlashChipSize()/(1024*1024));
-
+  otaOnBootValidate(); 
   esp_task_wdt_deinit();
   
 
@@ -44,18 +45,6 @@ void setup(){
   bool valid  = preferencesAreValid();
   bool manque = (wifiSSID.isEmpty() || wifiPassword.isEmpty());
   bool needProv = (!valid || manque);
-
-  Preferences p; p.begin("ota", true);
-  bool pending = p.getBool("pending", false);
-  p.end();
-
-  if (pending) {
-    // Health check minimal : attendre 10s de loop stable
-    unsigned long t0 = millis();
-    while (millis()-t0 < 10000) { esp_task_wdt_reset(); delay(10); }
-    Preferences w; w.begin("ota", false); w.putBool("pending", false); w.end();
-    Serial.println("[BOOT] OTA marked healthy");
-  }
 
 
   Serial.println("----- PREFS -----");
@@ -109,38 +98,45 @@ void setup(){
 }
 
 void loop(){
-  if (wifiConnected && !otaInProgress && lastOtaCheck==0){
+  // ★ Check OTA au premier boot Wi-Fi, 1 seule fois
+  if (wifiConnected && !otaInProgress && lastOtaCheck==0 && !s_otaBootTaskScheduled){
     lastOtaCheck = millis();
+    s_otaBootTaskScheduled = true;
     xTaskCreatePinnedToCore([](void*){
       checkAndPerformCloudOTA();
-      vTaskDelete(0);
-    }, "OTA_BOOT", 16384, 0, 1, 0, 0);
+      s_otaBootTaskScheduled = false;   // libérer le guard si besoin
+      vTaskDelete(NULL);
+    }, "OTA_BOOT", 16384, NULL, 1, NULL, 0);
   }
 
+  // ★ Check OTA périodique
   if (!otaInProgress && wifiConnected){
     unsigned long now = millis();
-    if ((long)(now - lastOtaCheck) >= (long)OTA_CHECK_INTERVAL_MS){
+    if ((long)(now - lastOtaCheck) >= (long)OTA_CHECK_INTERVAL_MS && !s_otaTickTaskScheduled){
       lastOtaCheck = now;
+      s_otaTickTaskScheduled = true;
       xTaskCreatePinnedToCore([](void*){
         checkAndPerformCloudOTA();
-        vTaskDelete(0);
-      }, "OTA_TICK", 16384, 0, 1, 0, 0);
+        s_otaTickTaskScheduled = false;
+        vTaskDelete(NULL);
+      }, "OTA_TICK", 16384, NULL, 1, NULL, 0);
     }
   }
 
+  // Provisioning → nouveaux identifiants reçus
   if (!wifiConnected && needToConnectWiFi){
     needToConnectWiFi = false;   // évite plusieurs déclenchements
     Serial.println("[WiFi] tentative suite à nouveaux identifiants (BLE)");
-    connectToWiFi(); // échec => restartBLEAdvertising() est appelé à l'intérieur, comme avant
+    connectToWiFi(); // échec => restartBLEAdvertising() à l'intérieur comme avant
     if (wifiConnected) {
       updateLedState(LED_BOOT);
-      if (connectToMQTT()) mqttSubscribeOtaTopic();
+      if (connectToMQTT()) mqttSubscribeOtaTopic(); // tu peux déclencher triggerOtaCheckNow() dans ton callback
     } else {
       updateLedState(LED_PAIRING);
     }
   }
 
-
+  // Publish capteurs
   if (mqttClient.connected()){
     unsigned long now = millis();
     if ((long)(now - lastPublish) >= 5000){
