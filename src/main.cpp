@@ -13,18 +13,24 @@
 #include "esp_task_wdt.h"
 #include <ArduinoJson.h>
 
+static const unsigned long WIFI_RETRY_BACKOFF_MS = 15000; // 15s
+static const uint8_t WIFI_FAILS_BEFORE_PROV = 1;          // dès le 1er échec, on ouvre BLE
+
+// --- Trampo pour init BLE sur core 0 ---
+static bool s_bleStartAdv = false;
+
+
 void setup(){
-  delay(1000);
+  delay(4000);
   Serial.begin(115200);
   Serial.printf("Flash chip size: %u MB\n", ESP.getFlashChipSize()/(1024*1024));
 
   esp_task_wdt_deinit();
-  esp_task_wdt_init(30, true);
-  esp_task_wdt_add(NULL);
+  
 
   ledInit(LED_PIN, LED_COUNT);
   updateLedState(LED_BOOT);
-  ledTaskStart();
+  
 
   WiFi.disconnect(true);
 
@@ -39,6 +45,19 @@ void setup(){
   bool manque = (wifiSSID.isEmpty() || wifiPassword.isEmpty());
   bool needProv = (!valid || manque);
 
+  Preferences p; p.begin("ota", true);
+  bool pending = p.getBool("pending", false);
+  p.end();
+
+  if (pending) {
+    // Health check minimal : attendre 10s de loop stable
+    unsigned long t0 = millis();
+    while (millis()-t0 < 10000) { esp_task_wdt_reset(); delay(10); }
+    Preferences w; w.begin("ota", false); w.putBool("pending", false); w.end();
+    Serial.println("[BOOT] OTA marked healthy");
+  }
+
+
   Serial.println("----- PREFS -----");
   Serial.printf("SSID: %s\n", wifiSSID.c_str());
   Serial.printf("PWD : %s\n", wifiPassword.c_str());
@@ -46,21 +65,33 @@ void setup(){
   Serial.printf("UID : %s\n", userId.c_str());
   Serial.printf("valid=%d manque=%d needProv=%d\n", (int)valid,(int)manque,(int)needProv);
   Serial.println("-----------------");
-  if(needProv){
-    setupBLE(true);
-  }
-  else{
-    Serial.println("Pas besoin de provisioning");
-  }
-  if (needProv){ updateLedState(LED_PAIRING); Serial.println("En attente provisioning BLE..."); }
 
-  if (!manque && connectToWiFi()){
-    updateLedState(LED_BOOT);
-    if (connectToMQTT()) mqttSubscribeOtaTopic();
-  } else {
-    restartBLEAdvertising();
+  setupBLE(needProv);  // ← démarre BLE tout de suite si provisioning requis
+
+  // (optionnel) attendre un peu:
+  uint32_t t0 = millis();
+  while(!bleInited && millis()-t0 < 2000) { esp_task_wdt_reset(); delay(10); }
+
+  ledTaskStart();
+  // 2) Tenter la connexion Wi-Fi immédiate si on a des identifiants
+  //    (en cas d’échec, connectToWiFi() s’occupe de relancer l’advertising BLE)
+  if (!manque) {
+    Serial.println("Tentative de connexion avec les identifiants sauvegardés...");
+    connectToWiFi();
   }
 
+  // 3) Si provisioning nécessaire : LED pairing + attente jusqu’à connexion Wi-Fi
+  if (needProv) {
+    updateLedState(LED_PAIRING);
+    Serial.println("En attente provisioning BLE...");
+    while (!wifiConnected) {
+      delay(500);
+      esp_task_wdt_reset();
+    }
+    Serial.println("Wi-Fi connecté, provisioning terminé.");
+  }
+  esp_task_wdt_init(30, true);
+  esp_task_wdt_add(NULL);
   sensorsInit();
   gPmsMutex = xSemaphoreCreateMutex();
   pmsTaskStart(16, 17);
@@ -74,6 +105,7 @@ void setup(){
   }
 
   Serial.println("[BOOT] Setup terminé");
+  lastWifiAttemptMs = millis();
 }
 
 void loop(){
@@ -96,11 +128,18 @@ void loop(){
     }
   }
 
-  if (!wifiConnected) {
-    if (connectToWiFi() && connectToMQTT()) mqttSubscribeOtaTopic();
-  } else if (!mqttClient.connected()){
-    if (connectToMQTT()) mqttSubscribeOtaTopic();
+  if (!wifiConnected && needToConnectWiFi){
+    needToConnectWiFi = false;   // évite plusieurs déclenchements
+    Serial.println("[WiFi] tentative suite à nouveaux identifiants (BLE)");
+    connectToWiFi(); // échec => restartBLEAdvertising() est appelé à l'intérieur, comme avant
+    if (wifiConnected) {
+      updateLedState(LED_BOOT);
+      if (connectToMQTT()) mqttSubscribeOtaTopic();
+    } else {
+      updateLedState(LED_PAIRING);
+    }
   }
+
 
   if (mqttClient.connected()){
     unsigned long now = millis();

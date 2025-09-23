@@ -3,7 +3,7 @@
 #include <PubSubClient.h>
 #include "../core/globals.h"
 #include "../ota/ota.h"
-
+#include "ble/provisioning.h"
 // Broker: tes valeurs
 static const char* MQTT_HOST = "607207c4394d44b8bad11a33e8ed591d.s1.eu.hivemq.cloud";
 static const int   MQTT_PORT = 8883;
@@ -24,6 +24,7 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length){
     }, "OTA_TASK", 8192, 0, 1, 0, 0);
   }
 }
+static bool bleInitStarted = false;
 
 bool connectToWiFi(){
   if (wifiSSID.isEmpty() || wifiPassword.isEmpty()){
@@ -36,12 +37,26 @@ bool connectToWiFi(){
   for (int i=0;i<20 && WiFi.status()!=WL_CONNECTED;i++){ delay(500); Serial.print("."); }
   if (WiFi.status()==WL_CONNECTED){
     Serial.printf("\n[WiFi] OK IP=%s\n", WiFi.localIP().toString().c_str());
-    wifiConnected = true; return true;
+    wifiConnected = true;
+    return true;
   } else {
     Serial.println("\n[WiFi] ÉCHEC");
-    wifiConnected = false; return false;
+    wifiConnected = false;
+
+    // ✅ démarre proprement BLE si pas déjà fait
+    if (!bleInited && !bleInitStarted) {
+      bleInitStarted = true;
+      Serial.println("[BLE] Init différée -> démarrage maintenant (après échec Wi-Fi).");
+      setupBLE(true);
+    } else if (bleInited) {
+      restartBLEAdvertising();
+    }
+
+    return false;
   }
 }
+
+
 
 bool connectToMQTT(){
   if (!wifiConnected) return false;

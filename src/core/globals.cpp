@@ -5,7 +5,9 @@ bool wifiConnected = false;
 bool needToConnectWiFi = false;
 volatile bool otaInProgress = false;
 unsigned long lastOtaCheck = 0;
-
+uint8_t       wifiFailCount = 0;
+unsigned long lastWifiAttemptMs = 0;
+bool          bleInited = false;
 Preferences prefs;
 String wifiSSID = "";
 String wifiPassword = "";
