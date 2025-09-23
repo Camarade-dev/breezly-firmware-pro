@@ -2,7 +2,7 @@
 
 #define CURRENT_FIRMWARE_VERSION "1.0.3"
 static const char* FW_MANIFEST_URL =
-  "https://breezly-backend.onrender.com/firmware/esp32/wroom32e/prod/manifest.json";
+  "https://breezly-backend.onrender.com/firmware/esp32/wroom32e/prod/latest.json";
 
 #define LED_PIN   13
 #define LED_COUNT 1
