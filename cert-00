@@ -1,0 +1,7 @@
+CONNECTED(000001D8)
+---
+Certificate chain
+ 0 s:CN=*.rezoleo.fr
+   i:C=US, O=Let's Encrypt, CN=E6
+   a:PKEY: id-ecPublicKey, 256 (bit); sigalg: ecdsa-with-SHA384
+   v:NotBefore: Aug 16 01:40:29 2025 GMT; NotAfter: Nov 14 01:40:28 2025 GMT
