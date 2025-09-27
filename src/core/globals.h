@@ -22,6 +22,11 @@ struct PmsData {
   uint32_t seq=0;
 };
 
+enum WifiAuthType : uint8_t {
+  WIFI_CONN_PSK = 0,                  // SSID + password
+  WIFI_CONN_EAP_PEAP_MSCHAPV2 = 1     // Enterprise (PEAP/MSCHAPv2 + CA)
+};
+
 // ==== GLOBAUX (définis dans globals.cpp) ====
 extern bool wifiConnected;
 extern bool needToConnectWiFi;
@@ -50,3 +55,21 @@ extern volatile bool    ledOverride;
 extern unsigned long lastPublish;
 
 uint16_t be16(const uint8_t *b);
+
+// ==== Ajout: sélection d'auth + credentials EAP ====
+extern WifiAuthType wifiAuthType;
+extern String eapIdentity;   // inner identity (souvent = username) (optionnel)
+extern String eapUsername;   // inner username (MSCHAPv2)
+extern String eapPassword;   // inner password
+extern String eapAnon;       // outer anonymous identity (ex: "ano@rezoleo.fr")
+
+// ==== API réseau ====
+bool connectToWiFi();               // route PSK/EAP
+bool connectToWiFiEnterprise();     // EAP-PEAP/MSCHAPv2 + CA
+void startSNTPAfterConnected();     // SNTP après Wi-Fi connecté
+
+// ==== Helpers capteurs (déjà existants chez toi) ====
+bool safeSensorRead(float& t, float& h);
+void sensorsReadEns160(int& aqi,int& tvoc,int& eco2,float t,float h);
+
+// (updateLedState est ailleurs chez toi)

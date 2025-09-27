@@ -9,6 +9,7 @@
 #include "net/wifi_mqtt.h"
 #include "ota/ota.h"
 #include "sensors/sensors.h"
+#include <WiFi.h>
 
 #include "esp_task_wdt.h"
 #include <ArduinoJson.h>
@@ -39,7 +40,23 @@ void setup(){
   wifiPassword = prefs.getString("wifiPassword", "");
   sensorId     = prefs.getString("sensorId", "");
   userId       = prefs.getString("userId", "");
+  wifiAuthType = (WifiAuthType)prefs.getUInt("wifiAuthType", (uint32_t)WIFI_CONN_PSK);
+  // EAP
+  eapIdentity  = prefs.getString("eapIdentity", "");
+  eapUsername  = prefs.getString("eapUsername", "");
+  eapPassword  = prefs.getString("eapPassword", "");
+  eapAnon      = prefs.getString("eapAnon", "ano@rezoleo.fr");
   prefs.end();
+
+  Serial.printf("authType=%u (0=PSK,1=EAP)\n", (unsigned)wifiAuthType);
+  if (wifiAuthType == WIFI_CONN_EAP_PEAP_MSCHAPV2) {
+    Serial.printf("EAP SSID: %s\n", wifiSSID.c_str());
+    Serial.printf("EAP user: %s\n", eapUsername.c_str());
+    Serial.printf("EAP anon: %s\n", eapAnon.c_str());
+  } else {
+    Serial.printf("SSID: %s\n", wifiSSID.c_str());
+  }
+
 
   bool valid  = preferencesAreValid();
   bool manque = (wifiSSID.isEmpty() || wifiPassword.isEmpty());
@@ -78,13 +95,16 @@ void setup(){
     }
     Serial.println("Wi-Fi connecté, provisioning terminé.");
   }
-  esp_task_wdt_init(30, true);
+  esp_task_wdt_config_t twdt_cfg = {};
+  twdt_cfg.timeout_ms     = 30 * 1000;
+  twdt_cfg.idle_core_mask = ((1U << portNUM_PROCESSORS) - 1U);
+  twdt_cfg.trigger_panic  = true;
+  ESP_ERROR_CHECK( esp_task_wdt_init(&twdt_cfg) );
+
   esp_task_wdt_add(NULL);
   if (wifiConnected && !mqttClient.connected()) {
     Serial.println("[MQTT] Tentative initiale post-WiFi");
-    if (connectToMQTT()) {
-      mqttSubscribeOtaTopic();
-    }
+    scheduleMqttConnect();   // <-- asynchrone, ne bloque pas loopTask
   }
   sensorsInit();
   gPmsMutex = xSemaphoreCreateMutex();
@@ -118,12 +138,13 @@ void loop(){
     lastOtaCheck = millis();
     s_otaBootTaskScheduled = true;
     xTaskCreatePinnedToCore([](void*){
-      ledSuspend();
-      checkAndPerformCloudOTA();   // reboot si update OK
-      ledResume();                 // relance seulement si pas de reboot
-      s_otaBootTaskScheduled = false;
+      // Cette task n’empêche plus loopTask de tourner
+      esp_task_wdt_add(NULL);
+      checkAndPerformCloudOTA();
+      esp_task_wdt_delete(NULL);
       vTaskDelete(NULL);
-    }, "OTA_BOOT", 16384, NULL, 1, NULL, 0);
+    }, "OTA_BOOT", 8192, nullptr, 1, nullptr, 0);
+
   }
 
   // ★ Check OTA périodique
@@ -149,7 +170,7 @@ void loop(){
     connectToWiFi(); // échec => restartBLEAdvertising() à l'intérieur comme avant
     if (wifiConnected) {
       updateLedState(LED_BOOT);
-      if (connectToMQTT()) mqttSubscribeOtaTopic(); // tu peux déclencher triggerOtaCheckNow() dans ton callback
+      scheduleMqttConnect();   // <-- asynchrone
     } else {
       updateLedState(LED_PAIRING);
     }

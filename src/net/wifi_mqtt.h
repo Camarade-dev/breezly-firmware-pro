@@ -5,3 +5,4 @@ bool connectToWiFi();
 bool connectToMQTT();
 void mqttSubscribeOtaTopic();
 void mqttLoopOnce();
+void scheduleMqttConnect();
