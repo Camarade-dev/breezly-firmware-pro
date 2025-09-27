@@ -138,9 +138,12 @@ static bool verifyManifestSignature(const String& canonical, const String& sigB6
   }
   OTA_VLOG("[OTA] sig decoded len=%u", (unsigned)olen);
   unsigned char hash[32];
-  mbedtls_sha256_context ctx; mbedtls_sha256_init(&ctx); mbedtls_sha256_starts_ret(&ctx, 0);
-  mbedtls_sha256_update_ret(&ctx, (const unsigned char*)canonical.c_str(), canonical.length());
-  mbedtls_sha256_finish_ret(&ctx, hash); mbedtls_sha256_free(&ctx);
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx); 
+  mbedtls_sha256_starts(&ctx, 0);
+  mbedtls_sha256_update(&ctx, (const unsigned char*)canonical.c_str(), canonical.length());
+  mbedtls_sha256_finish(&ctx, hash);
+  mbedtls_sha256_free(&ctx);
 
   int ok = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, sizeof(hash), sig, olen);
   mbedtls_pk_free(&pk);
@@ -239,7 +242,7 @@ static bool httpDownloadToUpdate(const String& binUrl,
   uint8_t* buf = (uint8_t*)heap_caps_malloc(CH, MALLOC_CAP_8BIT);
   if (!buf) { OTA_LOG("[OTA] malloc FAIL"); wcs.stop(); Update.end(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false; }
 
-  mbedtls_sha256_context sha; mbedtls_sha256_init(&sha); mbedtls_sha256_starts_ret(&sha,0);
+  mbedtls_sha256_context sha; mbedtls_sha256_init(&sha); mbedtls_sha256_starts(&sha, 0);
   size_t written = 0;
   unsigned long lastLog = millis();
   unsigned long lastProgress = millis();
@@ -250,7 +253,8 @@ static bool httpDownloadToUpdate(const String& binUrl,
     if (n > 0) {
       if (written==0) OTA_LOG("[OTA] first chunk %d bytes", n);
       lastProgress = millis();
-      mbedtls_sha256_update_ret(&sha, buf, n);
+      mbedtls_sha256_update(&sha, buf, n);
+
       size_t w = Update.write(buf, n);
       if (w != (size_t)n) {
         OTA_LOG("[OTA] write err=%u (wrote=%u/got=%d)", Update.getError(), (unsigned)w, n);
@@ -285,7 +289,7 @@ static bool httpDownloadToUpdate(const String& binUrl,
     mbedtls_sha256_free(&sha); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false;
   }
 
-  uint8_t digest[32]; mbedtls_sha256_finish_ret(&sha, digest); mbedtls_sha256_free(&sha);
+  uint8_t digest[32]; mbedtls_sha256_finish(&sha, digest); mbedtls_sha256_free(&sha);
   if (expectedSize>0 && written!=expectedSize) {
     OTA_LOG("[OTA] size mismatch: written=%u expected=%u", (unsigned)written, (unsigned)expectedSize);
     g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false;
@@ -345,11 +349,17 @@ void checkAndPerformCloudOTA(){
   if (!http.begin(wcs, url)) { OTA_LOG("[OTA] http.begin FAIL"); return; }
   http.addHeader("Accept-Encoding", "identity");
   http.setReuse(false); http.useHTTP10(true);
+  http.setTimeout(5000);      // 5 s max par read
+  http.setReuse(false);
+  http.useHTTP10(true);
 
   int code = http.GET(); 
   OTA_LOG("[OTA] manifest code=%d", code);
+  
   if (code!=HTTP_CODE_OK){ http.end(); return; }
-  String body = http.getString(); http.end();
+  String body = http.getString();    // peut bloquer jusqu'au timeout
+  esp_task_wdt_reset();
+  http.end();
 
   OTA_VLOG("[OTA] Manifest head:\n%s", body.substring(0,300).c_str());
 
