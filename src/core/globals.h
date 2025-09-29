@@ -26,7 +26,8 @@ enum WifiAuthType : uint8_t {
   WIFI_CONN_PSK = 0,                  // SSID + password
   WIFI_CONN_EAP_PEAP_MSCHAPV2 = 1     // Enterprise (PEAP/MSCHAPv2 + CA)
 };
-
+// globals.h ou wifi_mqtt.cpp (statiques)
+static volatile bool g_factoryResetPending = false;
 // ==== GLOBAUX (définis dans globals.cpp) ====
 extern bool wifiConnected;
 extern bool needToConnectWiFi;

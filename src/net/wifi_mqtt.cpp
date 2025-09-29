@@ -7,8 +7,14 @@
 #include "esp_task_wdt.h"
 #include <time.h>
 #include <string>
-
-extern "C" UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t xTask);
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "../led/led_status.h"
+#include <ArduinoJson.h>
+extern "C" {
+  #include "esp_wifi.h"
+  UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t xTask);
+}
 // Broker: tes valeurs
 static volatile bool s_mqttConnTaskRunning = false;
 static uint32_t      s_mqttAttemptCount    = 0;
@@ -35,7 +41,8 @@ extern const uint8_t _binary_src_certs_client_cert_pem_start[];
 extern const uint8_t _binary_src_certs_client_cert_pem_end[];
 extern const uint8_t _binary_src_certs_client_key_pem_start[];
 extern const uint8_t _binary_src_certs_client_key_pem_end[];
-
+static String statusTopic();
+static void publishStatusRetained(const char* state, const char* reason=nullptr);
 // --- helpers pour convertir le binaire linké en chaîne PEM terminée par NUL ---
 static const char* makePemZ(const uint8_t* start, const uint8_t* end) {
   size_t len = (size_t)(end - start);
@@ -81,22 +88,113 @@ static void configureMqttTLS() {
 }
 
 
+static void erasePrefsAndWifi() {
+  // Efface namespace app
+  Preferences p;
+  if (p.begin("myApp", false)) {  // RW
+    p.clear();                    // supprime toutes les clés du namespace
+    p.end();
+  }
 
+  // Efface config Wi-Fi (SSID, pass, EAP…) stockée par l'ESP32 dans NVS
+  esp_wifi_restore(); // remet les paramètres Wi-Fi à l’état d’usine
+
+  // (optionnel & radical) : tout NVS de la puce -> à éviter si tu stockes autre chose globalement
+  // nvs_flash_erase(); 
+  // nvs_flash_init();
+}
+
+static void gracefulStopBeforeReset() {
+  updateLedState(LED_UPDATING);    // ou LED_OFF si tu préfères
+  Serial.println("[RESET] Arrêt propre avant reset...");
+  Serial.println("o7");
+  // coupe tes tâches capteurs / PMS proprement
+  // coupe BLE adv pour éviter des races
+}
+
+static void factoryResetAndReboot() {
+  gracefulStopBeforeReset();
+
+  // Annonce état au cloud
+  StaticJsonDocument<128> s; s["state"]="erasing";
+  String sMsg; serializeJson(s,sMsg);
+  mqttClient.publish(("breezly/devices/"+sensorId+"/status").c_str(), sMsg.c_str());
+
+  delay(150); // laisse partir le publish
+
+  // Déconnexion réseau propre
+  if (mqttClient.connected()) mqttClient.disconnect();
+  WiFi.disconnect(true); // coupe la station (true = wifioff)
+
+  erasePrefsAndWifi();
+
+  delay(200);
+  ESP.restart();
+}
 
 static void mqttCallback(char* topic, byte* payload, unsigned int length){
-  String msg; msg.reserve(length);
+  Serial.printf("[MQTT] RX topic=%s len=%u\n", topic, length);
+  if (length == 0) { 
+    // retained cleared → rien à faire
+    return; 
+  }
+  // reconstruire le message
+  String msg; msg.reserve(length + 1);
   for (unsigned i=0;i<length;i++) msg += (char)payload[i];
-  if (msg.indexOf("\"action\"")!=-1 && msg.indexOf("update")!=-1){
+  Serial.printf("[MQTT] RX payload=%s\n", msg.c_str());
+
+  // parse JSON
+  StaticJsonDocument<256> j;
+  DeserializationError err = deserializeJson(j, msg);
+  if (err) {
+    Serial.printf("[MQTT] JSON parse error: %s\n", err.c_str());
+    return;
+  }
+
+  // récupérer l'action proprement
+  const char* action = j["action"].as<const char*>();
+  if (!action) {
+    Serial.println("[MQTT] Pas de clé 'action' (ou non-string)");
+    return;
+  }
+  Serial.printf("[MQTT] action=%s\n", action);
+
+  // OTA
+  if (strcmp(action, "update") == 0){
     Serial.println("[OTA] Trigger via MQTT");
     otaInProgress = true;
     xTaskCreatePinnedToCore([](void*){
       vTaskDelay(100/portTICK_PERIOD_MS);
       checkAndPerformCloudOTA();
       otaInProgress = false;
-      vTaskDelete(0);
-    }, "OTA_TASK", 8192, 0, 1, 0, 0);
+      vTaskDelete(NULL);
+    }, "OTA_TASK", 8192, NULL, 1, NULL, 0);
+    return;
   }
+
+  // Factory reset
+  if (strcmp(action, "factory_reset") == 0){
+    Serial.println("[RESET] Factory reset demandé via MQTT");
+
+    // ACK immédiat
+    StaticJsonDocument<128> ack;
+    ack["ack"] = "factory_reset";
+    ack["ok"]  = true;
+    String out; serializeJson(ack, out);
+    mqttClient.publish(("breezly/devices/"+sensorId+"/status").c_str(), out.c_str());
+    g_factoryResetPending = true;
+    // reset asynchrone
+    xTaskCreatePinnedToCore([](void*){
+      vTaskDelay(50/portTICK_PERIOD_MS);
+      factoryResetAndReboot();
+      vTaskDelete(NULL);
+    }, "FACTORY_RESET", 8192, NULL, 1, NULL, 0);
+    return;
+  }
+
+  Serial.println("[MQTT] Action inconnue -> ignorée");
 }
+
 static bool bleInitStarted = false;
 
 bool connectToWiFi(){
@@ -110,7 +208,7 @@ bool connectToWiFi(){
     return ok;
   }
 
-  // ==== Chemin PSK (ton code d'origine) ====
+  // ===== PSK sécurisé WDT =====
   if (wifiSSID.isEmpty() || wifiPassword.isEmpty()){
     Serial.println("[WiFi] SSID/PWD manquants");
     provisioningSetStatus("{\"status\":\"missing_fields\"}");
@@ -118,26 +216,35 @@ bool connectToWiFi(){
   }
 
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);                 // reset complet
   WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
   Serial.printf("[WiFi] Connexion à '%s'...\n", wifiSSID.c_str());
-  for (int i=0;i<20 && WiFi.status()!=WL_CONNECTED; i++){
-    delay(500); Serial.print(".");
+
+  const uint32_t timeoutMs = 15000;           // 15 s
+  const uint32_t deadline  = millis() + timeoutMs;
+  while (WiFi.status() != WL_CONNECTED && (int32_t)(deadline - millis()) > 0) {
+    esp_task_wdt_reset();                     // ★ feed WDT
+    vTaskDelay(100 / portTICK_PERIOD_MS);     // ★ laisse tourner FreeRTOS
+    if (((millis()/500) % 2) == 0) Serial.print(".");
   }
+  Serial.println();
 
   if (WiFi.status()==WL_CONNECTED){
-    Serial.printf("\n[WiFi] OK IP=%s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[WiFi] OK IP=%s RSSI=%d\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
     wifiConnected = true;
     provisioningNotifyConnected();
-    startSNTPAfterConnected();   // SNTP aussi pour PSK
+    startSNTPAfterConnected();                // comme EAP
     return true;
   } else {
-    Serial.println("\n[WiFi] ÉCHEC");
+    Serial.println("[WiFi] ÉCHEC (timeout)");
     wifiConnected = false;
     provisioningSetStatus("{\"status\":\"error\"}");
-    if (bleInited) restartBLEAdvertising();
+    if (bleInited) restartBLEAdvertising();   // UX: permet de corriger les creds
     return false;
   }
 }
+
 
 static bool timeIsSane(){ return time(nullptr) > 1700000000; }
 
@@ -156,12 +263,24 @@ bool connectToMQTT(){
   unsigned long t0 = millis();
   Serial.printf("[MQTT] Tentative #%lu -> %s:%d ... ",
                 (unsigned long)s_mqttAttemptCount, MQTT_HOST, MQTT_PORT);
+  StaticJsonDocument<96> lw; 
+  lw["state"] = "offline"; 
+  lw["ts"]    = (uint64_t)(time(nullptr) * 1000ULL);
+  static String lwtPayload; lwtPayload.clear(); serializeJson(lw, lwtPayload);
 
-  bool ok = mqttClient.connect("ESP32Client", MQTT_USER, MQTT_PASS);
-
+  // ⚠️ setWill garde un pointeur -> garder lwtPayload vivant jusqu'au connect()
+  bool ok = mqttClient.connect(
+    "ESP32Client",
+    MQTT_USER, MQTT_PASS,
+    statusTopic().c_str(),   // willTopic
+    0,                       // willQos
+    true,                    // willRetain
+    lwtPayload.c_str()       // willMessage
+  );
   unsigned long dt = millis() - t0;
   if (ok) {
     Serial.printf("OK (%lums)\n", dt);
+    publishStatusRetained("online");
     return true;
   } else {
     Serial.printf("FAIL state=%d (%lums)\n", mqttClient.state(), dt);
@@ -181,6 +300,7 @@ static void mqttConnectTask(void*){
 }
 
 void scheduleMqttConnect(){
+  if (g_factoryResetPending) return;
   if (s_mqttConnTaskRunning) return;
   s_mqttConnTaskRunning = true;
   xTaskCreatePinnedToCore(mqttConnectTask, "MQTT_CONN", MQTT_CONN_STACK, nullptr, 1, nullptr, 0);
@@ -188,12 +308,29 @@ void scheduleMqttConnect(){
 
 
 void mqttSubscribeOtaTopic(){
-  String otaTopic = "breezly/devices/" + sensorId + "/ota";
-  if (mqttClient.subscribe(otaTopic.c_str())) Serial.printf("[MQTT] Subscribed: %s\n", otaTopic.c_str());
-  else                                        Serial.printf("[MQTT] Subscribe FAIL: %s\n", otaTopic.c_str());
+  String otaTopic   = "breezly/devices/" + sensorId + "/ota";
+  String ctrlTopic  = "breezly/devices/" + sensorId + "/control";
+
+  bool ok1 = mqttClient.subscribe(otaTopic.c_str());
+  Serial.printf("[MQTT] Subscribed OTA: %s (%s)\n", otaTopic.c_str(), ok1?"ok":"fail");
+
+  bool ok2 = mqttClient.subscribe(ctrlTopic.c_str());
+  Serial.printf("[MQTT] Subscribed CTRL: %s (%s)\n", ctrlTopic.c_str(), ok2?"ok":"fail");
+}
+
+// --- Status helpers ---
+static String statusTopic() { return "breezly/devices/" + sensorId + "/status"; }
+static void publishStatusRetained(const char* state, const char* reason) {
+  StaticJsonDocument<128> j;
+  j["state"] = state;
+  j["ts"]    = (uint64_t)(time(nullptr) * 1000ULL);
+  if (reason) j["reason"] = reason;
+  String s; serializeJson(j, s);
+  mqttClient.publish(statusTopic().c_str(), s.c_str(), true); // retained
 }
 
 void mqttLoopOnce(){
+  if (g_factoryResetPending) return;
   // Si Wi-Fi KO → on s’assure que MQTT est down proprement
   if (!wifiConnected){
     if (mqttClient.connected()){
