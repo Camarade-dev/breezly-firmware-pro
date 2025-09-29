@@ -166,7 +166,6 @@ static bool httpDownloadToUpdate(const String& binUrl,
   String host = hostPath.substring(0, slash);
   String path = hostPath.substring(slash);
 
-  if (mqttClient.connected()) { mqttClient.disconnect(); OTA_LOG("[OTA] MQTT disconnected for OTA"); }
   g_otaInProgress = true; otaInProgress = true; updateLedState(LED_UPDATING);
 
   wcs.setCACert(CA_BUNDLE_PEM);

@@ -6,12 +6,12 @@
 
 #include "led/led_status.h"
 #include "ble/provisioning.h"
-#include "net/wifi_mqtt.h"
+#include "net/mqtt_bus.h"
 #include "ota/ota.h"
 #include "sensors/sensors.h"
 #include <WiFi.h>
 #include "esp_wifi.h"
-
+#include "net/wifi_connect.h"
 #include "esp_task_wdt.h"
 #include <ArduinoJson.h>
 
@@ -24,13 +24,10 @@ void doFactoryResetOnMainLoop(){
   // annonce "erasing" pendant que MQTT est encore up
   StaticJsonDocument<64> s; s["state"]="erasing";
   String sMsg; serializeJson(s, sMsg);
-  mqttClient.publish(("breezly/devices/"+sensorId+"/status").c_str(), sMsg.c_str());
-  mqttClient.loop(); // flush
-
+  mqtt_enqueue(mqtt_topic_status(), sMsg, 0, false);
+  mqtt_flush(300); // on vide rapidement la queue
   delay(150); // laisse partir le publish
 
-  // TOUT ce qui suit reste dans la même tâche (loop)
-  if (mqttClient.connected()) mqttClient.disconnect();
   WiFi.disconnect(true);             // coupe la STA
 
   // NVS / prefs
@@ -42,28 +39,30 @@ void doFactoryResetOnMainLoop(){
   ESP.restart();
 }
 
-static void twdtInitOnce(){
+static void twdtInitOnce() {
   if (s_twdtReady) return;
 
   esp_task_wdt_config_t cfg = {};
-  cfg.timeout_ms     = 60 * 1000;
-  cfg.idle_core_mask = ((1U << portNUM_PROCESSORS) - 1U);
+  cfg.timeout_ms     = 120 * 1000;                          // your 2 min
+  cfg.idle_core_mask = ((1U << portNUM_PROCESSORS) - 1U);   // feed IDLE0/1
   cfg.trigger_panic  = true;
 
-  // OK si déjà initialisé
   esp_err_t e = esp_task_wdt_init(&cfg);
-  if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
+  if (e == ESP_ERR_INVALID_STATE) {
+    // already init’d with another timeout → tear down and re-init
+    esp_task_wdt_deinit();                  // <-- important
+    ESP_ERROR_CHECK( esp_task_wdt_init(&cfg) );
+  } else {
     ESP_ERROR_CHECK(e);
   }
 
-  // OK si déjà ajoutée
+  // (re-)add current task (loopTask)
   e = esp_task_wdt_add(NULL);
-  if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
-    ESP_ERROR_CHECK(e);
-  }
+  if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) ESP_ERROR_CHECK(e);
 
   s_twdtReady = true;
 }
+
 
 static inline void twdtResetSafe(){
   if (s_twdtReady) esp_task_wdt_reset();
@@ -148,6 +147,9 @@ void setup(){
  delay(10); }
 
   ledTaskStart();
+  sensorsInit();
+  gPmsMutex = xSemaphoreCreateMutex();
+  pmsTaskStart(16, 17);
   // 2) Tenter la connexion Wi-Fi immédiate si on a des identifiants
   //    (en cas d’échec, connectToWiFi() s’occupe de relancer l’advertising BLE)
   if (!missingCreds) {
@@ -162,21 +164,8 @@ void setup(){
     // NE PAS bloquer ici. loop() s'occupe d'appeler connectToWiFi()
   }
   twdtResetSafe(); delay(1);
-  if (wifiConnected && !mqttClient.connected()) {
-    Serial.println("[MQTT] Tentative initiale post-WiFi");
-    scheduleMqttConnect();   // <-- asynchrone, ne bloque pas loopTask
-  }
-  sensorsInit();
-  gPmsMutex = xSemaphoreCreateMutex();
-  pmsTaskStart(16, 17);
-
-  if (mqttClient.connected()){
-    StaticJsonDocument<256> j;
-    j["boot"]=true; j["sensorId"]=sensorId; j["firmwareVersion"]=CURRENT_FIRMWARE_VERSION;
-    String s; serializeJson(j,s);
-    mqttClient.publish("capteurs/boot", s.c_str());
-    Serial.println(s);
-  }
+  mqtt_bus_start_task();   // démarre le bus MQTT (tâche propriétaire)
+  mqtt_request_connect();  // demande une première connexion
 
   Serial.println("[BOOT] Setup terminé");
   lastWifiAttemptMs = millis();
@@ -201,19 +190,19 @@ void loop(){
     Serial.println("[OTA] Check au boot Wi-Fi");
     lastOtaCheck = millis();
     s_otaBootTaskScheduled = true;
-  xTaskCreatePinnedToCore([](void*){
-    // ajoute la tâche au WDT si possible
-    esp_err_t e = esp_task_wdt_add(NULL);
-    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) { ESP_ERROR_CHECK(e); }
+    xTaskCreatePinnedToCore([](void*){
+      // ajoute la tâche au WDT si possible
+      esp_err_t e = esp_task_wdt_add(NULL);
+      if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) { ESP_ERROR_CHECK(e); }
 
-    checkAndPerformCloudOTA();
+      checkAndPerformCloudOTA();
 
-    // la supprimer si elle était ajoutée
-    e = esp_task_wdt_delete(NULL);
-    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) { ESP_ERROR_CHECK(e); }
+      // la supprimer si elle était ajoutée
+      e = esp_task_wdt_delete(NULL);
+      if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) { ESP_ERROR_CHECK(e); }
 
-    vTaskDelete(NULL);
-  }, "OTA_BOOT", 8192, nullptr, 1, nullptr, 0);
+      vTaskDelete(NULL);
+    }, "OTA_BOOT", 8192, nullptr, 1, nullptr, 0);
 
 
   }
@@ -247,16 +236,17 @@ void loop(){
     Serial.println("[WiFi] tentative suite à nouveaux identifiants (BLE)");
     twdtResetSafe();
     connectToWiFi(); // échec => restartBLEAdvertising() à l'intérieur comme avant
+    twdtResetSafe();
     if (wifiConnected) {
       updateLedState(LED_BOOT);
-      scheduleMqttConnect();   // <-- asynchrone
+      mqtt_request_connect();
     } else {
       updateLedState(LED_PAIRING);
     }
   }
 
   // Publish capteurs
-  if (!g_factoryResetPending && mqttClient.connected()){
+  if (!g_factoryResetPending && mqtt_is_connected()){
     unsigned long now = millis();
     if ((long)(now - lastPublish) >= 5000){
       lastPublish = now;
@@ -285,7 +275,7 @@ void loop(){
         j["sensorId"]=sensorId; j["userId"]=userId;
 
         String s; serializeJson(j,s);
-        mqttClient.publish("capteurs/qualite_air", s.c_str());
+        mqtt_enqueue("capteurs/qualite_air", s, 0, false);
         Serial.println(s);
       } else {
         updateLedState(LED_BAD);
@@ -293,10 +283,6 @@ void loop(){
     }
   }
   }
-
-
-  if (!g_factoryResetPending) {mqttLoopOnce();}
   twdtResetSafe();
-
   delay(5);
 }
