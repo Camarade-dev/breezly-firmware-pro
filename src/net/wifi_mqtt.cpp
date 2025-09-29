@@ -131,6 +131,95 @@ static void factoryResetAndReboot() {
   delay(200);
   ESP.restart();
 }
+static bool applyWifiPrefsFromJson(const JsonDocument& j, String& errMsg) {
+  Preferences p;
+  if (!p.begin("myApp", false)) { errMsg = "prefs_begin_failed"; return false; }
+
+  // Auth: "psk" ou "eap"
+  const char* auth = j["authType"] | "psk";
+  WifiAuthType newAuth = (strcmp(auth,"eap")==0) ? WIFI_CONN_EAP_PEAP_MSCHAPV2 : WIFI_CONN_PSK;
+
+  const char* ssid = j["ssid"] | "";
+  const char* pwd  = j["password"] | "";
+
+  // Champs EAP optionnels
+  const char* eapUser = j["eap"]["username"] | "";
+  const char* eapPass = j["eap"]["password"] | "";
+  const char* eapId   = j["eap"]["identity"] | "";
+  const char* eapAnon = j["eap"]["anon"] | "";
+
+  // Validations minimales
+  if (newAuth == WIFI_CONN_PSK) {
+    if (strlen(ssid) == 0 || strlen(pwd) == 0) { errMsg="missing_ssid_or_pwd"; return false; }
+  } else {
+    if (!ssid || !eapUser || !eapPass) { errMsg="missing_eap_fields"; p.end(); return false; }
+  }
+  Serial.printf("[CTRL] set_wifi -> auth=%s, ssid_len=%u, pwd_len=%u\n",
+              auth, (unsigned)strlen(ssid), (unsigned)strlen(pwd));
+  // Ecrit les valeurs (on n'imprime pas les secrets dans les logs)
+  p.putUInt("wifiAuthType", (uint32_t)newAuth);
+  p.putString("wifiSSID",     ssid ? ssid : "");
+  p.putString("wifiPassword", pwd  ? pwd  : "");
+
+  if (newAuth == WIFI_CONN_EAP_PEAP_MSCHAPV2) {
+    p.putString("eapUsername", eapUser ? eapUser : "");
+    p.putString("eapPassword", eapPass ? eapPass : "");
+    p.putString("eapIdentity", eapId   ? eapId   : "");
+    p.putString("eapAnon",     eapAnon ? eapAnon : "anon@domain");
+  } else {
+    // nettoie les anciens champs EAP s'il y en avait
+    p.putString("eapUsername", "");
+    p.putString("eapPassword", "");
+    p.putString("eapIdentity", "");
+    p.putString("eapAnon",     "");
+  }
+
+  p.end();
+  return true;
+}
+// Publie un ACK sur le topic status
+static void publishControlAck(const char* type, bool ok, const char* reason=nullptr){
+  StaticJsonDocument<160> j;
+  j["ack"]   = type;   // ex: "set_wifi"
+  j["ok"]    = ok;
+  j["ts"]    = (uint64_t)(time(nullptr) * 1000ULL);
+  if (reason) j["reason"] = reason;
+  String s; serializeJson(j, s);
+  mqttClient.publish(statusTopic().c_str(), s.c_str()); // pas besoin de retained
+}
+
+static void handleSetWifi(const JsonDocument& j){
+  String err;
+  bool ok = applyWifiPrefsFromJson(j, err);
+  publishControlAck("set_wifi", ok, ok ? nullptr : err.c_str());
+  if (!ok) return;
+
+  // (re)charge les globals
+  prefs.begin("myApp", true);
+  wifiSSID     = prefs.getString("wifiSSID", "");
+  wifiPassword = prefs.getString("wifiPassword", "");
+  wifiAuthType = (WifiAuthType)prefs.getUInt("wifiAuthType",(uint32_t)WIFI_CONN_PSK);
+  eapIdentity  = prefs.getString("eapIdentity", "");
+  eapUsername  = prefs.getString("eapUsername", "");
+  eapPassword  = prefs.getString("eapPassword", "");
+  eapAnon      = prefs.getString("eapAnon", "");
+  prefs.end();
+
+  // ⚠️ efface le retained AVANT de couper MQTT/WiFi
+  String ctrlTopic = "breezly/devices/" + sensorId + "/control";
+  bool cleared = mqttClient.publish(ctrlTopic.c_str(), "", true);
+  Serial.printf("[CTRL] clear retained on %s -> %d\n", ctrlTopic.c_str(), (int)cleared);
+  mqttClient.loop();
+  delay(50);
+
+  if (mqttClient.connected()) mqttClient.disconnect();
+  WiFi.disconnect(true, true);
+
+  wifiConnected     = false;
+  needToConnectWiFi = true;
+  updateLedState(LED_BOOT);
+}
+
 
 static void mqttCallback(char* topic, byte* payload, unsigned int length){
   Serial.printf("[MQTT] RX topic=%s len=%u\n", topic, length);
@@ -144,7 +233,7 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length){
   Serial.printf("[MQTT] RX payload=%s\n", msg.c_str());
 
   // parse JSON
-  StaticJsonDocument<256> j;
+  StaticJsonDocument<512> j;
   DeserializationError err = deserializeJson(j, msg);
   if (err) {
     Serial.printf("[MQTT] JSON parse error: %s\n", err.c_str());
@@ -158,7 +247,13 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length){
     return;
   }
   Serial.printf("[MQTT] action=%s\n", action);
-
+  if (strcmp(action, "set_wifi") == 0) {
+    // Ex: { "action":"set_wifi", "authType":"psk", "ssid":"...", "password":"..." }
+    // ou EAP: { "action":"set_wifi", "authType":"eap", "ssid":"eduroam",
+    //           "eap": { "username":"u", "password":"p", "identity":"u", "anon":"anon@realm" } }
+    handleSetWifi(j);
+    return;
+  }
   // OTA
   if (strcmp(action, "update") == 0){
     Serial.println("[OTA] Trigger via MQTT");
@@ -291,6 +386,7 @@ static void mqttConnectTask(void*){
   bool ok = connectToMQTT();
   if (ok) {
     mqttSubscribeOtaTopic();
+    s_mqttBackoffMs = 1000;
   }
   s_mqttConnTaskRunning = false;
   UBaseType_t hw = uxTaskGetStackHighWaterMark(NULL);
@@ -331,7 +427,10 @@ static void publishStatusRetained(const char* state, const char* reason) {
 
 void mqttLoopOnce(){
   if (g_factoryResetPending) return;
-  // Si Wi-Fi KO → on s’assure que MQTT est down proprement
+
+  // ⛔ ne touche pas mqttClient pendant qu'on connecte
+  if (s_mqttConnTaskRunning) return;
+
   if (!wifiConnected){
     if (mqttClient.connected()){
       mqttClient.disconnect();
@@ -340,21 +439,19 @@ void mqttLoopOnce(){
     return;
   }
 
-  // Wi-Fi OK
   if (mqttClient.connected()){
     mqttClient.loop();
     return;
   }
 
-  // Wi-Fi OK mais MQTT KO → retry avec backoff, en tâche séparée
   unsigned long now = millis();
   if ((long)(now - s_lastMqttAttemptMs) >= (long)s_mqttBackoffMs){
     s_lastMqttAttemptMs = now;
-    scheduleMqttConnect();  // <-- au lieu d'appeler connectToMQTT() ici
-    // backoff exponentiel (il sera réduit si on connecte)
+    scheduleMqttConnect();
     s_mqttBackoffMs = s_mqttBackoffMs < MQTT_BACKOFF_MAX
       ? min<uint32_t>(MQTT_BACKOFF_MAX, s_mqttBackoffMs << 1)
       : MQTT_BACKOFF_MAX;
     Serial.printf("[MQTT] Retry planifié dans tâche (backoff=%lums)\n", (unsigned long)s_mqttBackoffMs);
   }
 }
+
