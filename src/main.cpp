@@ -46,7 +46,7 @@ static void twdtInitOnce(){
   if (s_twdtReady) return;
 
   esp_task_wdt_config_t cfg = {};
-  cfg.timeout_ms     = 30 * 1000;
+  cfg.timeout_ms     = 60 * 1000;
   cfg.idle_core_mask = ((1U << portNUM_PROCESSORS) - 1U);
   cfg.trigger_panic  = true;
 
@@ -104,19 +104,33 @@ void setup(){
   eapAnon      = prefs.getString("eapAnon", "ano@rezoleo.fr");
   prefs.end();
 
+  // --- Vérifs d’identifiants selon le mode sélectionné ---
+  const bool manquePSK = (wifiSSID.isEmpty() || wifiPassword.isEmpty());
+  const bool manqueEAP = (wifiSSID.isEmpty() || eapUsername.isEmpty() || eapPassword.isEmpty());
+  const bool missingCreds = (wifiAuthType == WIFI_CONN_PSK) ? manquePSK : manqueEAP;
+
+  // "valid" = prefs cohérentes pour l'AUTH courante, pas forcément connectées
+  const bool validAuth =
+      (wifiAuthType == WIFI_CONN_PSK) ? !manquePSK : !manqueEAP;
+
+  // needProv = on a besoin de provisioning BLE uniquement si les champs REQUIS
+  // pour l'AUTH courante ne sont pas tous présents
+  const bool needProv = !validAuth;
+
+  Serial.println("----- PREFS -----");
   Serial.printf("authType=%u (0=PSK,1=EAP)\n", (unsigned)wifiAuthType);
-  if (wifiAuthType == WIFI_CONN_EAP_PEAP_MSCHAPV2) {
-    Serial.printf("EAP SSID: %s\n", wifiSSID.c_str());
-    Serial.printf("EAP user: %s\n", eapUsername.c_str());
-    Serial.printf("EAP anon: %s\n", eapAnon.c_str());
+  Serial.printf("SSID: %s\n", wifiSSID.c_str());
+  if (wifiAuthType == WIFI_CONN_PSK) {
+    Serial.printf("PWD : %s\n", wifiPassword.c_str());
   } else {
-    Serial.printf("SSID: %s\n", wifiSSID.c_str());
+    Serial.printf("EAP user: %s\n", eapUsername.c_str());
+    Serial.printf("EAP mdp : %s\n", eapPassword.c_str());
+    Serial.printf("EAP anon: %s\n", eapAnon.c_str());
   }
+  Serial.printf("validAuth=%d manquePSK=%d manqueEAP=%d needProv=%d\n",
+                (int)validAuth, (int)manquePSK, (int)manqueEAP, (int)needProv);
+  Serial.println("-----------------");
 
-
-  bool valid  = preferencesAreValid();
-  bool manque = (wifiSSID.isEmpty() || wifiPassword.isEmpty());
-  bool needProv = (!valid || manque);
 
 
   Serial.println("----- PREFS -----");
@@ -124,7 +138,6 @@ void setup(){
   Serial.printf("PWD : %s\n", wifiPassword.c_str());
   Serial.printf("SID : %s\n", sensorId.c_str());
   Serial.printf("UID : %s\n", userId.c_str());
-  Serial.printf("valid=%d manque=%d needProv=%d\n", (int)valid,(int)manque,(int)needProv);
   Serial.println("-----------------");
 
   setupBLE(needProv);  // ← démarre BLE tout de suite si provisioning requis
@@ -137,7 +150,7 @@ void setup(){
   ledTaskStart();
   // 2) Tenter la connexion Wi-Fi immédiate si on a des identifiants
   //    (en cas d’échec, connectToWiFi() s’occupe de relancer l’advertising BLE)
-  if (!manque) {
+  if (!missingCreds) {
     Serial.println("Tentative de connexion avec les identifiants sauvegardés...");
     connectToWiFi();
   }
@@ -148,8 +161,7 @@ void setup(){
     Serial.println("En attente provisioning BLE (non-bloquant)...");
     // NE PAS bloquer ici. loop() s'occupe d'appeler connectToWiFi()
   }
-
-
+  twdtResetSafe(); delay(1);
   if (wifiConnected && !mqttClient.connected()) {
     Serial.println("[MQTT] Tentative initiale post-WiFi");
     scheduleMqttConnect();   // <-- asynchrone, ne bloque pas loopTask
@@ -233,6 +245,7 @@ void loop(){
   if (!wifiConnected && needToConnectWiFi &&  !g_factoryResetPending){
     needToConnectWiFi = false;   // évite plusieurs déclenchements
     Serial.println("[WiFi] tentative suite à nouveaux identifiants (BLE)");
+    twdtResetSafe();
     connectToWiFi(); // échec => restartBLEAdvertising() à l'intérieur comme avant
     if (wifiConnected) {
       updateLedState(LED_BOOT);
