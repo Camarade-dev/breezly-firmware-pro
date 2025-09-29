@@ -197,7 +197,7 @@ void setupBLE(bool startAdvertising) {
   // 2) Init NimBLE identique à la version monolithique
   Serial.printf("[BLE] INIT NimBLE (%s)\n", bleName);
   NimBLEDevice::init(bleName);
-  NimBLEDevice::setMTU(256);
+  NimBLEDevice::setMTU(185);
   NimBLEDevice::setDeviceName(bleName);
 
   pServer = NimBLEDevice::createServer();

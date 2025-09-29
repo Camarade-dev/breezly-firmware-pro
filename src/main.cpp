@@ -13,6 +13,36 @@
 
 #include "esp_task_wdt.h"
 #include <ArduinoJson.h>
+
+static bool s_twdtReady = false;
+
+static void twdtInitOnce(){
+  if (s_twdtReady) return;
+
+  esp_task_wdt_config_t cfg = {};
+  cfg.timeout_ms     = 30 * 1000;
+  cfg.idle_core_mask = ((1U << portNUM_PROCESSORS) - 1U);
+  cfg.trigger_panic  = true;
+
+  // OK si déjà initialisé
+  esp_err_t e = esp_task_wdt_init(&cfg);
+  if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
+    ESP_ERROR_CHECK(e);
+  }
+
+  // OK si déjà ajoutée
+  e = esp_task_wdt_add(NULL);
+  if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
+    ESP_ERROR_CHECK(e);
+  }
+
+  s_twdtReady = true;
+}
+
+static inline void twdtResetSafe(){
+  if (s_twdtReady) esp_task_wdt_reset();
+}
+
 static volatile bool s_otaBootTaskScheduled = false;
 static volatile bool s_otaTickTaskScheduled = false;
 static const unsigned long WIFI_RETRY_BACKOFF_MS = 15000; // 15s
@@ -27,8 +57,8 @@ void setup(){
   Serial.begin(115200);
   Serial.printf("Flash chip size: %u MB\n", ESP.getFlashChipSize()/(1024*1024));
   otaOnBootValidate(); 
-  esp_task_wdt_deinit();
-  
+  twdtInitOnce();
+    
 
   ledInit(LED_PIN, LED_COUNT);
   updateLedState(LED_BOOT);
@@ -75,7 +105,8 @@ void setup(){
 
   // (optionnel) attendre un peu:
   uint32_t t0 = millis();
-  while(!bleInited && millis()-t0 < 2000) { esp_task_wdt_reset(); delay(10); }
+  while(!bleInited && millis()-t0 < 2000) { twdtResetSafe();
+ delay(10); }
 
   ledTaskStart();
   // 2) Tenter la connexion Wi-Fi immédiate si on a des identifiants
@@ -91,17 +122,12 @@ void setup(){
     Serial.println("En attente provisioning BLE...");
     while (!wifiConnected) {
       delay(500);
-      esp_task_wdt_reset();
+      twdtResetSafe();
+
     }
     Serial.println("Wi-Fi connecté, provisioning terminé.");
   }
-  esp_task_wdt_config_t twdt_cfg = {};
-  twdt_cfg.timeout_ms     = 30 * 1000;
-  twdt_cfg.idle_core_mask = ((1U << portNUM_PROCESSORS) - 1U);
-  twdt_cfg.trigger_panic  = true;
-  ESP_ERROR_CHECK( esp_task_wdt_init(&twdt_cfg) );
 
-  esp_task_wdt_add(NULL);
   if (wifiConnected && !mqttClient.connected()) {
     Serial.println("[MQTT] Tentative initiale post-WiFi");
     scheduleMqttConnect();   // <-- asynchrone, ne bloque pas loopTask
@@ -125,7 +151,8 @@ void setup(){
 void loop(){
   if (otaIsInProgress()) {
     // Pas de publish capteurs, pas de mqttClient.loop()
-    esp_task_wdt_reset();
+    twdtResetSafe();
+
     delay(10);
   } 
   else{
@@ -137,13 +164,20 @@ void loop(){
     Serial.println("[OTA] Check au boot Wi-Fi");
     lastOtaCheck = millis();
     s_otaBootTaskScheduled = true;
-    xTaskCreatePinnedToCore([](void*){
-      // Cette task n’empêche plus loopTask de tourner
-      esp_task_wdt_add(NULL);
-      checkAndPerformCloudOTA();
-      esp_task_wdt_delete(NULL);
-      vTaskDelete(NULL);
-    }, "OTA_BOOT", 8192, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore([](void*){
+    // ajoute la tâche au WDT si possible
+    esp_err_t e = esp_task_wdt_add(NULL);
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) { ESP_ERROR_CHECK(e); }
+
+    checkAndPerformCloudOTA();
+
+    // la supprimer si elle était ajoutée
+    e = esp_task_wdt_delete(NULL);
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) { ESP_ERROR_CHECK(e); }
+
+    vTaskDelete(NULL);
+  }, "OTA_BOOT", 8192, nullptr, 1, nullptr, 0);
+
 
   }
 
@@ -154,12 +188,19 @@ void loop(){
       lastOtaCheck = now;
       s_otaTickTaskScheduled = true;
       xTaskCreatePinnedToCore([](void*){
-          ledSuspend();
-          checkAndPerformCloudOTA();   // reboot si update OK
-          ledResume();                 // relance seulement si pas de reboot
-        s_otaTickTaskScheduled = false;
+        // ajoute la tâche au WDT si possible
+        esp_err_t e = esp_task_wdt_add(NULL);
+        if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) { ESP_ERROR_CHECK(e); }
+
+        checkAndPerformCloudOTA();
+
+        // la supprimer si elle était ajoutée
+        e = esp_task_wdt_delete(NULL);
+        if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) { ESP_ERROR_CHECK(e); }
+
         vTaskDelete(NULL);
-      }, "OTA_TICK", 16384, NULL, 1, NULL, 0);
+      }, "OTA_TICK", 8192, nullptr, 1, nullptr, 0);
+
     }
   }
 
@@ -217,6 +258,7 @@ void loop(){
 
 
   mqttLoopOnce();
-  esp_task_wdt_reset();
+  twdtResetSafe();
+
   delay(5);
 }
