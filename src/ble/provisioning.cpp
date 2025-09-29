@@ -50,43 +50,29 @@ static void configureAdvertising() {
   adv->setScanResponseData(scanData);
 }
 
-class CredentialsCallback : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo&) override {
-    static String   acc;
-    static uint32_t chunkCount = 0;
-    static size_t   accLen     = 0;
+// provisioning.cpp (extrait)
+static String g_acc;
+static TaskHandle_t sCredTask = nullptr;
+static SemaphoreHandle_t sAccMutex;
+static void credWorker(void*){
+    for(;;){
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    const std::string raw = c->getValue();
-    ++chunkCount;
-    accLen += raw.size();
+    String json;
+    xSemaphoreTake(sAccMutex, portMAX_DELAY);
+    json = g_acc;
+    g_acc = "";
+    xSemaphoreGive(sAccMutex);
 
-    Serial.printf("[BLE][cred] chunk#%lu : '%s'\n",
-                  (unsigned long)chunkCount,
-                  raw.c_str());
-    acc += String(raw.c_str());
+    // parse + NVS + logs ICI (pas dans onWrite)
+    DynamicJsonDocument doc(1024);
+    DeserializationError err = deserializeJson(doc, json);
+    if (err){ provisioningSetStatus("{\"status\":\"json_error\"}"); continue; }
 
-    // Attente de la fin JSON simple (fermeture “}”)
-    if (!acc.endsWith("}")) return;
-
-    // Doc plus large (au besoin 1024/1536)
-    StaticJsonDocument<1024> doc;
-    DeserializationError err = deserializeJson(doc, acc);
-    if (err) {
-      Serial.printf("[BLE][cred] JSON error: %s (len=%d)\n", err.c_str(), acc.length());
-      provisioningSetStatus("{\"status\":\"json_error\"}");
-      acc = "";          // reset l'accumulateur même en erreur
-      return;
-    }
-
-    /* Copie IMMÉDIATE en String => pas de zero-copy piège */
     String modeS = doc["mode"]     | "psk";
     String ssidS = doc["ssid"]     | "";
     String sIdS  = doc["sensorId"] | "";
     String uIdS  = doc["userId"]   | "";
-
-    // Log SAFE (toujours .c_str(), jamais de pointeur potentiellement nul)
-    Serial.printf("[BLE][cred] mode='%s' ssid='%s' sId='%s' uId='%s'\n",
-      modeS.c_str(), ssidS.c_str(), sIdS.c_str(), uIdS.c_str());
 
     if (modeS.equalsIgnoreCase("eap")) {
       String userS = doc["username"]  | "";
@@ -94,29 +80,20 @@ class CredentialsCallback : public NimBLECharacteristicCallbacks {
       String idS   = doc["identity"]  | userS;
       String anonS = doc["anonymous"] | "";
 
-      Serial.printf("[BLE][cred] EAP: ssid='%s' user='%s' id='%s' anon='%s'\n",
-        ssidS.c_str(), userS.c_str(), idS.c_str(), anonS.c_str());
-
-      if (ssidS.isEmpty() || userS.isEmpty() || passS.isEmpty()) {
+      if (ssidS.isEmpty() || userS.isEmpty() || passS.isEmpty()){
         provisioningSetStatus("{\"status\":\"missing_fields\"}");
-        acc = "";
-        return;
+        continue;
       }
 
-      // Apply
-      wifiSSID     = ssidS;
-      wifiAuthType = WIFI_CONN_EAP_PEAP_MSCHAPV2;
-      eapUsername  = userS;
-      eapPassword  = passS;
-      eapIdentity  = idS;
-      eapAnon      = anonS;
-      if (!sIdS.isEmpty()) sensorId = sIdS;
-      if (!uIdS.isEmpty()) userId   = uIdS;
+      wifiSSID=ssidS; wifiAuthType=WIFI_CONN_EAP_PEAP_MSCHAPV2;
+      eapUsername=userS; eapPassword=passS; eapIdentity=idS; eapAnon=anonS;
+      if (!sIdS.isEmpty()) sensorId=sIdS;
+      if (!uIdS.isEmpty()) userId=uIdS;
 
-      uint32_t checksum = computeChecksum(wifiSSID, String(""), sensorId, userId);
+      uint32_t checksum=computeChecksum(wifiSSID,String(""),sensorId,userId);
       prefs.begin("myApp", false);
       prefs.putString("wifiSSID", wifiSSID);
-      prefs.putUInt  ("wifiAuthType", (uint32_t)wifiAuthType);
+      prefs.putUInt  ("wifiAuthType",(uint32_t)wifiAuthType);
       prefs.putString("eapUsername",  eapUsername);
       prefs.putString("eapPassword",  eapPassword);
       prefs.putString("eapIdentity",  eapIdentity);
@@ -125,26 +102,17 @@ class CredentialsCallback : public NimBLECharacteristicCallbacks {
       prefs.putString("userId",       userId);
       prefs.putUInt  ("checksum",     checksum);
       prefs.end();
-
     } else {
-      // PSK
       String pwdS = doc["password"] | "";
-      Serial.printf("[BLE][cred] PSK: ssid='%s' pwd='%s'\n",
-        ssidS.c_str(), pwdS.c_str());
-
-      if (ssidS.isEmpty() || pwdS.isEmpty()) {
+      if (ssidS.isEmpty() || pwdS.isEmpty()){
         provisioningSetStatus("{\"status\":\"missing_fields\"}");
-        acc = "";
-        return;
+        continue;
       }
+      wifiSSID=ssidS; wifiPassword=pwdS; wifiAuthType=WIFI_CONN_PSK;
+      if (!sIdS.isEmpty()) sensorId=sIdS;
+      if (!uIdS.isEmpty()) userId=uIdS;
 
-      wifiSSID     = ssidS;
-      wifiPassword = pwdS;
-      wifiAuthType = WIFI_CONN_PSK;
-      if (!sIdS.isEmpty()) sensorId = sIdS;
-      if (!uIdS.isEmpty()) userId   = uIdS;
-
-      uint32_t checksum = computeChecksum(wifiSSID, wifiPassword, sensorId, userId);
+      uint32_t checksum=computeChecksum(wifiSSID,wifiPassword,sensorId,userId);
       prefs.begin("myApp", false);
       prefs.putString("wifiSSID",     wifiSSID);
       prefs.putString("wifiPassword", wifiPassword);
@@ -155,9 +123,25 @@ class CredentialsCallback : public NimBLECharacteristicCallbacks {
       prefs.end();
     }
 
-    acc = "";                   // reset OK
     needToConnectWiFi = true;
     provisioningSetStatus("{\"status\":\"connecting\"}");
+  }
+}
+
+class CredentialsCallback : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo&) override {
+    const std::string raw = c->getValue();
+    if (!sAccMutex) sAccMutex = xSemaphoreCreateMutex();
+    xSemaphoreTake(sAccMutex, portMAX_DELAY);
+    g_acc += String(raw.c_str());
+    bool done = g_acc.endsWith("}");
+    xSemaphoreGive(sAccMutex);
+    if (!done) return;
+
+    if (!sCredTask){
+      xTaskCreatePinnedToCore(credWorker, "BLE_CRED", 8192, nullptr, 1, &sCredTask, 0);
+    }
+    xTaskNotifyGive(sCredTask);
   }
 };
 

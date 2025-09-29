@@ -10,11 +10,37 @@
 #include "ota/ota.h"
 #include "sensors/sensors.h"
 #include <WiFi.h>
+#include "esp_wifi.h"
 
 #include "esp_task_wdt.h"
 #include <ArduinoJson.h>
 
 static bool s_twdtReady = false;
+void doFactoryResetOnMainLoop(){
+  updateLedState(LED_UPDATING);
+  Serial.println("[RESET] Arrêt propre avant reset...");
+  // stoppe proprement tes tâches capteurs, BLE adv, etc.
+
+  // annonce "erasing" pendant que MQTT est encore up
+  StaticJsonDocument<64> s; s["state"]="erasing";
+  String sMsg; serializeJson(s, sMsg);
+  mqttClient.publish(("breezly/devices/"+sensorId+"/status").c_str(), sMsg.c_str());
+  mqttClient.loop(); // flush
+
+  delay(150); // laisse partir le publish
+
+  // TOUT ce qui suit reste dans la même tâche (loop)
+  if (mqttClient.connected()) mqttClient.disconnect();
+  WiFi.disconnect(true);             // coupe la STA
+
+  // NVS / prefs
+  Preferences p;
+  if (p.begin("myApp", false)) { p.clear(); p.end(); }
+  esp_wifi_restore();                // reset Wi-Fi factory
+
+  delay(200);
+  ESP.restart();
+}
 
 static void twdtInitOnce(){
   if (s_twdtReady) return;
@@ -119,14 +145,10 @@ void setup(){
   // 3) Si provisioning nécessaire : LED pairing + attente jusqu’à connexion Wi-Fi
   if (needProv) {
     updateLedState(LED_PAIRING);
-    Serial.println("En attente provisioning BLE...");
-    while (!wifiConnected) {
-      delay(500);
-      twdtResetSafe();
-
-    }
-    Serial.println("Wi-Fi connecté, provisioning terminé.");
+    Serial.println("En attente provisioning BLE (non-bloquant)...");
+    // NE PAS bloquer ici. loop() s'occupe d'appeler connectToWiFi()
   }
+
 
   if (wifiConnected && !mqttClient.connected()) {
     Serial.println("[MQTT] Tentative initiale post-WiFi");
@@ -149,16 +171,19 @@ void setup(){
 }
 
 void loop(){
-  if (otaIsInProgress()) {
-    // Pas de publish capteurs, pas de mqttClient.loop()
-    twdtResetSafe();
+  if (g_factoryResetPending){
+    g_factoryResetPending = false;
 
+    doFactoryResetOnMainLoop();
+    return; 
+  }
+
+
+  if (otaIsInProgress()) {
+    twdtResetSafe();
     delay(10);
   } 
   else{
-    // <- ton code “normal” (publish capteurs, mqttClient.loop(), etc.)
-  
-
   // ★ Check OTA au premier boot Wi-Fi, 1 seule fois
   if (wifiConnected && !otaIsInProgress() && lastOtaCheck==0 && !s_otaBootTaskScheduled){
     Serial.println("[OTA] Check au boot Wi-Fi");
@@ -182,7 +207,7 @@ void loop(){
   }
 
   // ★ Check OTA périodique
-  if (!otaInProgress && wifiConnected){
+  if (!otaInProgress && wifiConnected && !g_factoryResetPending){
     unsigned long now = millis();
     if ((long)(now - lastOtaCheck) >= (long)OTA_CHECK_INTERVAL_MS && !s_otaTickTaskScheduled){
       lastOtaCheck = now;
@@ -205,7 +230,7 @@ void loop(){
   }
 
   // Provisioning → nouveaux identifiants reçus
-  if (!wifiConnected && needToConnectWiFi){
+  if (!wifiConnected && needToConnectWiFi &&  !g_factoryResetPending){
     needToConnectWiFi = false;   // évite plusieurs déclenchements
     Serial.println("[WiFi] tentative suite à nouveaux identifiants (BLE)");
     connectToWiFi(); // échec => restartBLEAdvertising() à l'intérieur comme avant
@@ -218,7 +243,7 @@ void loop(){
   }
 
   // Publish capteurs
-  if (mqttClient.connected()){
+  if (!g_factoryResetPending && mqttClient.connected()){
     unsigned long now = millis();
     if ((long)(now - lastPublish) >= 5000){
       lastPublish = now;
@@ -257,7 +282,7 @@ void loop(){
   }
 
 
-  mqttLoopOnce();
+  if (!g_factoryResetPending) {mqttLoopOnce();}
   twdtResetSafe();
 
   delay(5);
