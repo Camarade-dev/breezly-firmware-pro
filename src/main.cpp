@@ -14,7 +14,7 @@
 #include "net/wifi_connect.h"
 #include "esp_task_wdt.h"
 #include <ArduinoJson.h>
-
+#include "core/devkey_runtime.h"
 static bool s_twdtReady = false;
 void doFactoryResetOnMainLoop(){
   updateLedState(LED_UPDATING);
@@ -75,7 +75,7 @@ static const uint8_t WIFI_FAILS_BEFORE_PROV = 1;          // dès le 1er échec,
 
 // --- Trampo pour init BLE sur core 0 ---
 static bool s_bleStartAdv = false;
-
+// ble/provisioning.cpp ou core/globals.cpp (où tu lis tes prefs)
 
 void setup(){
   delay(4000);
@@ -130,15 +130,15 @@ void setup(){
                 (int)validAuth, (int)manquePSK, (int)manqueEAP, (int)needProv);
   Serial.println("-----------------");
 
-
-
+    loadOrInitDevKey();
+    Serial.printf("[DEVKEY] len=%d, head=%.6s\n", (int)g_deviceKeyB64.length(), g_deviceKeyB64.c_str());
   Serial.println("----- PREFS -----");
   Serial.printf("SSID: %s\n", wifiSSID.c_str());
   Serial.printf("PWD : %s\n", wifiPassword.c_str());
   Serial.printf("SID : %s\n", sensorId.c_str());
   Serial.printf("UID : %s\n", userId.c_str());
   Serial.println("-----------------");
-
+  
   setupBLE(needProv);  // ← démarre BLE tout de suite si provisioning requis
 
   // (optionnel) attendre un peu:
