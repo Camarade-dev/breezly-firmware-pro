@@ -21,7 +21,6 @@ struct PmsData {
   uint32_t lastMs=0;
   uint32_t seq=0;
 };
-
 enum WifiAuthType : uint8_t {
   WIFI_CONN_PSK = 0,                  // SSID + password
   WIFI_CONN_EAP_PEAP_MSCHAPV2 = 1     // Enterprise (PEAP/MSCHAPv2 + CA)
