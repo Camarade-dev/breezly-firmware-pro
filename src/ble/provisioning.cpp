@@ -49,14 +49,38 @@ static String base64Encode(const uint8_t* buf, size_t len){
 // --- remplace provisioningSetStatus par ---
 void provisioningSetStatus(const char* json){
   if (statusCharacteristic){
+    // LOG sortant vers l'app
+    Serial.printf("[ESP->APP][NOTIFY] JSON len=%u\n", (unsigned)strlen(json));
+    Serial.printf("[ESP->APP][NOTIFY] %s\n", json);
     statusCharacteristic->setValue(json);
     statusCharacteristic->notify();
+  } else {
+    Serial.println("[ESP->APP][NOTIFY] statusCharacteristic NULL");
   }
 }
 
 void provisioningNotifyConnected(){
   provisioningSetStatus("{\"status\":\"connected\"}");
 }
+// === Helpers de log hex/ASCII ===
+static void printHex(const uint8_t* buf, size_t len, const char* tag = "HEX") {
+  Serial.printf("[BLE][%s] len=%u : ", tag, (unsigned)len);
+  for (size_t i = 0; i < len; ++i) Serial.printf("%02X", buf[i]);
+  Serial.println();
+}
+
+static void printAsciiPreview(const uint8_t* buf, size_t len, size_t maxShow = 80) {
+  Serial.print("[BLE][ASCII] ");
+  size_t show = len < maxShow ? len : maxShow;
+  for (size_t i = 0; i < show; ++i) {
+    char c = (char)buf[i];
+    if (c >= 32 && c < 127) Serial.write(c); else Serial.write('.');
+  }
+  if (len > show) Serial.print("…");
+  Serial.println();
+}
+
+
 
 // --- Helpers -----------------------------------------------------------------
 static void configureAdvertising() {
@@ -79,8 +103,9 @@ static String g_acc;
 static TaskHandle_t sCredTask = nullptr;
 static SemaphoreHandle_t sAccMutex;
 static void credWorker(void*){
-    for(;;){
+  for(;;){
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    Serial.println("[BLE][WORKER] wake: processing accumulated credentials/ops…");
 
     String json;
     xSemaphoreTake(sAccMutex, portMAX_DELAY);
@@ -88,31 +113,38 @@ static void credWorker(void*){
     g_acc = "";
     xSemaphoreGive(sAccMutex);
 
-    // parse + NVS + logs ICI (pas dans onWrite)
+    Serial.printf("[BLE][WORKER] JSON total len=%u\n", (unsigned)json.length());
+    Serial.printf("[BLE][WORKER] JSON payload: %s\n", json.c_str());
+
     DynamicJsonDocument doc(1024);
     DeserializationError err = deserializeJson(doc, json);
-    if (err){ provisioningSetStatus("{\"status\":\"json_error\"}"); continue; }
+    if (err){
+      Serial.printf("[BLE][WORKER][ERROR] JSON deserialization: %s\n", err.f_str());
+      provisioningSetStatus("{\"status\":\"json_error\"}");
+      continue;
+    }
+
+    const char* op = doc["op"] | "";
+    Serial.printf("[BLE][WORKER] op=\"%s\"\n", op);
 
     String modeS = doc["mode"]     | "psk";
     String ssidS = doc["ssid"]     | "";
     String sIdS  = doc["sensorId"] | "";
     String uIdS  = doc["userId"]   | "";
-      // après parse JSON:
-    const char* op = doc["op"] | "";
+
     if (strcmp(op, "claim_challenge") == 0) {
       String nonceB64 = doc["nonce"] | "";
       uint32_t counter = doc["counter"] | 0;
-
+      Serial.printf("[BLE][WORKER] claim_challenge: nonceB64.len=%u counter=%u\n",
+                    (unsigned)nonceB64.length(), counter);
+      
       if (g_deviceKeyB64.length() == 0 || nonceB64.length() == 0) {
+        Serial.println("[BLE][WORKER][ERROR] missing key or nonce");
         provisioningSetStatus("{\"op\":\"claim_proof\",\"err\":\"missing_key_or_nonce\"}");
         continue;
       }
 
-      // msg = nonce || counter (uint32 BE)
-      // On décode nonceB64
-      // (petit décodeur Base64 minimal)
       auto b64Dec = [](const String& s)->std::vector<uint8_t>{
-        // décodage simple (ou remplace par ta lib existante si tu en as une)
         const char* tbl="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         auto idx=[&](char c)->int{ const char* p=strchr(tbl,c); return p? (int)(p-tbl) : (c=='='?-1:-2); };
         std::vector<uint8_t> out; out.reserve((s.length()*3)/4);
@@ -126,28 +158,34 @@ static void credWorker(void*){
       };
 
       std::vector<uint8_t> nonce = b64Dec(nonceB64);
-      uint8_t msg[36]; // 32 + 4
-      size_t mlen = 0;
+      Serial.printf("[BLE][WORKER] decoded nonce len=%u (expected 32)\n", (unsigned)nonce.size());
       if (nonce.size() != 32) {
+        Serial.println("[BLE][WORKER][ERROR] bad_nonce_len");
         provisioningSetStatus("{\"op\":\"claim_proof\",\"err\":\"bad_nonce_len\"}");
         continue;
       }
+
+      uint8_t msg[36]; size_t mlen = 0;
       memcpy(msg, nonce.data(), 32); mlen = 32;
       msg[mlen+0] = (uint8_t)((counter>>24)&0xFF);
       msg[mlen+1] = (uint8_t)((counter>>16)&0xFF);
       msg[mlen+2] = (uint8_t)((counter>>8)&0xFF);
       msg[mlen+3] = (uint8_t)(counter&0xFF);
       mlen += 4;
+      printHex(msg, mlen, "CLAIM_MSG");
 
-      // key
       std::vector<uint8_t> key = b64Dec(g_deviceKeyB64);
+      Serial.printf("[BLE][WORKER] decoded key len=%u\n", (unsigned)key.size());
+
       uint8_t mac[32];
       if (!hmac_sha256(key.data(), key.size(), msg, mlen, mac)) {
+        Serial.println("[BLE][WORKER][ERROR] hmac_failed");
         provisioningSetStatus("{\"op\":\"claim_proof\",\"err\":\"hmac_failed\"}");
         continue;
       }
       String macB64 = base64Encode(mac, 32);
-      // NOTIFY
+      Serial.printf("[BLE][WORKER] hmac(b64).len=%u\n", (unsigned)macB64.length());
+
       StaticJsonDocument<128> out;
       out["op"]   = "claim_proof";
       out["hmac"] = macB64;
@@ -156,13 +194,20 @@ static void credWorker(void*){
       continue;
     }
 
+    // Logs généraux sur les credentials
+    Serial.printf("[BLE][WORKER] mode=%s, ssid.len=%u, sensorId.len=%u, userId.len=%u\n",
+                  modeS.c_str(), (unsigned)ssidS.length(), (unsigned)sIdS.length(), (unsigned)uIdS.length());
+
     if (modeS.equalsIgnoreCase("eap")) {
       String userS = doc["username"]  | "";
       String passS = doc["password"]  | "";
       String idS   = doc["identity"]  | userS;
       String anonS = doc["anonymous"] | "";
+      Serial.printf("[BLE][WORKER] EAP: user.len=%u pass.len=%u id.len=%u anon.len=%u\n",
+                    (unsigned)userS.length(), (unsigned)passS.length(), (unsigned)idS.length(), (unsigned)anonS.length());
 
       if (ssidS.isEmpty() || userS.isEmpty() || passS.isEmpty()){
+        Serial.println("[BLE][WORKER][ERROR] missing_fields (EAP)");
         provisioningSetStatus("{\"status\":\"missing_fields\"}");
         continue;
       }
@@ -186,7 +231,9 @@ static void credWorker(void*){
       prefs.end();
     } else {
       String pwdS = doc["password"] | "";
+      Serial.printf("[BLE][WORKER] PSK: pwd.len=%u\n", (unsigned)pwdS.length());
       if (ssidS.isEmpty() || pwdS.isEmpty()){
+        Serial.println("[BLE][WORKER][ERROR] missing_fields (PSK)");
         provisioningSetStatus("{\"status\":\"missing_fields\"}");
         continue;
       }
@@ -213,21 +260,29 @@ static void credWorker(void*){
 class CredentialsCallback : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo&) override {
     const std::string raw = c->getValue();
+    Serial.printf("[APP->ESP][WRITE] chunk bytes=%u\n", (unsigned)raw.length());
+    if (!raw.empty()) {
+      printHex((const uint8_t*)raw.data(), raw.size(), "APP->ESP");
+      printAsciiPreview((const uint8_t*)raw.data(), raw.size());
+    }
+
     if (!sAccMutex) sAccMutex = xSemaphoreCreateMutex();
     xSemaphoreTake(sAccMutex, portMAX_DELAY);
 
-    // 🔧 Concaténer en respectant la longueur (sans s'appuyer sur '\0')
     g_acc.reserve(g_acc.length() + raw.length());
-    for (size_t i = 0; i < raw.length(); ++i) {
-      g_acc += (char)raw[i];
-    }
-    Serial.printf("[BLE][onWrite] len=%u, accLen=%u\n", (unsigned)raw.length(), (unsigned)g_acc.length());
+    for (size_t i = 0; i < raw.length(); ++i) g_acc += (char)raw[i];
+
+    Serial.printf("[BLE][onWrite] accLen=%u\n", (unsigned)g_acc.length());
     if (g_acc.length() >= 1) {
       char last = g_acc[g_acc.length()-1];
-      Serial.printf("[BLE][onWrite] last='%c' (0x%02X)\n", (last>=32 && last<127)?last:'.', (unsigned char)last);
+      Serial.printf("[BLE][onWrite] acc.last='%c' (0x%02X)\n",
+        (last>=32 && last<127)?last:'.', (unsigned char)last);
     }
 
-    bool done = g_acc.endsWith("}");   // ton framing reste inchangé
+    bool done = g_acc.endsWith("}");
+    if (done) {
+      Serial.println("[BLE][onWrite] detected end-of-JSON '}' -> wake worker");
+    }
     xSemaphoreGive(sAccMutex);
     if (!done) return;
 
@@ -285,6 +340,7 @@ void setupBLE(bool startAdvertising) {
     credentialsCharacteristicUUID,
     NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
   );
+
   credentialsCharacteristic->setCallbacks(new CredentialsCallback());
   credentialsCharacteristic->createDescriptor("2901")->setValue("WiFi Credentials");
 
