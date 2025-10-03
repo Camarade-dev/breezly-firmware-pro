@@ -4,11 +4,22 @@
 
 #include <WiFi.h>
 #include "esp_task_wdt.h"
-
+#include "wifi_status_helpers.h"
 extern "C" {
   #include "esp_wifi.h"
   #include "esp_event.h"
   #include "esp_eap_client.h"   // API Enterprise moderne (ESP-IDF 5.x)
+}
+extern bool bleInited;
+extern void restartBLEAdvertising();
+
+static volatile int s_lastDiscReasonEap = -1;
+static esp_event_handler_instance_t s_discInstEap = nullptr;
+
+static void onStaDiscEap(void*, esp_event_base_t, int32_t, void* data) {
+  auto* ev = (wifi_event_sta_disconnected_t*)data;
+  s_lastDiscReasonEap = ev ? ev->reason : -1;
+  Serial.printf("[EAP] STA_DISCONNECTED reason=%d\n", s_lastDiscReasonEap);
 }
 
 // ─────────────────────────── Hooks no-op (si tu veux pauser d’autres stacks)
@@ -31,24 +42,23 @@ extern const uint8_t _binary_src_certs_ca_rezoleo_pem_end[];
 
 // ─────────────────────────── Connexion WPA2-Enterprise (PEAP/MSCHAPv2)
 bool connectToWiFiEnterprise() {
-  // Champs requis EAP
   if (wifiSSID.isEmpty() || eapUsername.isEmpty() || eapPassword.isEmpty()) {
     Serial.println("[EAP] champs manquants (ssid/user/pass)");
+    provSet("status", "missing_fields");
     return false;
   }
 
-  // Préparer WiFi via Arduino (NE PAS étendre la pile → wifioff=false)
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect(false, true);           // efface juste l'AP/état
-  esp_wifi_set_ps(WIFI_PS_NONE);          // pas d’économie d’énergie pendant l’auth
+  WiFi.disconnect(false, true);
+  esp_wifi_set_ps(WIFI_PS_NONE);
 
-  // Handler de déconnexion (diag, enregistré 1 seule fois)
-  if (!s_discInst) {
-    esp_event_handler_instance_register(
-      WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &onStaDisc, nullptr, &s_discInst);
+  // handler (1 fois)
+  if (!s_discInstEap) {
+    ESP_ERROR_CHECK( esp_event_handler_instance_register(
+      WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &onStaDiscEap, nullptr, &s_discInstEap) );
   }
 
-  // Nettoyage Enterprise "best effort"
+  // Nettoyage EAP
   esp_wifi_sta_enterprise_disable();
   #ifdef esp_eap_client_clear_identity
     esp_eap_client_clear_identity();
@@ -69,21 +79,20 @@ bool connectToWiFiEnterprise() {
     esp_eap_client_clear_cert_key();
   #endif
 
-  // Identités + MDP + CA
+  // Identités + MDP + CA (comme avant)
   const String outer = eapAnon.length() ? eapAnon : "ano@rezoleo.fr";
   ESP_ERROR_CHECK( esp_eap_client_set_identity((const uint8_t*)outer.c_str(), outer.length()) );
   ESP_ERROR_CHECK( esp_eap_client_set_username((const uint8_t*)eapUsername.c_str(), eapUsername.length()) );
   ESP_ERROR_CHECK( esp_eap_client_set_password((const uint8_t*)eapPassword.c_str(), eapPassword.length()) );
-
-  // Si l’horloge n’est pas à l’heure au boot → évite l’échec « cert non encore valide »
   esp_eap_client_set_disable_time_check(true);
 
-  const uint8_t* ca_start = _binary_src_certs_ca_rezoleo_pem_start;
-  const uint8_t* ca_end   = _binary_src_certs_ca_rezoleo_pem_end;
+  extern const uint8_t _binary_src_certs_ca_rezoleo_pem_start[];
+  extern const uint8_t _binary_src_certs_ca_rezoleo_pem_end[];
   ESP_ERROR_CHECK( esp_eap_client_set_ca_cert(
-      (const unsigned char*)ca_start, (int)(ca_end - ca_start)) );
+      (const unsigned char*)_binary_src_certs_ca_rezoleo_pem_start,
+      (int)(_binary_src_certs_ca_rezoleo_pem_end - _binary_src_certs_ca_rezoleo_pem_start)
+  ) );
 
-  // Activer EAP (si NOT_INIT, s’assurer du mode STA et réessayer)
   esp_err_t er = esp_wifi_sta_enterprise_enable();
   if (er == ESP_ERR_WIFI_NOT_INIT) {
     WiFi.mode(WIFI_STA);
@@ -91,12 +100,12 @@ bool connectToWiFiEnterprise() {
   }
   ESP_ERROR_CHECK(er);
 
-  // Associer via Arduino (ne pas utiliser esp_wifi_connect ici)
   Serial.printf("[EAP] Connexion à '%s'…\n", wifiSSID.c_str());
-  pauseOtherNetWork();
+  provSet("status", "connecting");
+
   WiFi.begin(wifiSSID.c_str());
 
-  // Attente ~20 s avec feed WDT
+  // Attente ~20 s
   bool ok = false;
   for (int i = 0; i < 80; ++i) {
     if (WiFi.status() == WL_CONNECTED) { ok = true; break; }
@@ -111,18 +120,28 @@ bool connectToWiFiEnterprise() {
     Serial.printf("[EAP] OK IP=%s  RSSI=%d\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI());
 
-    // Démarre SNTP APRÈS le lien Wi-Fi (évite les asserts lwIP)
+    // 1) Wi-Fi OK
+    provSet("status", "wifi_ok");
+
+    // 2) Internet ?
+    bool inet = checkInternetReachable();
+    if (!inet) {
+      Serial.println("[EAP] Internet unreachable");
+      provSet("status", "inet_unreachable");
+      return false;
+    }
+
+    provSet("status", "inet_ok");
+    // 3) Final
+    provisioningNotifyConnected();
     startSNTPAfterConnected();
-
-    // (Optionnel) tu pourras réactiver la vérif de date plus tard si tu veux :
-    // esp_eap_client_set_disable_time_check(false);
-
-    resumeOtherNetWork();
     return true;
-  } else {
-    wifiConnected = false;
-    Serial.println("[EAP] ÉCHEC");
-    resumeOtherNetWork();
-    return false;
   }
+
+  // Échec : préciser la cause
+  wifiConnected = false;
+  const char* st = mapDiscReasonToStatus(s_lastDiscReasonEap);
+  provSet("status", st);
+  if (bleInited) restartBLEAdvertising();
+  return false;
 }

@@ -10,7 +10,7 @@ bool timeIsSane() {
   // > 2023-11-14 environ
   return time(nullptr) > 1700000000;
 }
-
+void stopSNTP(){ if (sntpStarted) { esp_sntp_stop(); sntpStarted = false; } }
 void startSNTPAfterConnected() {
   if (sntpStarted) return;
   sntpStarted = true;
@@ -24,7 +24,11 @@ void startSNTPAfterConnected() {
 
   // Attente active (max ~10 s). Augmente si besoin.
   for (int i = 0; i < 80; ++i) {  // 80*250ms ≈ 20 s
-    if (timeIsSane()) break;
+    if (timeIsSane())
+    { 
+      esp_sntp_stop(); sntpStarted=false;
+      break;
+    }
     delay(250);
   }
 }
