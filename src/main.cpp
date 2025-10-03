@@ -3,10 +3,11 @@
 
 #include "core/globals.h"
 #include "utils/crc_utils.h"
-
+#include "power/sleep.h"
 #include "led/led_status.h"
 #include "ble/provisioning.h"
 #include "net/mqtt_bus.h"
+#include "power/power_config.h"
 #include "ota/ota.h"
 #include "sensors/sensors.h"
 #include <WiFi.h>
@@ -15,6 +16,7 @@
 #include "esp_task_wdt.h"
 #include <ArduinoJson.h>
 #include "core/devkey_runtime.h"
+#include "power/cpu_pm.h"
 static bool s_twdtReady = false;
 void doFactoryResetOnMainLoop(){
   updateLedState(LED_UPDATING);
@@ -38,7 +40,16 @@ void doFactoryResetOnMainLoop(){
   delay(200);
   ESP.restart();
 }
+static unsigned long lastEns = 0;
+static unsigned long lastPms = 0;
 
+static inline bool isNight(){
+  // Minimal : entre 23:00 et 07:00, affine si tu as déjà un SNTP fiable
+  time_t now = time(nullptr);
+  struct tm t; localtime_r(&now, &t);
+  int h = t.tm_hour;
+  return (h >= 23 || h < 7);
+}
 static void twdtInitOnce() {
   if (s_twdtReady) return;
 
@@ -81,6 +92,7 @@ void setup(){
   delay(4000);
   Serial.begin(115200);
   Serial.printf("Flash chip size: %u MB\n", ESP.getFlashChipSize()/(1024*1024));
+  enableCpuPM();
   otaOnBootValidate(); 
   twdtInitOnce();
     
@@ -150,6 +162,8 @@ void setup(){
   sensorsInit();
   gPmsMutex = xSemaphoreCreateMutex();
   pmsTaskStart(16, 17);
+  pmsInitPins(15); // SET=15
+  pmsSleep();
   // 2) Tenter la connexion Wi-Fi immédiate si on a des identifiants
   //    (en cas d’échec, connectToWiFi() s’occupe de relancer l’advertising BLE)
   if (!missingCreds) {
@@ -247,42 +261,80 @@ void loop(){
 
   // Publish capteurs
   if (!g_factoryResetPending && mqtt_is_connected()){
-    unsigned long now = millis();
-    if ((long)(now - lastPublish) >= 5000){
-      lastPublish = now;
+    const bool night = isNight();
+    const unsigned long ENS_PERIOD = night ? ENS_READ_PERIOD_MS_NIGHT : ENS_READ_PERIOD_MS_DAY;
+    const unsigned long PMS_PERIOD = night ? PMS_SAMPLE_PERIOD_MS_NIGHT : PMS_SAMPLE_PERIOD_MS_DAY;
+    if (night) { 
+      if (!ledIsMuted()) ledSuspend();       // coupe totalement
+    } else {
+      if (ledIsMuted()) ledResume();         // rallume le jour
+    }
+    unsigned long nowMs = millis();
 
-      float t,h;
+    bool doEns = (long)(nowMs - lastEns) >= (long)ENS_PERIOD;
+    bool doPms = (long)(nowMs - lastPms) >= (long)PMS_PERIOD;
+
+    float t,h; int aqi=0,tvoc=0,eco2=0;
+    PmsData p = {}; bool havePms = false;
+
+    if (doEns){
       if (safeSensorRead(t,h)){
-        int aqi,tvoc,eco2; sensorsReadEns160(aqi,tvoc,eco2,t,h);
+        sensorsReadEns160(aqi,tvoc,eco2,t,h);
+        lastEns = nowMs;
+      } else {
+        // lecture AHT/ENS KO : on retentera au prochain tick
+        doEns = false;
+      }
+    }
 
+    if (doPms){
+      // échantillon ponctuel bloquant : wake -> warmup -> read -> sleep
+      havePms = pmsSampleBlocking(PMS_WARMUP_MS, p);
+      lastPms = nowMs;
+    }
+
+    if (doEns || doPms){
+      // LED feedback humidité (comme chez toi)
+      if (doEns){
         if (h>=40 && h<=60) updateLedState(LED_GOOD);
         else if ((h>=20&&h<40)||(h>60&&h<=70)) updateLedState(LED_MODERATE);
         else updateLedState(LED_BAD);
-
-        PmsData p; bool have=false;
-        if (gPmsMutex && xSemaphoreTake(gPmsMutex, 5/portTICK_PERIOD_MS)==pdTRUE){
-          p = gPms; xSemaphoreGive(gPmsMutex);
-          have = p.valid && (millis()-p.lastMs < 5000);
-        }
-
-        StaticJsonDocument<512> j;
-        j["temperature"]=t; j["humidity"]=h; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
-        if (have){
-          JsonObject atm = j["pms"]["atm"].to<JsonObject>();   atm["pm1"]=p.pm1_atm;   atm["pm25"]=p.pm25_atm; atm["pm10"]=p.pm10_atm;
-          JsonObject cf1 = j["pms"]["cf1"].to<JsonObject>();   cf1["pm1"]=p.pm1_cf1;   cf1["pm25"]=p.pm25_cf1; cf1["pm10"]=p.pm10_cf1;
-          JsonObject cnt = j["pms"]["counts"].to<JsonObject>();cnt["gt03"]=p.gt03; cnt["gt05"]=p.gt05; cnt["gt10"]=p.gt10; cnt["gt25"]=p.gt25; cnt["gt50"]=p.gt50; cnt["gt100"]=p.gt100;
-        }
-        j["sensorId"]=sensorId; j["userId"]=userId;
-
-        String s; serializeJson(j,s);
-        mqtt_enqueue("capteurs/qualite_air", s, 0, false);
-        Serial.println(s);
-      } else {
-        updateLedState(LED_BAD);
       }
+
+      StaticJsonDocument<512> j;
+      if (doEns){
+        j["temperature"]=t; j["humidity"]=h; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
+      }
+      if (havePms){
+        JsonObject atm = j["pms"]["atm"].to<JsonObject>();   atm["pm1"]=p.pm1_atm;   atm["pm25"]=p.pm25_atm; atm["pm10"]=p.pm10_atm;
+        JsonObject cf1 = j["pms"]["cf1"].to<JsonObject>();   cf1["pm1"]=p.pm1_cf1;   cf1["pm25"]=p.pm25_cf1; cf1["pm10"]=p.pm10_cf1;
+        JsonObject cnt = j["pms"]["counts"].to<JsonObject>();cnt["gt03"]=p.gt03; cnt["gt05"]=p.gt05; cnt["gt10"]=p.gt10; cnt["gt25"]=p.gt25; cnt["gt50"]=p.gt50; cnt["gt100"]=p.gt100;
+      }
+
+      j["sensorId"]=sensorId; j["userId"]=userId;
+
+      String s; serializeJson(j,s);
+      mqtt_enqueue("capteurs/qualite_air", s, 0, false);
+      Serial.println(s);
+      mqtt_flush(200);  // on pousse vite
+
+      // Fenêtre interactive courte après publish
+      enterModemSleep(true);
+      lightNapMs(INTERACTIVE_WINDOW_MS);
+      enterModemSleep(false);
     }
   }
-  }
+}
   twdtResetSafe();
-  delay(5);
+  vTaskDelay(5/portTICK_PERIOD_MS);
+  #if USE_DEEP_SLEEP
+    if (!otaIsInProgress() && !g_factoryResetPending && mqtt_is_connected()){
+      // Exemple : si nuit et rien à faire pendant 2 minutes -> deep sleep
+      if (isNight()){
+        pmsSleep();
+        updateLedState(LED_BOOT); // fixe une couleur discrète avant dodo
+        deepSleepForMs(120000);
+      }
+    }
+  #endif
 }

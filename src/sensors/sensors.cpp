@@ -2,11 +2,34 @@
 #include <Wire.h>
 
 static bool pmsStarted = false;
+static int s_pmsSetPin = -1;
+void pmsInitPins(int setPin){
+  s_pmsSetPin = setPin;
+  pinMode(setPin, OUTPUT);
+  digitalWrite(setPin, HIGH); // actif par défaut
+}
 
+// Échantillon bloquant : réveille, attend warmup, lit la dernière trame vue, rendort
+bool pmsSampleBlocking(uint32_t warmupMs, PmsData& out){
+  pmsWake();
+  uint32_t t0 = millis();
+  // Laisse tourner la tâche PMS qui met à jour gPms
+  while ((millis() - t0) < warmupMs){
+    vTaskDelay(100/portTICK_PERIOD_MS);
+  }
+
+  bool have = false;
+  if (gPmsMutex && xSemaphoreTake(gPmsMutex, 100/portTICK_PERIOD_MS) == pdTRUE){
+    if (gPms.valid && (millis() - gPms.lastMs) < 5000) { out = gPms; have = true; }
+    xSemaphoreGive(gPmsMutex);
+  }
+  pmsSleep();
+  return have;
+}
 bool sensorsInit(){
   Wire.begin();
   delay(100);
-
+  Wire.setClock(100000);
   if (!aht.begin())  Serial.println("AHT21 initialization failed!");
   else               Serial.println("AHT21 initialisé avec succès.");
 
@@ -61,22 +84,24 @@ static bool readPmsFrame(HardwareSerial &ser, PmsData &out) {
   return false;
 }
 
-static void pmsTask(void *){
-  PMS.begin(9600, SERIAL_8N1, 16, 17); // pins 16/17 câblés comme ton code
-  uint32_t t0=millis(); while (millis()-t0<5000) vTaskDelay(100/portTICK_PERIOD_MS);
+static volatile bool s_pmsAwake = false;
+void pmsWake(){  if (s_pmsSetPin>=0) digitalWrite(s_pmsSetPin, HIGH); s_pmsAwake=true; }
+void pmsSleep(){ if (s_pmsSetPin>=0) digitalWrite(s_pmsSetPin, LOW);  s_pmsAwake=false; }
 
+static void pmsTask(void *){
+  PMS.begin(9600, SERIAL_8N1, 16, 17);
+  uint32_t t0=millis(); while (millis()-t0<5000) vTaskDelay(100/portTICK_PERIOD_MS);
   PmsData tmp; static uint32_t seq=0;
   for(;;){
-    if (readPmsFrame(PMS, tmp)){
+    if (s_pmsAwake && readPmsFrame(PMS, tmp)){
       tmp.seq = ++seq;
       if (gPmsMutex && xSemaphoreTake(gPmsMutex, 5/portTICK_PERIOD_MS)==pdTRUE){
         gPms = tmp; xSemaphoreGive(gPmsMutex);
       }
     }
-    vTaskDelay(50/portTICK_PERIOD_MS);
+    vTaskDelay(s_pmsAwake ? 50/portTICK_PERIOD_MS : 250/portTICK_PERIOD_MS);
   }
 }
-
 void pmsTaskStart(int rx, int tx){
   (void)rx; (void)tx; // câblés en dur
   if (pmsStarted) return;
