@@ -1,6 +1,6 @@
 #pragma once
 
-#define CURRENT_FIRMWARE_VERSION "1.0.8"
+#define CURRENT_FIRMWARE_VERSION "1.0.9"
 static const char* FW_MANIFEST_URL =
   "https://breezly-backend.onrender.com/firmware/esp32/wroom32e/prod/manifest.json";
 

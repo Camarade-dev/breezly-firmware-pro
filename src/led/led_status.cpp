@@ -82,11 +82,11 @@ static void ledTask(void *){
 
     // Breathing
     if (currentLedMode==LED_GOOD || currentLedMode==LED_MODERATE || currentLedMode==LED_UPDATING){
-      brightness += (up ? 5 : -5);
+      brightness += (up ? 2 : -2);
       int maxB = 150, minB = 10;
       if (brightness >= maxB){ brightness = maxB; up = false; }
       if (brightness <= minB){ brightness = minB; up = true; }
-      int delayMs = (currentLedMode==LED_UPDATING) ? 60 : 80; // au lieu de 40/30
+      int delayMs = (currentLedMode==LED_UPDATING) ? 30 : 40;
       vTaskDelay(delayMs/portTICK_PERIOD_MS);
     } else if (currentLedMode==LED_BAD){
       brightness = 255; 

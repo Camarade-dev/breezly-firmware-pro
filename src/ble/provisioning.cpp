@@ -7,6 +7,7 @@
 #include "utils/crc_utils.h"   // computeChecksum(...)
 #include "mbedtls/md.h"
 #include "core/devkey_runtime.h"
+#include "led/led_status.h"   // ledSuspend()/ledResume()
 static NimBLEUUID serviceUUID("60f8a11f-e56f-4c3c-9658-5578e2f8d754");
 static NimBLEUUID credentialsCharacteristicUUID("d6f37ab1-4367-4001-b311-f219e161b736");
 static NimBLEUUID statusCharacteristicUUID      ("11f47ab2-1111-4002-b316-f219e161b736");
