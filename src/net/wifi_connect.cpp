@@ -48,7 +48,7 @@ static bool connectToWiFiPSK() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true, true);
   provSet("status", "connecting");              // ← statut UX
-
+  updateLedState(LED_PAIRING); // ← statut LED
   WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
   Serial.printf("[WiFi] Connexion à '%s'...\n", wifiSSID.c_str());
 

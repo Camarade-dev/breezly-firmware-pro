@@ -43,13 +43,6 @@ void doFactoryResetOnMainLoop(){
 static unsigned long lastEns = 0;
 static unsigned long lastPms = 0;
 
-static inline bool isNight(){
-  // Minimal : entre 23:00 et 07:00, affine si tu as déjà un SNTP fiable
-  time_t now = time(nullptr);
-  struct tm t; localtime_r(&now, &t);
-  int h = t.tm_hour;
-  return (h >= 23 || h < 7);
-}
 static void twdtInitOnce() {
   if (s_twdtReady) return;
 
@@ -98,6 +91,7 @@ void setup(){
     
 
   ledInit(LED_PIN, LED_COUNT);
+  
   updateLedState(LED_BOOT);
   
 
@@ -150,7 +144,7 @@ void setup(){
   Serial.printf("SID : %s\n", sensorId.c_str());
   Serial.printf("UID : %s\n", userId.c_str());
   Serial.println("-----------------");
-  
+  updateLedState(LED_PAIRING);
   setupBLE(needProv);  // ← démarre BLE tout de suite si provisioning requis
 
   // (optionnel) attendre un peu:
@@ -167,6 +161,7 @@ void setup(){
   // 2) Tenter la connexion Wi-Fi immédiate si on a des identifiants
   //    (en cas d’échec, connectToWiFi() s’occupe de relancer l’advertising BLE)
   if (!missingCreds) {
+    updateLedState(LED_PAIRING);
     Serial.println("Tentative de connexion avec les identifiants sauvegardés...");
     connectToWiFi();
   }
@@ -182,6 +177,7 @@ void setup(){
   mqtt_request_connect();  // demande une première connexion
 
   Serial.println("[BOOT] Setup terminé");
+  updateLedState(LED_BOOT);
   lastWifiAttemptMs = millis();
 }
 
@@ -261,16 +257,11 @@ void loop(){
 
   // Publish capteurs
   if (!g_factoryResetPending && mqtt_is_connected()){
-    const bool night = isNight();
-    const unsigned long ENS_PERIOD = night ? ENS_READ_PERIOD_MS_NIGHT : ENS_READ_PERIOD_MS_DAY;
-    const unsigned long PMS_PERIOD = night ? PMS_SAMPLE_PERIOD_MS_NIGHT : PMS_SAMPLE_PERIOD_MS_DAY;
-    if (night) { 
-      if (!ledIsMuted()) ledSuspend();       // coupe totalement
-    } else {
-      if (ledIsMuted()) ledResume();         // rallume le jour
-    }
-    unsigned long nowMs = millis();
 
+    const unsigned long ENS_PERIOD = ENS_READ_PERIOD_MS_DAY;
+    const unsigned long PMS_PERIOD = PMS_SAMPLE_PERIOD_MS_DAY;
+    unsigned long nowMs = millis();
+    
     bool doEns = (long)(nowMs - lastEns) >= (long)ENS_PERIOD;
     bool doPms = (long)(nowMs - lastPms) >= (long)PMS_PERIOD;
 
@@ -330,11 +321,9 @@ void loop(){
   #if USE_DEEP_SLEEP
     if (!otaIsInProgress() && !g_factoryResetPending && mqtt_is_connected()){
       // Exemple : si nuit et rien à faire pendant 2 minutes -> deep sleep
-      if (isNight()){
         pmsSleep();
         updateLedState(LED_BOOT); // fixe une couleur discrète avant dodo
         deepSleepForMs(120000);
-      }
     }
   #endif
 }
