@@ -62,30 +62,34 @@ static bool connectToWiFiPSK() {
   Serial.println();
 
   if (WiFi.status()==WL_CONNECTED){
-    
-    Serial.printf("[WiFi] OK IP=%s RSSI=%d\n",
-                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    wifiAutoTxPower();
-    wifiConnected = true;
+  Serial.printf("[WiFi] OK IP=%s RSSI=%d\n",
+                WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  wifiAutoTxPower();
+  wifiConnected = true;
 
-    // Étape 1 : Wi-Fi OK
-    provSet("status", "wifi_ok");
+  // Étape 1 : Wi-Fi OK
+  provSet("status", "wifi_ok");
 
-    // Étape 2 : Internet ?
-    bool inet = checkInternetReachable();
-    if (!inet) {
-      Serial.println("[WiFi] Internet unreachable");
-      provSet("status", "inet_unreachable");
-      // On ne coupe pas le Wi-Fi, l’utilisateur peut corriger côté routeur
-      return false;
-    }
+  // 🔑 Lance la sync horloge tout de suite (évite le poulet–œuf)
+  startSNTPAfterConnected();
 
+  // Étape 2 : Internet ? (time-agnostic)
+  bool inet = checkInternetReachable();
+  if (!inet) {
+    Serial.println("[WiFi] Internet unreachable");
+    provSet("status", "inet_unreachable");
+    // Ne pas retourner false : on laisse SNTP/fallback corriger l'heure,
+    // ensuite OTA/MQTT pourront se connecter.
+  } else {
     provSet("status", "inet_ok");
-    // Étape 3 : final
-    provisioningNotifyConnected();
-    startSNTPAfterConnected();
-    return true;
   }
+
+  // Étape 3 : final
+  provisioningNotifyConnected();
+  return true;
+}
+
+
 
   // ÉCHEC: on tente d’éclairer la cause
   wifiConnected = false;

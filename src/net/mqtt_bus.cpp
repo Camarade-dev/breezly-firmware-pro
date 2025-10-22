@@ -14,17 +14,13 @@
 #include "../net/sntp_utils.h"
 #include <string>
 #include "../ca_bundle.h"
+
 #include "../app_config.h"  
 // ======= PARAMS BROKER (reprends les tiens) =======
 static const char* MQTT_HOST = "607207c4394d44b8bad11a33e8ed591d.s1.eu.hivemq.cloud";
 static const int   MQTT_PORT = 8883;
 static const char* MQTT_USER = "admin";
 static const char* MQTT_PASS = "26052004Sg";
-
-// ======= TLS CA embarqué (même symbole que ton code) =======
-//   platformio.ini -> board_build.embed_txtfiles = src/certs/hivemq_ca.pem
-extern const uint8_t _binary_src_certs_hivemq_ca_pem_start[];
-extern const uint8_t _binary_src_certs_hivemq_ca_pem_end[];
 
 // ======= Ressources de la tâche MQTT =======
 static WiFiClientSecure s_tls;
@@ -218,9 +214,6 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int len) {
     return;
   }
 }
-//extern const char CA_BUNDLE_PEM[];   // déjà fourni par ota/ca_bundle.h
-extern const uint8_t _binary_src_certs_hivemq_ca_pem_start[];
-extern const uint8_t _binary_src_certs_hivemq_ca_pem_end[];
 
 static const char* makePemZ(const uint8_t* start, const uint8_t* end) {
   static std::string buf;
@@ -232,10 +225,15 @@ static const char* makePemZ(const uint8_t* start, const uint8_t* end) {
 static bool mqtt_do_connect() {
   if (!wifiConnected || !timeIsSane()) return false;
 
-  // -------- TLS: utiliser le CA HiveMQ embarqué --------
-  const char* ca_pem = makePemZ(_binary_src_certs_hivemq_ca_pem_start,
-                                _binary_src_certs_hivemq_ca_pem_end);
-  s_tls.setCACert(ca_pem);
+  s_tls.setCACert(CA_BUNDLE_PEM);
+  s_tls.setTimeout(10000);
+
+  s_mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  s_mqtt.setBufferSize(2048);
+  s_mqtt.setKeepAlive(30);
+  s_mqtt.setSocketTimeout(10);
+  s_mqtt.setCallback(onMqttMessage);
+
   s_tls.setTimeout(10000);
 
   s_mqtt.setServer(MQTT_HOST, MQTT_PORT);   // SNI OK car on passe un hostname
@@ -298,19 +296,20 @@ static void mqttTask(void*) {
       }
       if (shouldTry) {
         s_lastConnAttemptMs = millis();
-        if (!timeIsSane()) {
-            if ((millis() - s_lastConnAttemptMs) >= RECONNECT_BACKOFF_MS) {
-                Serial.printf("[MQTT] waiting SNTP... now=%ld\n", (long)time(nullptr));
-                s_lastConnAttemptMs = millis();
-            }
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-            continue; // ne tente pas de connect
-            }
+
+        // <<<< AJOUT
+        ensureTlsClockReady(20000);
+        time_t now = time(nullptr);
+        Serial.printf("[MQTT] pre-connect, unix=%ld sane=%d\n", (long)now, (int)timeIsSaneHard());
+        if (!timeIsSaneHard()) { vTaskDelay(250/portTICK_PERIOD_MS); continue; }
+        // >>>>
+
         if (mqtt_do_connect()) s_connected = true;
       }
       vTaskDelay(50 / portTICK_PERIOD_MS);
       continue;
     }
+
 
     // Loop broker
     if (!s_mqtt.loop()) {
