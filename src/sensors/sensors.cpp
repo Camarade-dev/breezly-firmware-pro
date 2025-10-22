@@ -1,12 +1,20 @@
 #include "sensors.h"
 #include <Wire.h>
-
+#include "../app_config.h"
 static bool pmsStarted = false;
 static int s_pmsSetPin = -1;
+static bool pmsAlwaysOn = PMS_ALWAYS_ON;
+static volatile bool s_pmsAwake = false;
 void pmsInitPins(int setPin){
   s_pmsSetPin = setPin;
   pinMode(setPin, OUTPUT);
-  digitalWrite(setPin, HIGH); // actif par défaut
+  if (pmsAlwaysOn) {
+    digitalWrite(setPin, HIGH);  // allumé en permanence
+    s_pmsAwake = true;
+  } else {
+    digitalWrite(setPin, LOW);   // tu veux le comportement ancien par défaut
+    s_pmsAwake = false;
+  }
 }
 
 // Échantillon bloquant : réveille, attend warmup, lit la dernière trame vue, rendort
@@ -78,13 +86,15 @@ static bool readPmsFrame(HardwareSerial &ser, PmsData &out) {
     out.pm1_atm  = be16(&payload[8]);  out.pm25_atm = be16(&payload[10]); out.pm10_atm = be16(&payload[12]);
     out.gt03     = be16(&payload[14]); out.gt05     = be16(&payload[16]); out.gt10     = be16(&payload[18]);
     out.gt25     = be16(&payload[20]); out.gt50     = be16(&payload[22]); out.gt100    = be16(&payload[24]);
-
+    Serial.printf("PMS: CF1 PM1=%u PM2.5=%u PM10=%u | ATM PM1=%u PM2.5=%u PM10=%u\n",
+                  out.pm1_cf1, out.pm25_cf1, out.pm10_cf1,
+                  out.pm1_atm, out.pm25_atm, out.pm10_atm);
     out.valid=true; out.lastMs=millis(); return true;
   }
   return false;
 }
 
-static volatile bool s_pmsAwake = false;
+
 void pmsWake(){  if (s_pmsSetPin>=0) digitalWrite(s_pmsSetPin, HIGH); s_pmsAwake=true; }
 void pmsSleep(){ if (s_pmsSetPin>=0) digitalWrite(s_pmsSetPin, LOW);  s_pmsAwake=false; }
 

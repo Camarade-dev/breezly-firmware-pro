@@ -8,6 +8,7 @@
 #include "mbedtls/base64.h"
 #include "esp_heap_caps.h"
 #include <ArduinoJson.h>
+#include "../net/sntp_utils.h"
 #include "../core/globals.h"
 #include "../app_config.h"
 #include "../led/led_status.h"
@@ -324,6 +325,8 @@ void triggerOtaCheckNow(){ g_forceCheck = true; }
 void checkAndPerformCloudOTA(){
   OTA_VLOG("[OTA] check enter: wifi=%d inProg=%d force=%d", (WiFi.status()==WL_CONNECTED), (int)g_otaInProgress, (int)g_forceCheck);
   if (WiFi.status()!=WL_CONNECTED){ OTA_LOG("[OTA] WiFi KO"); return; }
+    ensureTlsClockReady(20000);
+  if (!timeIsSaneHard()) { OTA_LOG("[OTA] clock not sane → skip"); return; }
   if (g_otaInProgress || otaInProgress){ OTA_VLOG("[OTA] already in progress"); return; }
 
   const unsigned long PERIOD = 30UL*60UL*1000UL;
