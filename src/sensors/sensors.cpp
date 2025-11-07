@@ -1,6 +1,8 @@
 #include "sensors.h"
 #include <Wire.h>
 #include "../app_config.h"
+#include "calibration.h"
+
 static bool pmsStarted = false;
 static int s_pmsSetPin = -1;
 static bool pmsAlwaysOn = PMS_ALWAYS_ON;
@@ -16,7 +18,21 @@ void pmsInitPins(int setPin){
     s_pmsAwake = false;
   }
 }
+static inline float satVapor_hPa(float T){
+  return 6.112f * expf(17.62f * T / (243.12f + T));
+}
 
+static inline float rhTempCompensate(float RH_raw, float T_raw, float T_corr){
+  if (!isfinite(RH_raw) || !isfinite(T_raw) || !isfinite(T_corr)) return NAN;
+  if (fabsf(T_corr - T_raw) < 0.001f) return RH_raw;
+  const float es_raw  = satVapor_hPa(T_raw);
+  const float es_corr = satVapor_hPa(T_corr);
+  if (es_corr <= 0.0f) return NAN;
+  float RH = RH_raw * (es_raw / es_corr);
+  if (RH < 0.f)   RH = 0.f;
+  if (RH > 100.f) RH = 100.f;
+  return RH;
+}
 // Échantillon bloquant : réveille, attend warmup, lit la dernière trame vue, rendort
 bool pmsSampleBlocking(uint32_t warmupMs, PmsData& out){
   pmsWake();
@@ -47,7 +63,6 @@ bool sensorsInit(){
   if (!gPmsMutex) gPmsMutex = xSemaphoreCreateMutex();
   return true;
 }
-
 bool safeSensorRead(float& tempC, float& humidity){
   sensors_event_t eventHum, eventTemp;
   aht.getEvent(&eventHum, &eventTemp);
@@ -55,10 +70,31 @@ bool safeSensorRead(float& tempC, float& humidity){
     Serial.println("Erreur de lecture capteur : données invalides");
     return false;
   }
-  tempC = eventTemp.temperature;
-  humidity = eventHum.relative_humidity;
+
+  const float T_raw = eventTemp.temperature;
+  const float RH_raw = eventHum.relative_humidity;
+
+  // 1) Correction 3 niveaux sur TEMP
+  const float T_corr = calApplyTemp(T_raw);
+
+  // 2) Compensation d'humidité par changement de T (physique)
+  float RH_tc = rhTempCompensate(RH_raw, T_raw, T_corr);
+
+  // 3) (Optionnel) Appliquer ensuite ta calibration 3 niveaux HUM
+  //    Si tu ne veux pas de correction HR pour l'instant: commente la ligne suivante
+  //    Sinon, garde-la (avec bornes internes).
+  float RH_corr = /* calApplyHum( */ RH_tc /* ) */;
+
+  // Clamp final (sécurité)
+  if (!isfinite(RH_corr)) RH_corr = RH_tc; // fallback
+  if (RH_corr < 0.f)   RH_corr = 0.f;
+  if (RH_corr > 100.f) RH_corr = 100.f;
+
+  tempC   = T_corr;
+  humidity= RH_corr;
   return true;
 }
+
 
 void sensorsReadEns160(int& aqi, int& tvoc, int& eco2, float tempC, float humidity){
   if (ens160.available()){
