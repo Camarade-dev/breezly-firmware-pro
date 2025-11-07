@@ -2,6 +2,97 @@
 #include <Wire.h>
 #include "../app_config.h"
 #include "calibration.h"
+#include <math.h>
+
+
+
+struct PmsFiltState {
+  uint32_t lastMs = 0;
+  float pm1 = NAN, pm25 = NAN, pm10 = NAN;
+} s_pmsFilt;
+
+// ======= Réglages "usine" PMS (affine + anti-zéro + EMA) =======
+static constexpr float kPM1_Af  = 1.000f;
+static constexpr float kPM1_Bf  = 0.0f;
+static constexpr float kPM25_Af = 1.000f;
+static constexpr float kPM25_Bf = 1.5f;   // petit plancher usine (ex : +0.5 µg/m3)
+static constexpr float kPM10_Af = 1.000f;
+static constexpr float kPM10_Bf = 1.5f;
+
+// micro-estimation à partir des counts (heuristique douce)
+static constexpr uint16_t kCNT_MIN_FOR_FLOOR = 50; // on n'active qu'au-dessus
+static constexpr float    kPM25_CNT_K        = 0.005f; // µg/m3 par "count" (faible)
+static constexpr float    kPM10_CNT_K        = 0.008f; // µg/m3 par "count" (faible)
+static constexpr float    kPM_MIN_FLOOR_25   = 1.0f;   // plancher min si counts>seuil
+static constexpr float    kPM_MIN_FLOOR_10   = 1.0f;
+
+// EMA (constante de temps)
+static constexpr float kEMA_TAU_SEC = 8.0f;
+
+// Applique l'affine usine
+static inline float pmAffine(float x, float A, float B){
+  return A * x + B;
+}
+
+// Anti-zéro : si lecture 0 mais counts > seuil, injecte une micro-estimation
+static inline float pmAntiZeroFromCounts25(float pm25_raw, uint16_t gt03, uint16_t gt10, uint16_t gt25){
+  const uint32_t sum = (uint32_t)gt03 + gt10 + gt25;
+  if (pm25_raw > 0.0f || sum < kCNT_MIN_FOR_FLOOR) return pm25_raw;
+  float est = kPM25_CNT_K * (0.6f*gt03 + 0.3f*gt10 + 0.1f*gt25);
+  if (est < kPM_MIN_FLOOR_25) est = kPM_MIN_FLOOR_25;
+  return est;
+}
+static inline float pmAntiZeroFromCounts10(float pm10_raw, uint16_t gt10, uint16_t gt25, uint16_t gt50){
+  const uint32_t sum = (uint32_t)gt10 + gt25 + gt50;
+  if (pm10_raw > 0.0f || sum < kCNT_MIN_FOR_FLOOR) return pm10_raw;
+  float est = kPM10_CNT_K * (0.7f*gt10 + 0.2f*gt25 + 0.1f*gt50);
+  if (est < kPM_MIN_FLOOR_10) est = kPM_MIN_FLOOR_10;
+  return est;
+}
+
+// EMA avec dt adaptatif (en ms)
+static inline float emaStep(float prev, float x, uint32_t dt_ms, float tau_sec){
+  // alpha = 1 - exp(-dt/tau)
+  float alpha = 1.0f - expf(-(dt_ms / 1000.0f) / tau_sec);
+  if (!isfinite(prev)) return x;  // init
+  return prev + alpha * (x - prev);
+}
+
+// Corrige + anti-zéro + EMA
+void pmsPostProcess(const PmsData& in, float& pm1, float& pm25, float& pm10){
+  // 1) affine usine
+  float r1  = pmAffine((float)in.pm1_atm,  kPM1_Af,  kPM1_Bf);
+  float r25 = pmAffine((float)in.pm25_atm, kPM25_Af, kPM25_Bf);
+  float r10 = pmAffine((float)in.pm10_atm, kPM10_Af, kPM10_Bf);
+
+  // 2) anti-zéro basé counts (PM2.5 & PM10 surtout)
+  r25 = pmAntiZeroFromCounts25(r25, in.gt03, in.gt10, in.gt25);
+  r10 = pmAntiZeroFromCounts10 (r10, in.gt10, in.gt25, in.gt50);
+
+  // (on peut laisser PM1 sans anti-zéro, il a moins d’intérêt visuel au repos)
+
+  // clamp sécurité
+  if (r1  < 0.f) r1  = 0.f;
+  if (r25 < 0.f) r25 = 0.f;
+  if (r10 < 0.f) r10 = 0.f;
+
+  // 3) EMA
+  uint32_t now = millis();
+  uint32_t dt  = (s_pmsFilt.lastMs==0) ? 0 : (now - s_pmsFilt.lastMs);
+  s_pmsFilt.pm1  = emaStep(s_pmsFilt.pm1,  r1,  dt, kEMA_TAU_SEC);
+  s_pmsFilt.pm25 = emaStep(s_pmsFilt.pm25, r25, dt, kEMA_TAU_SEC);
+  s_pmsFilt.pm10 = emaStep(s_pmsFilt.pm10, r10, dt, kEMA_TAU_SEC);
+  s_pmsFilt.lastMs = now;
+
+  pm1  = s_pmsFilt.pm1;
+  pm25 = s_pmsFilt.pm25;
+  pm10 = s_pmsFilt.pm10;
+}
+
+
+
+
+
 
 static bool pmsStarted = false;
 static int s_pmsSetPin = -1;
