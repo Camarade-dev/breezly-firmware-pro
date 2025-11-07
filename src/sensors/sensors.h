@@ -11,3 +11,4 @@ void  pmsInitPins(int setPin);
 void  pmsSleep();                 // SET=LOW
 void  pmsWake();                  // SET=HIGH
 bool  pmsSampleBlocking(uint32_t warmupMs, PmsData& out); // wake->attend->lit->sleep
+void pmsPostProcess(const PmsData& in, float& pm1, float& pm25, float& pm10);

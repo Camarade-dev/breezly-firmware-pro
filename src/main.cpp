@@ -300,9 +300,27 @@ void loop(){
         j["temperature"]=t; j["humidity"]=h; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
       }
       if (havePms){
-        JsonObject atm = j["pms"]["atm"].to<JsonObject>();   atm["pm1"]=p.pm1_atm;   atm["pm25"]=p.pm25_atm; atm["pm10"]=p.pm10_atm;
-        JsonObject cf1 = j["pms"]["cf1"].to<JsonObject>();   cf1["pm1"]=p.pm1_cf1;   cf1["pm25"]=p.pm25_cf1; cf1["pm10"]=p.pm10_cf1;
-        JsonObject cnt = j["pms"]["counts"].to<JsonObject>();cnt["gt03"]=p.gt03; cnt["gt05"]=p.gt05; cnt["gt10"]=p.gt10; cnt["gt25"]=p.gt25; cnt["gt50"]=p.gt50; cnt["gt100"]=p.gt100;
+        float pm1f=0, pm25f=0, pm10f=0;
+        pmsPostProcess(p, pm1f, pm25f, pm10f);
+
+        // on peut arrondir gentiment pour publier de jolis entiers
+        uint16_t pm1u  = (uint16_t)lroundf(pm1f);
+        uint16_t pm25u = (uint16_t)lroundf(pm25f);
+        uint16_t pm10u = (uint16_t)lroundf(pm10f);
+
+        JsonObject atm = j["pms"]["atm"].to<JsonObject>();   
+        atm["pm1"]  = pm1u;   
+        atm["pm25"] = pm25u; 
+        atm["pm10"] = pm10u;
+
+        JsonObject cf1 = j["pms"]["cf1"].to<JsonObject>();   // tu peux garder le brut si tu veux
+        cf1["pm1"]  = p.pm1_cf1;   
+        cf1["pm25"] = p.pm25_cf1; 
+        cf1["pm10"] = p.pm10_cf1;
+
+        JsonObject cnt = j["pms"]["counts"].to<JsonObject>();
+        cnt["gt03"]=p.gt03; cnt["gt05"]=p.gt05; cnt["gt10"]=p.gt10;
+        cnt["gt25"]=p.gt25; cnt["gt50"]=p.gt50; cnt["gt100"]=p.gt100;
       }
 
       j["sensorId"]=sensorId; j["userId"]=userId;
