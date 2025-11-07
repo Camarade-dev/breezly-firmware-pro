@@ -40,20 +40,16 @@ void stopSNTP() {
 void startSNTPAfterConnected() {
   if (sntpStarted) return;
   sntpStarted = true;
-
   esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
-  esp_sntp_setservername(0, "pool.ntp.org");
-  // Tu peux en ajouter d'autres si tu veux :
-  // esp_sntp_setservername(1, "time.google.com");
-  // esp_sntp_setservername(2, "fr.pool.ntp.org");
+  esp_sntp_setservername(0, "fr.pool.ntp.org");
+  esp_sntp_setservername(1, "time.google.com");
+  esp_sntp_setservername(2, "pool.ntp.org");
   esp_sntp_init();
 
-  // Attente active (max ~20 s)
-  for (int i = 0; i < 80; ++i) {  // 80 * 250ms ≈ 20s
-    if (timeIsSaneHard()) { stopSNTP(); break; }
-    delay(250);
-  }
+  // Attente opportuniste (PAS de stopSNTP ici)
+  for (int i = 0; i < 80 && !timeIsSaneHard(); ++i) delay(250);
 }
+
 
 // === Fallback HTTP Date (si UDP/123 bloqué) ===
 static bool syncTimeFromHttpDate(int timeoutMs = 6000) {
