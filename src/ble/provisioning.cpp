@@ -22,7 +22,20 @@ static bool s_advertising   = false;
 
 extern bool bleInited;  // exporté via header
 // --- ajoute ce helper en haut du fichier ---
+static volatile uint32_t s_lastActivityMs = 0;
+static TaskHandle_t sWatchdogTask = nullptr;
+static bool s_wdEnabled = false;          // <— nouveau
 
+// 3 minutes de grâce par défaut (ajuste si tu veux)
+#ifndef PROV_IDLE_TIMEOUT_MS
+#define PROV_IDLE_TIMEOUT_MS 15000UL  // 15 s pour tester
+#endif
+static inline void wd_kick() { s_lastActivityMs = millis(); }
+static volatile bool s_gattConnected = false;   // NEW
+static inline void wd_enable(bool on) {
+  s_wdEnabled = on;
+  if (on) wd_kick();
+}
 static bool hmac_sha256(const uint8_t* key, size_t keylen, const uint8_t* msg, size_t msglen, uint8_t out[32]){
   mbedtls_md_context_t ctx; mbedtls_md_init(&ctx);
   const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
@@ -62,6 +75,9 @@ void provisioningSetStatus(const char* json){
 
 void provisioningNotifyConnected(){
   provisioningSetStatus("{\"status\":\"connected\"}");
+  wd_enable(false);
+  s_gattConnected = false;  // on coupe la session BLE “logiquement”
+  Serial.println("[WD] provisioning complete -> WD disabled, gatt=0");
 }
 // === Helpers de log hex/ASCII ===
 static void printHex(const uint8_t* buf, size_t len, const char* tag = "HEX") {
@@ -126,6 +142,17 @@ static void credWorker(void*){
     }
 
     const char* op = doc["op"] | "";
+    if (strcmp(op, "abort") == 0) {
+      // Feedback à l’app + remise à zéro de l’état de provisioning
+      provisioningSetStatus("{\"status\":\"aborted\",\"reason\":\"client_abort\"}");
+      g_acc = "";  // purge JSON accumulé
+      // Déconnexion “propre” si encore connecté côté GATT
+      NimBLEDevice::stopAdvertising(); // (facultatif, on va relancer)
+      // Si tu as un handle, tu peux forcer la déconnexion. Sinon, redémarrer la pub suffit.
+      restartBLEAdvertising();
+      continue; // rien d’autre à faire
+    }
+
     Serial.printf("[BLE][WORKER] op=\"%s\"\n", op);
 
     String modeS = doc["mode"]     | "psk";
@@ -257,9 +284,27 @@ static void credWorker(void*){
     provisioningSetStatus("{\"status\":\"connecting\"}");
   }
 }
+class ServerCb : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* s, ble_gap_conn_desc* d)  {
+    s_gattConnected = true;                     // <— flag sûr
+    wd_enable(true);
+    provisioningSetStatus("{\"status\":\"ble_connected\"}");
+    Serial.println("[WD] onConnect: enable WD, gattConnected=1");
+  }
+  void onDisconnect(NimBLEServer* s, ble_gap_conn_desc* d)  {
+    s_gattConnected = false;                    // <— flag sûr
+    provisioningSetStatus("{\"status\":\"idle\"}");
+    g_acc = "";
+    wd_enable(false);
+    Serial.println("[WD] onDisconnect: disable WD, gattConnected=0");
+    restartBLEAdvertising();
+  }
+};
+
 
 class CredentialsCallback : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo&) override {
+    wd_kick();
     const std::string raw = c->getValue();
     Serial.printf("[APP->ESP][WRITE] chunk bytes=%u\n", (unsigned)raw.length());
     if (!raw.empty()) {
@@ -293,9 +338,43 @@ class CredentialsCallback : public NimBLECharacteristicCallbacks {
     xTaskNotifyGive(sCredTask);
   }
 };
+static void sessionWatchdog(void*) {
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    if (!s_wdEnabled)                continue;
+    if (!s_gattConnected)            continue;   // <— remplace getConnectedCount()
+    // (optionnel) si tu veux garder un garde-fou : if (!pServer) continue;
+
+    const uint32_t now  = millis();
+    const uint32_t idle = now - s_lastActivityMs;
+
+    // DEBUG : trace toutes les 5 s
+    static uint32_t lastLog = 0;
+    if (now - lastLog > 5000) {
+      Serial.printf("[WD] enabled=1, gatt=1, idle=%lu/%lu ms\n",
+                    (unsigned long)idle, (unsigned long)PROV_IDLE_TIMEOUT_MS);
+      lastLog = now;
+    }
+
+    if (idle > PROV_IDLE_TIMEOUT_MS) {
+      Serial.println("[WD] TIMEOUT -> notify+restart adv");
+      // Ne notifie que si encore connecté (sinon ça ne sert à rien et peut planter)
+      provisioningSetStatus("{\"status\":\"timeout\"}");
+      g_acc = "";
+      restartBLEAdvertising();
+      wd_kick();               // évite une rafale
+      // On garde s_wdEnabled= true : si l’app se reconnecte, on repart
+    }
+  }
+}
+
+
 
 // --- API ---------------------------------------------------------------------
 void setupBLE(bool startAdvertising) {
+  wd_kick();
+  Serial.printf("[WD] init: timeout=%lu ms\n", (unsigned long)PROV_IDLE_TIMEOUT_MS);
   // Anti double-init : si déjà init, on peut juste (re)lancer la pub.
   if (s_bleInitDone) {
     if (startAdvertising && !s_advertising) {
@@ -334,7 +413,7 @@ void setupBLE(bool startAdvertising) {
   NimBLEDevice::setDeviceName(bleName);
 
   pServer = NimBLEDevice::createServer();
-
+  pServer->setCallbacks(new ServerCb());
   NimBLEService* pService = pServer->createService(serviceUUID);
 
   credentialsCharacteristic = pService->createCharacteristic(
@@ -368,6 +447,9 @@ void setupBLE(bool startAdvertising) {
 
   s_bleInitDone = true;
   bleInited     = true;
+  if (!sWatchdogTask) {
+    xTaskCreatePinnedToCore(sessionWatchdog, "BLE_WD", 4096, nullptr, 1, &sWatchdogTask, 0);
+  }
 }
 
 void restartBLEAdvertising() {
