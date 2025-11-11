@@ -41,6 +41,64 @@ String mqtt_topic_ota()    { return mqtt_topic_device_base() + "/ota"; }
 String mqtt_topic_ctrl()   { return mqtt_topic_device_base() + "/control"; }
 String mqtt_topic_status() { return mqtt_topic_device_base() + "/status"; }
 
+// --- Helpers unpair / reboot ---
+static void forgetWifiPrefs_All(bool alsoForgetUser){
+  Preferences p;
+  if (p.begin("myApp", false)) {
+    p.putUInt("wifiAuthType", (uint32_t)WIFI_CONN_PSK);
+    p.putString("wifiSSID", "");
+    p.putString("wifiPassword", "");
+    p.putString("eapUsername", "");
+    p.putString("eapPassword", "");
+    p.putString("eapIdentity", "");
+    p.putString("eapAnon", "");
+    if (alsoForgetUser) {
+      p.putString("userId", "");
+      // tu peux aussi vider "sensorId" si tu veux forcer un re-claim complet
+      // p.putString("sensorId", "");
+    }
+    p.end();
+  }
+
+  // Recharge globals en RAM
+  prefs.begin("myApp", true);
+  wifiSSID     = prefs.getString("wifiSSID", "");
+  wifiPassword = prefs.getString("wifiPassword", "");
+  wifiAuthType = (WifiAuthType)prefs.getUInt("wifiAuthType",(uint32_t)WIFI_CONN_PSK);
+  eapIdentity  = prefs.getString("eapIdentity", "");
+  eapUsername  = prefs.getString("eapUsername", "");
+  eapPassword  = prefs.getString("eapPassword", "");
+  eapAnon      = prefs.getString("eapAnon", "");
+  if (alsoForgetUser) {
+    userId = prefs.getString("userId", "");
+  }
+  prefs.end();
+}
+
+static void gracefulUnpairAndReboot(const char* reason){
+  // 1) Annonce retained “erasing/unpaired”
+  DynamicJsonDocument st(160);
+  st["state"]  = "erasing";
+  st["reason"] = reason ? reason : "unpair";
+  st["ts"]     = (uint64_t)(time(nullptr) * 1000ULL);
+  String s; serializeJson(st, s);
+  s_mqtt.publish(mqtt_topic_status().c_str(), s.c_str(), true); // retained
+
+  // 2) Clear retained /control pour éviter re-appliquer après reboot
+  String ctrlTopic = mqtt_topic_ctrl();
+  s_mqtt.publish(ctrlTopic.c_str(), "", true);
+  s_mqtt.loop();
+  delay(100);
+
+  // 3) Couper MQTT+WiFi proprement
+  s_mqtt.disconnect();
+  WiFi.disconnect(true, true);
+
+  // 4) Feedback LED et reboot
+  updateLedState(LED_UPDATING);
+  delay(150);
+  ESP.restart();
+}
 
 // ======= API =======
 bool mqtt_is_connected() { return s_connected; }
@@ -187,6 +245,81 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int len) {
         otaInProgress = false;
         vTaskDelete(NULL);
       }, "OTA_TASK", 8192, NULL, 1, NULL, 0);
+      return;
+    }
+    if (strcmp(action, "forget_wifi")==0) {
+      // —— Idempotence guard
+      uint64_t cmdTs = j["ts"] | 0ULL;
+      const char* cmdId = j["cmdId"] | "";
+
+      Preferences pGuard;
+      uint64_t lastTs = 0;
+      String   lastId = "";
+      if (pGuard.begin("myApp", true)) {
+        lastTs = pGuard.getULong64("forget_ts", 0ULL);
+        lastId = pGuard.getString("forget_id", "");
+        pGuard.end();
+      }
+
+      // If same id or older/equal timestamp, ignore (stale retained)
+      if ((cmdId[0] && lastId == cmdId) || (cmdTs && cmdTs <= lastTs)) {
+        publish_control_ack("forget_wifi", true, "ignored_duplicate");
+        return;
+      }
+
+      // Persist the newest cmd markers BEFORE doing anything destructive
+      if (pGuard.begin("myApp", false)) {
+        pGuard.putULong64("forget_ts", cmdTs ? cmdTs : (uint64_t)time(nullptr)*1000ULL);
+        if (cmdId[0]) pGuard.putString("forget_id", cmdId);
+        pGuard.end();
+      }
+
+      Preferences p;
+      if (p.begin("myApp", false)) {
+        p.putUInt("wifiAuthType", (uint32_t)WIFI_CONN_PSK);
+        p.putString("wifiSSID", "");
+        p.putString("wifiPassword", "");
+        p.putString("eapUsername", "");
+        p.putString("eapPassword", "");
+        p.putString("eapIdentity", "");
+        p.putString("eapAnon", "");
+        p.end();
+      }
+
+      // 2) Recharger les globals RAM (cohérence)
+      prefs.begin("myApp", true);
+      wifiSSID     = prefs.getString("wifiSSID", "");
+      wifiPassword = prefs.getString("wifiPassword", "");
+      wifiAuthType = (WifiAuthType)prefs.getUInt("wifiAuthType",(uint32_t)WIFI_CONN_PSK);
+      eapIdentity  = prefs.getString("eapIdentity", "");
+      eapUsername  = prefs.getString("eapUsername", "");
+      eapPassword  = prefs.getString("eapPassword", "");
+      eapAnon      = prefs.getString("eapAnon", "");
+      prefs.end();
+
+      // 3) ACK immédiat (non retained)
+      publish_control_ack("forget_wifi", true);
+
+      // 4) Publier un état RETAINED "erasing" pour l'app (feedback UX)
+      publish_status_retained("erasing", "forget_wifi");
+
+      // 5) Clear le retained /control pour éviter ré-application post-reboot
+      String ctrlTopic = mqtt_topic_ctrl();
+      s_mqtt.publish(ctrlTopic.c_str(), "", true);
+      s_mqtt.loop();
+      delay(80);
+
+      // 6) Vide au mieux la file de publish utilisateurs
+      mqtt_flush(200);
+
+      // 7) Couper proprement MQTT + Wi-Fi
+      s_mqtt.disconnect();
+      WiFi.disconnect(true, true);
+
+      // 8) LED → pairing (visuel immédiat) puis redémarrage "propre"
+      updateLedState(LED_PAIRING);
+      delay(120);
+      ESP.restart();
       return;
     }
 
