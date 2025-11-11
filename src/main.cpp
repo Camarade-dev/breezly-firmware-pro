@@ -295,29 +295,41 @@ void loop(){
         else updateLedState(LED_BAD);
       }
 
-      StaticJsonDocument<512> j;
+            StaticJsonDocument<512> j;
       if (doEns){
         j["temperature"]=t; j["humidity"]=h; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
       }
+
       if (havePms){
+        // 1) FUSION + LISSSAGE → valeurs UX au dixième
         float pm1f=0, pm25f=0, pm10f=0;
         pmsPostProcess(p, pm1f, pm25f, pm10f);
 
-        // on peut arrondir gentiment pour publier de jolis entiers
-        uint16_t pm1u  = (uint16_t)lroundf(pm1f);
-        uint16_t pm25u = (uint16_t)lroundf(pm25f);
-        uint16_t pm10u = (uint16_t)lroundf(pm10f);
+        auto round1 = [](float v)->float {
+          return floorf(v * 10.0f + 0.5f) / 10.0f; // arrondi au 0.1
+        };
 
-        JsonObject atm = j["pms"]["atm"].to<JsonObject>();   
-        atm["pm1"]  = pm1u;   
-        atm["pm25"] = pm25u; 
-        atm["pm10"] = pm10u;
+        // 2) Publis structurées
+        // --- ux : valeurs fusionnées/lissées (pour l’app & le backend)
+        JsonObject ux = j["pms"]["ux"].to<JsonObject>();
+        ux["pm1"]  = round1(pm1f);
+        ux["pm25"] = round1(pm25f);
+        ux["pm10"] = round1(pm10f);
+        ux["source"] = "fused-v1";   // méta rapide si tu veux versionner
 
-        JsonObject cf1 = j["pms"]["cf1"].to<JsonObject>();   // tu peux garder le brut si tu veux
-        cf1["pm1"]  = p.pm1_cf1;   
-        cf1["pm25"] = p.pm25_cf1; 
+        // --- atm : bruts du module (entiers, comme avant)
+        JsonObject atm = j["pms"]["atm"].to<JsonObject>();
+        atm["pm1"]  = p.pm1_atm;
+        atm["pm25"] = p.pm25_atm;
+        atm["pm10"] = p.pm10_atm;
+
+        // --- cf1 : bruts mode CF=1 (entiers, référence)
+        JsonObject cf1 = j["pms"]["cf1"].to<JsonObject>();
+        cf1["pm1"]  = p.pm1_cf1;
+        cf1["pm25"] = p.pm25_cf1;
         cf1["pm10"] = p.pm10_cf1;
 
+        // --- counts : compteurs par taille (diagnostic, anti-zéro)
         JsonObject cnt = j["pms"]["counts"].to<JsonObject>();
         cnt["gt03"]=p.gt03; cnt["gt05"]=p.gt05; cnt["gt10"]=p.gt10;
         cnt["gt25"]=p.gt25; cnt["gt50"]=p.gt50; cnt["gt100"]=p.gt100;
@@ -328,7 +340,8 @@ void loop(){
       String s; serializeJson(j,s);
       mqtt_enqueue("capteurs/qualite_air", s, 0, false);
       Serial.println(s);
-      mqtt_flush(200);  // on pousse vite
+      mqtt_flush(200);
+
 
       // Fenêtre interactive courte après publish
       enterModemSleep(true);

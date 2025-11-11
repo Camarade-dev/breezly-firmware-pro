@@ -1,87 +1,165 @@
+// src/sensors/sensors.cpp
 #include "sensors.h"
 #include <Wire.h>
 #include "../app_config.h"
 #include "calibration.h"
 #include <math.h>
+#ifndef PMS_LOG_BURST
+#define PMS_LOG_BURST 1   // 1 = affiche les rafales PMS dans le Serial
+#endif
+// ==== extern définis dans core/globals.h (NE PAS changer les types) ====
+extern HardwareSerial& PMS;   // <- référence, pas un objet
+extern PmsData gPms;
+extern SemaphoreHandle_t gPmsMutex;
+extern uint16_t be16(const uint8_t *b); // déjà déclaré dans globals.h
 
+// =======================================================================
+// ===================== Réglages UX (fusion + lissage) ==================
+// =======================================================================
 
+// Affine "usine" (+ petit plancher pour éviter 0 moches)
+static constexpr float kPM1_Af  = 1.000f;
+static constexpr float kPM1_Bf  = 0.0f;
+static constexpr float kPM25_Af = 1.000f;
+static constexpr float kPM25_Bf = 1.5f;
+static constexpr float kPM10_Af = 1.000f;
+static constexpr float kPM10_Bf = 1.5f;
+
+// Activ. fusion counts
+static constexpr uint16_t kCNT_MIN_FOR_FLOOR = 50;
+
+// Gains faibles (estimations par counts)
+static constexpr float kPM25_CNT_K = 0.005f;   // µg/m3 / count
+static constexpr float kPM10_CNT_K = 0.008f;   // µg/m3 / count
+static constexpr float kPM1_CNT_K  = 0.0035f;  // µg/m3 / count
+
+// Planchers doux si counts>seuil
+static constexpr float kPM_MIN_FLOOR_25 = 1.0f;
+static constexpr float kPM_MIN_FLOOR_10 = 1.0f;
+
+// EMA adaptatif (constantes de temps)
+static constexpr float kTAU_FAST   = 2.0f;  // pics
+static constexpr float kTAU_MID    = 4.0f;  // petits évènements
+static constexpr float kTAU_NORMAL = 8.0f;  // régime normal
+static constexpr float kTAU_CLEAN  = 10.0f; // air très propre
+
+// =======================================================================
+// =========================== Etat filtre courant =======================
+// =======================================================================
 
 struct PmsFiltState {
   uint32_t lastMs = 0;
   float pm1 = NAN, pm25 = NAN, pm10 = NAN;
 } s_pmsFilt;
 
-// ======= Réglages "usine" PMS (affine + anti-zéro + EMA) =======
-static constexpr float kPM1_Af  = 1.000f;
-static constexpr float kPM1_Bf  = 0.0f;
-static constexpr float kPM25_Af = 1.000f;
-static constexpr float kPM25_Bf = 1.5f;   // petit plancher usine (ex : +0.5 µg/m3)
-static constexpr float kPM10_Af = 1.000f;
-static constexpr float kPM10_Bf = 1.5f;
+// =======================================================================
+// ============================== Utilitaires ============================
+// =======================================================================
 
-// micro-estimation à partir des counts (heuristique douce)
-static constexpr uint16_t kCNT_MIN_FOR_FLOOR = 50; // on n'active qu'au-dessus
-static constexpr float    kPM25_CNT_K        = 0.005f; // µg/m3 par "count" (faible)
-static constexpr float    kPM10_CNT_K        = 0.008f; // µg/m3 par "count" (faible)
-static constexpr float    kPM_MIN_FLOOR_25   = 1.0f;   // plancher min si counts>seuil
-static constexpr float    kPM_MIN_FLOOR_10   = 1.0f;
+static inline float pmAffine(float x, float A, float B){ return A * x + B; }
 
-// EMA (constante de temps)
-static constexpr float kEMA_TAU_SEC = 8.0f;
-
-// Applique l'affine usine
-static inline float pmAffine(float x, float A, float B){
-  return A * x + B;
+static inline float emaAlpha(uint32_t dt_ms, float tau_sec){
+  float dt = dt_ms / 1000.0f;
+  return 1.0f - expf(-dt / fmaxf(tau_sec, 1e-3f));
 }
 
-// Anti-zéro : si lecture 0 mais counts > seuil, injecte une micro-estimation
-static inline float pmAntiZeroFromCounts25(float pm25_raw, uint16_t gt03, uint16_t gt10, uint16_t gt25){
-  const uint32_t sum = (uint32_t)gt03 + gt10 + gt25;
-  if (pm25_raw > 0.0f || sum < kCNT_MIN_FOR_FLOOR) return pm25_raw;
-  float est = kPM25_CNT_K * (0.6f*gt03 + 0.3f*gt10 + 0.1f*gt25);
-  if (est < kPM_MIN_FLOOR_25) est = kPM_MIN_FLOOR_25;
-  return est;
-}
-static inline float pmAntiZeroFromCounts10(float pm10_raw, uint16_t gt10, uint16_t gt25, uint16_t gt50){
-  const uint32_t sum = (uint32_t)gt10 + gt25 + gt50;
-  if (pm10_raw > 0.0f || sum < kCNT_MIN_FOR_FLOOR) return pm10_raw;
-  float est = kPM10_CNT_K * (0.7f*gt10 + 0.2f*gt25 + 0.1f*gt50);
-  if (est < kPM_MIN_FLOOR_10) est = kPM_MIN_FLOOR_10;
-  return est;
+static inline float emaStepAdaptive(float prev, float x, uint32_t dt_ms){
+  if (!isfinite(prev)) return x;
+  float dx = (dt_ms>0) ? fabsf(x - prev) : 0.0f;
+  float tau;
+  if (dx > 3.0f)      tau = kTAU_FAST;
+  else if (dx > 1.0f) tau = kTAU_MID;
+  else if (x < 1.0f)  tau = kTAU_CLEAN;
+  else                tau = kTAU_NORMAL;
+  float a = emaAlpha(dt_ms, tau);
+  return prev + a * (x - prev);
 }
 
-// EMA avec dt adaptatif (en ms)
-static inline float emaStep(float prev, float x, uint32_t dt_ms, float tau_sec){
-  // alpha = 1 - exp(-dt/tau)
-  float alpha = 1.0f - expf(-(dt_ms / 1000.0f) / tau_sec);
-  if (!isfinite(prev)) return x;  // init
-  return prev + alpha * (x - prev);
+// Estimations douces par counts
+static inline float pm25FromCounts(uint16_t gt03, uint16_t gt10, uint16_t gt25){
+  return kPM25_CNT_K * (0.6f*gt03 + 0.3f*gt10 + 0.1f*gt25);
+}
+static inline float pm10FromCounts(uint16_t gt10, uint16_t gt25, uint16_t gt50){
+  return kPM10_CNT_K * (0.7f*gt10 + 0.2f*gt25 + 0.1f*gt50);
+}
+static inline float pm1FromCounts(uint16_t gt03, uint16_t gt05){
+  return kPM1_CNT_K * (0.7f*gt03 + 0.3f*gt05);
 }
 
-// Corrige + anti-zéro + EMA
+// Poids de fusion β en fonction de la densité de counts + “escaliers”
+static inline float betaFromCountsShape(float pm_affine, float countsDensity, float betaMin, float betaMax){
+  float beta = 0.0f;
+  if (pm_affine < 2.0f && countsDensity > kCNT_MIN_FOR_FLOOR){
+    float t = (countsDensity - 50.0f) / (400.0f - 50.0f);
+    if (t<0) t=0; if (t>1) t=1;
+    beta = betaMin + (betaMax - betaMin) * t;
+  }
+  // boost léger si valeur "pile un entier" (effet escaliers)
+  if (fabsf(pm_affine - roundf(pm_affine)) < 0.05f) {
+    beta = fmaxf(beta, (betaMin + betaMax) * 0.5f);
+  }
+  return beta;
+}
+
+static inline float fusePm25(float pm25_affine, uint16_t gt03, uint16_t gt10, uint16_t gt25){
+  float est = pm25FromCounts(gt03, gt10, gt25);
+  float density = (float)gt03 + gt10 + gt25;
+  float beta = betaFromCountsShape(pm25_affine, density, 0.15f, 0.60f);
+  float fused = (1.0f - beta)*pm25_affine + beta*est;
+  if (pm25_affine <= 0.1f && density > kCNT_MIN_FOR_FLOOR)
+    fused = fmaxf(fused, kPM_MIN_FLOOR_25);
+  return fused;
+}
+
+static inline float fusePm10(float pm10_affine, uint16_t gt10, uint16_t gt25, uint16_t gt50){
+  float est = pm10FromCounts(gt10, gt25, gt50);
+  float density = (float)gt10 + gt25 + gt50;
+  float beta = betaFromCountsShape(pm10_affine, density, 0.10f, 0.50f);
+  float fused = (1.0f - beta)*pm10_affine + beta*est;
+  if (pm10_affine <= 0.1f && density > kCNT_MIN_FOR_FLOOR)
+    fused = fmaxf(fused, kPM_MIN_FLOOR_10);
+  return fused;
+}
+
+static inline float fusePm1_conservative(float pm1_affine, uint16_t gt03, uint16_t gt05){
+  // β plus faible pour ne pas “gonfler” artificiellement PM1 en air propre
+  float est = pm1FromCounts(gt03, gt05);
+  float density = (float)gt03 + gt05;
+  float beta = 0.0f;
+  if (pm1_affine < 1.0f && density > kCNT_MIN_FOR_FLOOR){
+    float t = (density - 50.0f) / (400.0f - 50.0f);
+    if (t<0) t=0; if (t>1) t=1;
+    beta = 0.10f + 0.30f*t; // 0.10 → 0.40
+  }
+  return (1.0f - beta)*pm1_affine + beta*est;
+}
+
+// =======================================================================
+// ============================ Post-traitement ==========================
+// =======================================================================
+
 void pmsPostProcess(const PmsData& in, float& pm1, float& pm25, float& pm10){
-  // 1) affine usine
-  float r1  = pmAffine((float)in.pm1_atm,  kPM1_Af,  kPM1_Bf);
-  float r25 = pmAffine((float)in.pm25_atm, kPM25_Af, kPM25_Bf);
-  float r10 = pmAffine((float)in.pm10_atm, kPM10_Af, kPM10_Bf);
+  // 1) affine
+  float a1  = pmAffine((float)in.pm1_atm,  kPM1_Af,  kPM1_Bf);
+  float a25 = pmAffine((float)in.pm25_atm, kPM25_Af, kPM25_Bf);
+  float a10 = pmAffine((float)in.pm10_atm, kPM10_Af, kPM10_Bf);
 
-  // 2) anti-zéro basé counts (PM2.5 & PM10 surtout)
-  r25 = pmAntiZeroFromCounts25(r25, in.gt03, in.gt10, in.gt25);
-  r10 = pmAntiZeroFromCounts10 (r10, in.gt10, in.gt25, in.gt50);
+  // 2) fusion counts
+  float f25 = fusePm25(a25, in.gt03, in.gt10, in.gt25);
+  float f10 = fusePm10(a10, in.gt10, in.gt25, in.gt50);
+  float f1  = fusePm1_conservative(a1, in.gt03, in.gt05); // option “conservatrice”
 
-  // (on peut laisser PM1 sans anti-zéro, il a moins d’intérêt visuel au repos)
+  // clamp
+  if (f1  < 0.f)  f1  = 0.f;
+  if (f25 < 0.f)  f25 = 0.f;
+  if (f10 < 0.f)  f10 = 0.f;
 
-  // clamp sécurité
-  if (r1  < 0.f) r1  = 0.f;
-  if (r25 < 0.f) r25 = 0.f;
-  if (r10 < 0.f) r10 = 0.f;
-
-  // 3) EMA
+  // 3) EMA adaptatif
   uint32_t now = millis();
   uint32_t dt  = (s_pmsFilt.lastMs==0) ? 0 : (now - s_pmsFilt.lastMs);
-  s_pmsFilt.pm1  = emaStep(s_pmsFilt.pm1,  r1,  dt, kEMA_TAU_SEC);
-  s_pmsFilt.pm25 = emaStep(s_pmsFilt.pm25, r25, dt, kEMA_TAU_SEC);
-  s_pmsFilt.pm10 = emaStep(s_pmsFilt.pm10, r10, dt, kEMA_TAU_SEC);
+  s_pmsFilt.pm1  = emaStepAdaptive(s_pmsFilt.pm1,  f1,  dt);
+  s_pmsFilt.pm25 = emaStepAdaptive(s_pmsFilt.pm25, f25, dt);
+  s_pmsFilt.pm10 = emaStepAdaptive(s_pmsFilt.pm10, f10, dt);
   s_pmsFilt.lastMs = now;
 
   pm1  = s_pmsFilt.pm1;
@@ -89,114 +167,26 @@ void pmsPostProcess(const PmsData& in, float& pm1, float& pm25, float& pm10){
   pm10 = s_pmsFilt.pm10;
 }
 
-
-
-
-
+// =======================================================================
+// ========================== Gestion du PMS (IO) ========================
+// =======================================================================
 
 static bool pmsStarted = false;
 static int s_pmsSetPin = -1;
 static bool pmsAlwaysOn = PMS_ALWAYS_ON;
 static volatile bool s_pmsAwake = false;
+
 void pmsInitPins(int setPin){
   s_pmsSetPin = setPin;
   pinMode(setPin, OUTPUT);
-  if (pmsAlwaysOn) {
-    digitalWrite(setPin, HIGH);  // allumé en permanence
-    s_pmsAwake = true;
-  } else {
-    digitalWrite(setPin, LOW);   // tu veux le comportement ancien par défaut
-    s_pmsAwake = false;
-  }
-}
-static inline float satVapor_hPa(float T){
-  return 6.112f * expf(17.62f * T / (243.12f + T));
+  if (pmsAlwaysOn) { digitalWrite(setPin, HIGH); s_pmsAwake = true; }
+  else             { digitalWrite(setPin, LOW);  s_pmsAwake = false; }
 }
 
-static inline float rhTempCompensate(float RH_raw, float T_raw, float T_corr){
-  if (!isfinite(RH_raw) || !isfinite(T_raw) || !isfinite(T_corr)) return NAN;
-  if (fabsf(T_corr - T_raw) < 0.001f) return RH_raw;
-  const float es_raw  = satVapor_hPa(T_raw);
-  const float es_corr = satVapor_hPa(T_corr);
-  if (es_corr <= 0.0f) return NAN;
-  float RH = RH_raw * (es_raw / es_corr);
-  if (RH < 0.f)   RH = 0.f;
-  if (RH > 100.f) RH = 100.f;
-  return RH;
-}
-// Échantillon bloquant : réveille, attend warmup, lit la dernière trame vue, rendort
-bool pmsSampleBlocking(uint32_t warmupMs, PmsData& out){
-  pmsWake();
-  uint32_t t0 = millis();
-  // Laisse tourner la tâche PMS qui met à jour gPms
-  while ((millis() - t0) < warmupMs){
-    vTaskDelay(100/portTICK_PERIOD_MS);
-  }
+void pmsWake(){  if (s_pmsSetPin>=0) digitalWrite(s_pmsSetPin, HIGH); s_pmsAwake=true; }
+void pmsSleep(){ if (s_pmsSetPin>=0) digitalWrite(s_pmsSetPin, LOW);  s_pmsAwake=false; }
 
-  bool have = false;
-  if (gPmsMutex && xSemaphoreTake(gPmsMutex, 100/portTICK_PERIOD_MS) == pdTRUE){
-    if (gPms.valid && (millis() - gPms.lastMs) < 5000) { out = gPms; have = true; }
-    xSemaphoreGive(gPmsMutex);
-  }
-  pmsSleep();
-  return have;
-}
-bool sensorsInit(){
-  Wire.begin();
-  delay(100);
-  Wire.setClock(100000);
-  if (!aht.begin())  Serial.println("AHT21 initialization failed!");
-  else               Serial.println("AHT21 initialisé avec succès.");
-
-  if (!ens160.begin()) Serial.println("Échec ENS160 !");
-  else { Serial.println("ENS160 initialisé avec succès."); ens160.setMode(ENS160_OPMODE_STD); }
-
-  if (!gPmsMutex) gPmsMutex = xSemaphoreCreateMutex();
-  return true;
-}
-bool safeSensorRead(float& tempC, float& humidity){
-  sensors_event_t eventHum, eventTemp;
-  aht.getEvent(&eventHum, &eventTemp);
-  if (isnan(eventTemp.temperature) || isnan(eventHum.relative_humidity)){
-    Serial.println("Erreur de lecture capteur : données invalides");
-    return false;
-  }
-
-  const float T_raw = eventTemp.temperature;
-  const float RH_raw = eventHum.relative_humidity;
-
-  // 1) Correction 3 niveaux sur TEMP
-  const float T_corr = calApplyTemp(T_raw);
-
-  // 2) Compensation d'humidité par changement de T (physique)
-  float RH_tc = rhTempCompensate(RH_raw, T_raw, T_corr);
-
-  // 3) (Optionnel) Appliquer ensuite ta calibration 3 niveaux HUM
-  //    Si tu ne veux pas de correction HR pour l'instant: commente la ligne suivante
-  //    Sinon, garde-la (avec bornes internes).
-  float RH_corr = /* calApplyHum( */ RH_tc /* ) */;
-
-  // Clamp final (sécurité)
-  if (!isfinite(RH_corr)) RH_corr = RH_tc; // fallback
-  if (RH_corr < 0.f)   RH_corr = 0.f;
-  if (RH_corr > 100.f) RH_corr = 100.f;
-
-  tempC   = T_corr;
-  humidity= RH_corr;
-  return true;
-}
-
-
-void sensorsReadEns160(int& aqi, int& tvoc, int& eco2, float tempC, float humidity){
-  if (ens160.available()){
-    ens160.set_envdata(tempC, humidity);
-    ens160.measure(true);
-    aqi  = ens160.getAQI();
-    tvoc = ens160.getTVOC();
-    eco2 = ens160.geteCO2();
-  } else { aqi=tvoc=eco2=0; }
-}
-
+// Lecture d’une trame PMS (utilise be16() fourni par globals.h)
 static bool readPmsFrame(HardwareSerial &ser, PmsData &out) {
   while (ser.available() >= 32) {
     if ((uint8_t)ser.peek()!=0x42){ ser.read(); continue; }
@@ -213,17 +203,16 @@ static bool readPmsFrame(HardwareSerial &ser, PmsData &out) {
     out.pm1_atm  = be16(&payload[8]);  out.pm25_atm = be16(&payload[10]); out.pm10_atm = be16(&payload[12]);
     out.gt03     = be16(&payload[14]); out.gt05     = be16(&payload[16]); out.gt10     = be16(&payload[18]);
     out.gt25     = be16(&payload[20]); out.gt50     = be16(&payload[22]); out.gt100    = be16(&payload[24]);
-    Serial.printf("PMS: CF1 PM1=%u PM2.5=%u PM10=%u | ATM PM1=%u PM2.5=%u PM10=%u\n",
-                  out.pm1_cf1, out.pm25_cf1, out.pm10_cf1,
-                  out.pm1_atm, out.pm25_atm, out.pm10_atm);
+    #if PMS_LOG_BURST
+        Serial.printf("PMS: CF1 PM1=%u PM2.5=%u PM10=%u | ATM PM1=%u PM2.5=%u PM10=%u | CNT 0.3=%u 0.5=%u 1.0=%u 2.5=%u 5.0=%u 10=%u\n",
+                      out.pm1_cf1, out.pm25_cf1, out.pm10_cf1,
+                      out.pm1_atm, out.pm25_atm, out.pm10_atm,
+                      out.gt03, out.gt05, out.gt10, out.gt25, out.gt50, out.gt100);
+    #endif
     out.valid=true; out.lastMs=millis(); return true;
   }
   return false;
 }
-
-
-void pmsWake(){  if (s_pmsSetPin>=0) digitalWrite(s_pmsSetPin, HIGH); s_pmsAwake=true; }
-void pmsSleep(){ if (s_pmsSetPin>=0) digitalWrite(s_pmsSetPin, LOW);  s_pmsAwake=false; }
 
 static void pmsTask(void *){
   PMS.begin(9600, SERIAL_8N1, 16, 17);
@@ -239,9 +228,94 @@ static void pmsTask(void *){
     vTaskDelay(s_pmsAwake ? 50/portTICK_PERIOD_MS : 250/portTICK_PERIOD_MS);
   }
 }
+
 void pmsTaskStart(int rx, int tx){
   (void)rx; (void)tx; // câblés en dur
   if (pmsStarted) return;
   xTaskCreatePinnedToCore(pmsTask, "PMS", 4096, 0, 1, 0, 0);
   pmsStarted = true;
+}
+
+// Spot blocking : wake → warmup → lit dernière trame récente → sleep
+bool pmsSampleBlocking(uint32_t warmupMs, PmsData& out){
+  pmsWake();
+  uint32_t t0 = millis();
+  while ((millis() - t0) < warmupMs){
+    vTaskDelay(100/portTICK_PERIOD_MS);
+  }
+
+  bool have = false;
+  if (gPmsMutex && xSemaphoreTake(gPmsMutex, 100/portTICK_PERIOD_MS) == pdTRUE){
+    if (gPms.valid && (millis() - gPms.lastMs) < 5000) { out = gPms; have = true; }
+    xSemaphoreGive(gPmsMutex);
+  }
+  pmsSleep();
+  return have;
+}
+
+// =======================================================================
+// ======================= AHT21 / ENS160 (inchangé) =====================
+// =======================================================================
+
+bool sensorsInit(){
+  Wire.begin();
+  delay(100);
+  Wire.setClock(100000);
+  if (!aht.begin())  Serial.println("AHT21 initialization failed!");
+  else               Serial.println("AHT21 initialisé avec succès.");
+
+  if (!ens160.begin()) Serial.println("Échec ENS160 !");
+  else { Serial.println("ENS160 initialisé avec succès."); ens160.setMode(ENS160_OPMODE_STD); }
+
+  if (!gPmsMutex) gPmsMutex = xSemaphoreCreateMutex();
+  return true;
+}
+
+static inline float satVapor_hPa(float T){
+  return 6.112f * expf(17.62f * T / (243.12f + T));
+}
+static inline float rhTempCompensate(float RH_raw, float T_raw, float T_corr){
+  if (!isfinite(RH_raw) || !isfinite(T_raw) || !isfinite(T_corr)) return NAN;
+  if (fabsf(T_corr - T_raw) < 0.001f) return RH_raw;
+  const float es_raw  = satVapor_hPa(T_raw);
+  const float es_corr = satVapor_hPa(T_corr);
+  if (es_corr <= 0.0f) return NAN;
+  float RH = RH_raw * (es_raw / es_corr);
+  if (RH < 0.f)   RH = 0.f;
+  if (RH > 100.f) RH = 100.f;
+  return RH;
+}
+
+bool safeSensorRead(float& tempC, float& humidity){
+  sensors_event_t eventHum, eventTemp;
+  aht.getEvent(&eventHum, &eventTemp);
+  if (isnan(eventTemp.temperature) || isnan(eventHum.relative_humidity)){
+    Serial.println("Erreur de lecture capteur : données invalides");
+    return false;
+  }
+
+  const float T_raw = eventTemp.temperature;
+  const float RH_raw = eventHum.relative_humidity;
+
+  const float T_corr = calApplyTemp(T_raw);
+  float RH_tc = rhTempCompensate(RH_raw, T_raw, T_corr);
+
+  float RH_corr = /* calApplyHum( */ RH_tc /* ) */;
+  if (!isfinite(RH_corr)) RH_corr = RH_tc;
+  if (RH_corr < 0.f)   RH_corr = 0.f;
+  if (RH_corr > 100.f) RH_corr = 100.f;
+
+  tempC   = T_corr;
+  humidity= RH_corr;
+  return true;
+}
+
+void sensorsReadEns160(int& aqi, int& tvoc, int& eco2, float tempC, float humidity){
+  if (ens160.available()){
+    ens160.set_envdata(tempC, humidity);
+    ens160.measure(true);
+    aqi  = ens160.getAQI();
+    tvoc = ens160.getTVOC();
+    eco2 = ens160.geteCO2();
+  } else { aqi=tvoc=eco2=0; }
 }
