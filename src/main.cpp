@@ -18,6 +18,7 @@
 #include "core/devkey_runtime.h"
 #include "power/cpu_pm.h"
 #include "sensors/calibration.h"
+#include "esp_flash_encrypt.h"
 static bool s_twdtReady = false;
 void doFactoryResetOnMainLoop(){
   updateLedState(LED_UPDATING);
@@ -83,9 +84,10 @@ static bool s_bleStartAdv = false;
 // ble/provisioning.cpp ou core/globals.cpp (où tu lis tes prefs)
 
 void setup(){
-  delay(200);
+  delay(5000);
   Serial.begin(115200);
   Serial.printf("Flash chip size: %u MB\n", ESP.getFlashChipSize()/(1024*1024));
+  Serial.printf("[DBG] flash enc enabled = %d\n", esp_flash_encryption_enabled());
   enableCpuPM();
   otaOnBootValidate(); 
   twdtInitOnce();

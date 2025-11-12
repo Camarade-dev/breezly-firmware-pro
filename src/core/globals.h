@@ -11,7 +11,7 @@
 
 // === LED modes (même noms qu'avant)
 enum LedMode { LED_BOOT, LED_PAIRING, LED_GOOD, LED_MODERATE, LED_BAD, LED_UPDATING, LED_OFF };
-
+extern volatile bool g_netBusyForOta;
 // === PMS
 struct PmsData {
   uint16_t pm1_cf1=0, pm25_cf1=0, pm10_cf1=0;

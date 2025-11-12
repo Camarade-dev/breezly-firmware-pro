@@ -11,6 +11,7 @@ extern "C" {
 #include "../led/led_status.h"
 #include "wifi_enterprise.h"   // connectToWiFiEnterprise()
 #include "wifi_status_helpers.h"
+
 // === Version PSK (copiée de ton ancien code) ===
 static volatile int s_lastDiscReasonPsk = -1;
 static esp_event_handler_instance_t s_discInstPsk = nullptr;
@@ -66,8 +67,8 @@ static bool connectToWiFiPSK() {
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
   wifiAutoTxPower();
   wifiConnected = true;
-
-  // Étape 1 : Wi-Fi OK
+  breezly_on_wifi_ok();
+  // Étape 1 : Wi-Fi OK 
   provSet("status", "wifi_ok");
 
   // 🔑 Lance la sync horloge tout de suite (évite le poulet–œuf)
@@ -77,11 +78,11 @@ static bool connectToWiFiPSK() {
   bool inet = checkInternetReachable();
   if (!inet) {
     Serial.println("[WiFi] Internet unreachable");
-    provSet("status", "inet_unreachable");
-    // Ne pas retourner false : on laisse SNTP/fallback corriger l'heure,
-    // ensuite OTA/MQTT pourront se connecter.
+    provisioningSetStatus("{\"status\":\"inet_unreachable\"}");
+    // ne PAS appeler breezly_on_inet_ok() ici
   } else {
-    provSet("status", "inet_ok");
+    breezly_on_inet_ok();
+    provisioningSetStatus("{\"status\":\"inet_ok\"}");
   }
 
   // Étape 3 : final
@@ -95,6 +96,20 @@ static bool connectToWiFiPSK() {
   wifiConnected = false;
   const char* st = mapDiscReasonToStatus(s_lastDiscReasonPsk);
   provSet("status", st);
+  // Traduit quelques causes communes en hooks dédiés
+  if (s_lastDiscReasonPsk == WIFI_REASON_AUTH_EXPIRE ||
+      s_lastDiscReasonPsk == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT ||
+      s_lastDiscReasonPsk == WIFI_REASON_802_1X_AUTH_FAILED ||
+      s_lastDiscReasonPsk == WIFI_REASON_MIC_FAILURE ||
+      s_lastDiscReasonPsk == WIFI_REASON_AUTH_FAIL) {
+    breezly_on_wifi_auth_failed();
+  } else if (s_lastDiscReasonPsk == WIFI_REASON_NO_AP_FOUND ||
+            s_lastDiscReasonPsk == WIFI_REASON_ASSOC_LEAVE ||
+            s_lastDiscReasonPsk == WIFI_REASON_ASSOC_EXPIRE ||
+            s_lastDiscReasonPsk == WIFI_REASON_ASSOC_TOOMANY ||
+            s_lastDiscReasonPsk == WIFI_REASON_HANDSHAKE_TIMEOUT) {
+    breezly_on_wifi_assoc_timeout();
+  }
 
   if (bleInited) restartBLEAdvertising();
   return false;

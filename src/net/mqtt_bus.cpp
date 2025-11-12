@@ -6,6 +6,7 @@
 #include <ArduinoJson.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include "../ble/provisioning.h"
 #include <freertos/event_groups.h>
 #include <Preferences.h>
 #include "../core/globals.h"     // wifiConnected, sensorId, userId, prefs, CURRENT_FIRMWARE_VERSION
@@ -16,6 +17,7 @@
 #include "../ca_bundle.h"
 
 #include "../app_config.h"  
+static const char* MQTT_PREFIX = "prod/";
 // ======= PARAMS BROKER (reprends les tiens) =======
 static const char* MQTT_HOST = "607207c4394d44b8bad11a33e8ed591d.s1.eu.hivemq.cloud";
 static const int   MQTT_PORT = 8883;
@@ -34,13 +36,23 @@ static volatile bool s_ready     = false;
 static const int EV_REQ_CONNECT_BIT = (1 << 0);
 static uint32_t s_lastConnAttemptMs = 0;
 static const uint32_t RECONNECT_BACKOFF_MS = 8000; // 8s
-
+static String withPrefix(const String& t) {
+  if (t.startsWith("dev/") || t.startsWith("prod/")) return t;
+  return String(MQTT_PREFIX) + t;
+}
 // ======= Topics helpers =======
-String mqtt_topic_device_base() { return "breezly/devices/" + sensorId; }
+String mqtt_topic_device_base() { return withPrefix("breezly/devices/" + sensorId); }
 String mqtt_topic_ota()    { return mqtt_topic_device_base() + "/ota"; }
 String mqtt_topic_ctrl()   { return mqtt_topic_device_base() + "/control"; }
 String mqtt_topic_status() { return mqtt_topic_device_base() + "/status"; }
+static volatile bool s_hello_ok      = false;
+static volatile bool s_registered_ok = false;
 
+static void maybe_fire_connected_final() {
+  if (s_hello_ok && s_registered_ok) {
+    breezly_on_connected_final();   // ← étape “tout est prêt” pour l’app
+  }
+}
 // --- Helpers unpair / reboot ---
 static void forgetWifiPrefs_All(bool alsoForgetUser){
   Preferences p;
@@ -105,15 +117,32 @@ bool mqtt_is_connected() { return s_connected; }
 
 bool mqtt_enqueue(const String& t, const String& p, uint8_t qos, bool retain) {
   if (!s_queue) return false;
+
+  // 🧩 Applique le préfixe MQTT (ex: "dev/") uniquement si le topic n'en a pas déjà un
+  String topicFull;
+  if (t.startsWith("breezly/") || t.startsWith("dev/") || t.startsWith("prod/")) {
+    topicFull = t;
+  } else {
+    topicFull = String(MQTT_PREFIX) + t;
+  }
+
   PubMsg m{
-    strdup(t.c_str()),
+    strdup(topicFull.c_str()),
     strdup(p.c_str()),
     qos,
     retain
   };
-  if (!m.topic || !m.payload) { if (m.topic) free(m.topic); if (m.payload) free(m.payload); return false; }
+  Serial.printf("[MQTT] Enqueue vers topic: %s\n", topicFull.c_str());
+  if (!m.topic || !m.payload) {
+    if (m.topic) free(m.topic);
+    if (m.payload) free(m.payload);
+    return false;
+  }
+
   return xQueueSend(s_queue, &m, 0) == pdTRUE;
 }
+
+
 
 void mqtt_request_connect() {
   if (s_ev) xEventGroupSetBits(s_ev, EV_REQ_CONNECT_BIT);
@@ -226,23 +255,42 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int len) {
 
   String msg; msg.reserve(len+1);
   for (unsigned i=0;i<len;i++) msg += (char)payload[i];
+  if (t == mqtt_topic_status()) {
+    StaticJsonDocument<384> j;
+    auto err = deserializeJson(j, msg);
+    if (err) return;
+
+    // on standardise 2 formes:
+    //  - {"state":"registered", ...}
+    //  - {"registered":true, ...}
+    const char* st = j["state"] | "";
+    bool reg = j["registered"] | false;
+    if ((st && strcmp(st, "registered")==0) || reg) {
+      s_registered_ok = true;
+      breezly_on_registered();
+      maybe_fire_connected_final();
+    }
+    return;
+  }
 
   if (t == mqtt_topic_ctrl()) {
-    StaticJsonDocument<512> j;
+    
+    StaticJsonDocument<512> j;  
     auto err = deserializeJson(j, msg);
     if (err) { Serial.printf("[MQTT] JSON parse error: %s\n", err.c_str()); return; }
     const char* action = j["action"] | "";
+    
     if (!action[0]) return;
 
     if (strcmp(action, "set_wifi")==0) { handleSetWifi(j); return; }
 
     if (strcmp(action, "update")==0) {
-      Serial.println("[OTA] Trigger via MQTT");
-      otaInProgress = true;
-      xTaskCreatePinnedToCore([](void*){
+        Serial.println("[OTA] Trigger via MQTT");
+        otaSetInProgress(true); // ← pause immédiate de la tâche MQTT
+        xTaskCreatePinnedToCore([](void*){
         vTaskDelay(100/portTICK_PERIOD_MS);
         checkAndPerformCloudOTA();
-        otaInProgress = false;
+        otaSetInProgress(false);
         vTaskDelete(NULL);
       }, "OTA_TASK", 8192, NULL, 1, NULL, 0);
       return;
@@ -357,7 +405,7 @@ static const char* makePemZ(const uint8_t* start, const uint8_t* end) {
 // ======= Connexion broker =======
 static bool mqtt_do_connect() {
   if (!wifiConnected || !timeIsSane()) return false;
-
+  if (g_netBusyForOta || otaIsInProgress()) return false;
   s_tls.setCACert(CA_BUNDLE_PEM);
   s_tls.setTimeout(10000);
 
@@ -406,9 +454,25 @@ bool ok = s_mqtt.connect(
   j["userId"]=userId;
   j["firmwareVersion"]=CURRENT_FIRMWARE_VERSION;
   String s; serializeJson(j, s);
-  s_mqtt.publish("capteurs/boot", s.c_str(), false);
+  s_mqtt.publish((String(MQTT_PREFIX) + "capteurs/boot").c_str(), s.c_str(), false);
 
   publish_status_retained("online");
+  {
+    DynamicJsonDocument h(96);
+    h["hello"] = true;
+    h["ts"]    = (uint64_t)(time(nullptr) * 1000ULL);
+    String hs; serializeJson(h, hs);
+    String helloTopic = mqtt_topic_device_base() + "/hello";
+    s_mqtt.publish(helloTopic.c_str(), hs.c_str(), true);
+
+    s_hello_ok = true;
+    breezly_on_mqtt_hello_ok();
+    maybe_fire_connected_final();
+  }
+
+  // 2) S’abonner au topic status pour capter “registered”
+  s_mqtt.subscribe(mqtt_topic_status().c_str(), 0);
+
   return true;
 }
 
@@ -419,6 +483,11 @@ static void mqttTask(void*) {
   s_ready = true;
 
   for (;;) {
+    if (g_netBusyForOta || otaIsInProgress()) {
+      if (s_connected) { s_mqtt.disconnect(); s_connected = false; }
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+      continue;
+    }
     // (Re)connexion
     if (!s_connected) {
       bool shouldTry = false;

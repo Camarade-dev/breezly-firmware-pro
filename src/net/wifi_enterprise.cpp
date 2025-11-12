@@ -1,7 +1,7 @@
 #include "wifi_enterprise.h"
 #include "../core/globals.h"
 #include "../net/sntp_utils.h"
-
+#include "../ble/provisioning.h"
 #include <WiFi.h>
 #include "esp_task_wdt.h"
 #include "wifi_status_helpers.h"
@@ -117,6 +117,7 @@ bool connectToWiFiEnterprise() {
 
   if (ok) {
     wifiConnected = true;
+    breezly_on_wifi_ok();
     Serial.printf("[EAP] OK IP=%s  RSSI=%d\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI());
 
@@ -130,7 +131,7 @@ bool connectToWiFiEnterprise() {
       provSet("status", "inet_unreachable");
       return false;
     }
-
+    breezly_on_inet_ok();
     provSet("status", "inet_ok");
     // 3) Final
     provisioningNotifyConnected();
@@ -142,6 +143,13 @@ bool connectToWiFiEnterprise() {
   wifiConnected = false;
   const char* st = mapDiscReasonToStatus(s_lastDiscReasonEap);
   provSet("status", st);
+  if (s_lastDiscReasonEap == WIFI_REASON_802_1X_AUTH_FAILED) {
+    breezly_on_wifi_auth_failed();
+  } else if (s_lastDiscReasonEap == WIFI_REASON_NO_AP_FOUND ||
+            s_lastDiscReasonEap == WIFI_REASON_ASSOC_EXPIRE ||
+            s_lastDiscReasonEap == WIFI_REASON_HANDSHAKE_TIMEOUT) {
+    breezly_on_wifi_assoc_timeout();
+  }
   if (bleInited) restartBLEAdvertising();
   return false;
 }

@@ -1,3 +1,4 @@
+// src/ota/ota.cpp
 #include "ota.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -18,46 +19,64 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "ca_bundle.h"
+#include "esp_err.h"
+
 #ifndef OTA_DEBUG
-#define OTA_DEBUG 2   // 0 = off, 1 = normal, 2 = très verbeux
+#define OTA_DEBUG 2   // 0 = off, 1 = normal, 2 = verbose
 #endif
 
-#define OTA_LOG(fmt, ...)        do{ if(OTA_DEBUG>=1) Serial.printf(fmt "\n", ##__VA_ARGS__); }while(0)
-#define OTA_VLOG(fmt, ...)       do{ if(OTA_DEBUG>=2) Serial.printf(fmt "\n", ##__VA_ARGS__); }while(0)
-#define OTA_HEAP(tag)            do{ if(OTA_DEBUG>=2) Serial.printf("[OTA] %s heap=%u\n", tag, (unsigned)esp_get_free_heap_size()); }while(0)
-
+#define OTA_LOG(fmt, ...)  do{ if(OTA_DEBUG>=1) Serial.printf(fmt "\n", ##__VA_ARGS__); }while(0)
+#define OTA_VLOG(fmt, ...) do{ if(OTA_DEBUG>=2) Serial.printf(fmt "\n", ##__VA_ARGS__); }while(0)
+#define OTA_HEAP(tag)      do{ if(OTA_DEBUG>=2) Serial.printf("[OTA] %s heap=%u\n", tag, (unsigned)esp_get_free_heap_size()); }while(0)
+struct BoolFlagGuard {
+  volatile bool* p;
+  explicit BoolFlagGuard(volatile bool* ptr) : p(ptr) { if (p) *p = true; }
+  ~BoolFlagGuard() { if (p) *p = false; }
+  BoolFlagGuard(const BoolFlagGuard&) = delete;
+  BoolFlagGuard& operator=(const BoolFlagGuard&) = delete;
+};
+// ===================== Utils =====================
 static volatile bool g_otaInProgress = false;
 bool otaIsInProgress(){ return g_otaInProgress; }
-
-// --- utils log partition ---
+void otaSetInProgress(bool v){ g_otaInProgress = v; }
+static bool httpGetToString(const String& url, String& out,
+                            uint32_t connectMs = 8000,
+                            uint32_t readMs    = 12000);
 static void logPartitions(){
-  const esp_partition_t* run = esp_ota_get_running_partition();
-  const esp_partition_t* next= esp_ota_get_next_update_partition(NULL);
-  if (run)  OTA_VLOG("[OTA] running  part: label=%s addr=0x%06x size=%u", run->label,  run->address,  run->size);
-  if (next) OTA_VLOG("[OTA] next OTA part: label=%s addr=0x%06x size=%u", next->label, next->address, next->size);
+  const esp_partition_t* run  = esp_ota_get_running_partition();
+  const esp_partition_t* next = esp_ota_get_next_update_partition(NULL);
+  if (run)  OTA_VLOG(
+      "[OTA] running  part: label=%s addr=0x%06x size=%u encrypted=%d",
+      run->label,  run->address,  run->size, run->encrypted
+  );
+  if (next) OTA_VLOG(
+      "[OTA] next OTA part: label=%s addr=0x%06x size=%u encrypted=%d",
+      next->label, next->address, next->size, next->encrypted
+  );
 }
-
-// --- semver identique à ton code ---
+static bool fetchWithRetry(const String& u, String& out, int tries=4) {
+  for (int i=1; i<=tries; ++i) {
+    if (httpGetToString(u, out, 15000, 15000)) return true;
+    OTA_LOG("[OTA] fetch fail try %d/%d", i, tries);
+    // backoff + jitter pour laisser le LB/campus respirer
+    uint32_t d = 300 * i + (esp_random() % 200);
+    delay(d);
+  }
+  return false;
+}
 static int cmpSemver(const String& a, const String& b) {
   auto nextNum = [](const String& s, int& idx) -> long {
-    // Skip non-digits
     while (idx < (int)s.length() && !isDigit(s[idx])) idx++;
-    // Read digits
-    long v = 0; bool hasDigit = false;
-    while (idx < (int)s.length() && isDigit(s[idx])) { v = v*10 + (s[idx]-'0'); idx++; hasDigit = true; }
-    return hasDigit ? v : 0; // segment absent => 0
+    long v = 0; bool hasDigit=false;
+    while (idx < (int)s.length() && isDigit(s[idx])) { v = v*10 + (s[idx]-'0'); idx++; hasDigit=true; }
+    return hasDigit ? v : 0;
   };
-
-  int ia = 0, ib = 0;
-  for (int k = 0; k < 3; ++k) {
-    long va = nextNum(a, ia);
-    long vb = nextNum(b, ib);
-    if (va != vb) return (va < vb) ? -1 : 1;
-  }
+  int ia=0, ib=0;
+  for (int k=0;k<3;k++){ long va=nextNum(a,ia), vb=nextNum(b,ib); if (va!=vb) return (va<vb)?-1:1; }
   return 0;
 }
 
-static uint8_t hexchar_to_val(char c){
+static uint8_t hex_nibble(char c){
   if (c>='0'&&c<='9') return c-'0';
   if (c>='a'&&c<='f') return 10+(c-'a');
   if (c>='A'&&c<='F') return 10+(c-'A');
@@ -66,20 +85,61 @@ static uint8_t hexchar_to_val(char c){
 static bool hexEq(const uint8_t* digest, const String& hex){
   if (hex.length()!=64) return false;
   for (int i=0;i<32;i++){
-    uint8_t hi = hexchar_to_val(hex[2*i]);
-    uint8_t lo = hexchar_to_val(hex[2*i+1]);
-    if (hi>0x0F || lo>0x0F) return false;
+    uint8_t hi=hex_nibble(hex[2*i]), lo=hex_nibble(hex[2*i+1]);
+    if (hi>0x0F||lo>0x0F) return false;
     if (digest[i] != (uint8_t)((hi<<4)|lo)) return false;
   }
   return true;
 }
 
-// ====== 1) VALIDATION / ROLLBACK AU BOOT ======
+// GET → String via HTTPClient (TLS 1.2+, no chunked in memory)
+// Remplace ta httpGetToString existante par celle-ci
+static bool httpGetToString(const String& url, String& out,
+                            uint32_t connectMs,
+                            uint32_t readMs) {
+  WiFiClientSecure wcs;
+wcs.setCACert(CA_BUNDLE_PEM);
+#if defined(ARDUINO_ARCH_ESP32) && !defined(ARDUINO_ESP32S2_DEV)
+  wcs.setHandshakeTimeout(connectMs);
+#endif
+wcs.setTimeout(readMs);
+
+HTTPClient http;
+if (!http.begin(wcs, url)) {
+  OTA_LOG("[OTA] http.begin FAIL: %s", url.c_str());
+  return false;
+}
+
+  http.addHeader("Accept", "*/*");
+  http.addHeader("Accept-Encoding", "identity"); // pas de gzip
+  http.addHeader("Connection", "close");
+  http.setReuse(false);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setConnectTimeout(connectMs);
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    OTA_LOG("[OTA] GET %s -> code=%d (%s)", url.c_str(), code, http.errorToString(code).c_str());
+    http.end();
+    return false;
+  }
+
+  out = http.getString();     // <-- gère chunked proprement
+  http.end();
+
+  OTA_LOG("[OTA] manifest OK, %u bytes", (unsigned)out.length());
+  return out.length() > 0;
+}
+
+
+
+
+// ===================== Boot validation / rollback =====================
 void otaOnBootValidate(){
   Preferences p; p.begin("ota", false);
-  bool pending = p.getBool("pending", false);
-  uint32_t fail = p.getUShort("fail", 0);
-  uint32_t bootcnt = p.getUShort("bootcnt", 0);
+  bool     pending = p.getBool("pending", false);
+  uint16_t fail    = p.getUShort("fail", 0);
+  uint16_t bootcnt = p.getUShort("bootcnt", 0);
   p.end();
 
   OTA_LOG("[OTA] BootValidate: pending=%d fail=%u bootcnt=%u", (int)pending, (unsigned)fail, (unsigned)bootcnt);
@@ -88,13 +148,12 @@ void otaOnBootValidate(){
 
   if (pending){
     Preferences q; q.begin("ota", false);
-    uint32_t lastBoots = q.getUShort("bootcnt", 0) + 1;
-    q.putUShort("bootcnt", lastBoots);
-    q.putUShort("fail", fail + 1);
+    q.putUShort("bootcnt", bootcnt+1);
+    q.putUShort("fail", fail+1);
     q.end();
 
-    const uint32_t MAX_FAILS = 3;
-    if (fail + 1 >= MAX_FAILS){
+    const uint16_t MAX_FAILS = 3;
+    if ((fail+1) >= MAX_FAILS){
 #if ESP_IDF_VERSION_MAJOR >= 4
       OTA_LOG("[OTA] Too many failed boots → rollback");
       esp_ota_mark_app_invalid_rollback_and_reboot();
@@ -118,7 +177,7 @@ void otaOnBootValidate(){
   OTA_LOG("[OTA] App marked VALID");
 }
 
-// ====== 2) VERIF SIGNATURE MANIFEST (ECDSA P-256) ======
+// ===================== Manifest signature (ECDSA P-256) =====================
 static const char* OTA_PUBKEY_PEM =
 "-----BEGIN PUBLIC KEY-----\n"
 "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZqf6uoHvTKIEuo5gmUe7KzHw38v+\n"
@@ -132,15 +191,14 @@ static bool verifyManifestSignature(const String& canonical, const String& sigB6
     OTA_LOG("[OTA] parse public key FAIL");
     mbedtls_pk_free(&pk); return false;
   }
-  size_t olen=0; unsigned char sig[128];
+  unsigned char sig[128]; size_t olen=0;
   if (mbedtls_base64_decode(sig, sizeof(sig), &olen, (const unsigned char*)sigB64.c_str(), sigB64.length())!=0){
     OTA_LOG("[OTA] base64 decode FAIL");
     mbedtls_pk_free(&pk); return false;
   }
-  OTA_VLOG("[OTA] sig decoded len=%u", (unsigned)olen);
   unsigned char hash[32];
   mbedtls_sha256_context ctx;
-  mbedtls_sha256_init(&ctx); 
+  mbedtls_sha256_init(&ctx);
   mbedtls_sha256_starts(&ctx, 0);
   mbedtls_sha256_update(&ctx, (const unsigned char*)canonical.c_str(), canonical.length());
   mbedtls_sha256_finish(&ctx, hash);
@@ -151,223 +209,355 @@ static bool verifyManifestSignature(const String& canonical, const String& sigB6
   OTA_LOG("[OTA] manifest signature %s", ok==0 ? "OK" : "INVALID");
   return ok==0;
 }
-// ====== DOWNLOAD & FLASH : TLS manuel simple + retries ======
-static bool httpDownloadToUpdate(const String& binUrl,
-                                 uint32_t expectedSize,
-                                 const String& expectedSha256Hex,
-                                 WiFiClientSecure& wcs) {
-  OTA_LOG("[OTA] Download start (TLS manual)");
-  OTA_HEAP("before tls");
+
+// ===================== Download & flash (HTTPClient only) =====================
+// ===================== Download & flash (HTTPClient only) =====================
+// ===================== Download & flash (HTTPClient with manual fallback) =====================
+// ===================== Download & flash (HTTPClient with manual fallback) =====================
+// ===================== Download & flash (HTTPClient with manual fallback, fixed types) =====================
+// ===================== Download & flash (HTTPClient, no raw fallback) =====================
+// ===================== Download & flash (HTTPClient with explicit SNI host) =====================
+// ===================== Download & flash (HTTPClient with explicit SNI host) =====================
+static bool downloadAndFlashWithHTTPClient(const String& binUrl,
+                                           uint32_t expectedSize,
+                                           const String& expectedSha256Hex)
+{
+  OTA_LOG("[OTA] Download start (HTTPClient+SNI)");
+  OTA_HEAP("before http");
   logPartitions();
 
-  if (!binUrl.startsWith("https://")) { OTA_LOG("[OTA] URL must be https"); return false; }
-  String hostPath = binUrl.substring(strlen("https://"));
-  int slash = hostPath.indexOf('/');
-  if (slash < 0) { OTA_LOG("[OTA] Bad URL"); return false; }
-  String host = hostPath.substring(0, slash);
-  String path = hostPath.substring(slash);
-
-  g_otaInProgress = true; otaInProgress = true; updateLedState(LED_UPDATING);
-
-  wcs.setCACert(CA_BUNDLE_PEM);
-  wcs.setTimeout(30000);
-
-  bool tlsOK = false;
-  for (int i=1;i<=3 && !tlsOK;i++){
-    OTA_LOG("[OTA] TLS connect to %s:443 (try %d/3)", host.c_str(), i);
-    if (wcs.connect(host.c_str(), 443)) tlsOK = true;
-    else delay(300);
-  }
-  if (!tlsOK){
-    OTA_LOG("[OTA] TLS connect FAIL");
-    g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD);
+  const esp_partition_t* nextPart = esp_ota_get_next_update_partition(NULL);
+  if (!nextPart) {
+    OTA_LOG("[OTA] No OTA partition");
     return false;
   }
 
-  String req;
-  req.reserve(256);
-  req += "GET " + path + " HTTP/1.1\r\n";
-  req += "Host: " + host + "\r\n";
-  req += "User-Agent: esp32-ota\r\n";
-  req += "Accept: */*\r\n";
-  req += "Accept-Encoding: identity\r\n";
-  req += "Connection: close\r\n\r\n";
+  g_otaInProgress = true;
+  updateLedState(LED_UPDATING);
 
-  if (wcs.print(req) != (int)req.length()) {
-    OTA_LOG("[OTA] write request FAIL");
-    wcs.stop(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD);
+  // --- Parse URL -> scheme/host/port/path
+  String scheme = "https", host, path = "/";
+  uint16_t port = 443;
+  {
+    int p = binUrl.indexOf("://");
+    int h0 = (p > 0) ? p + 3 : 0;
+    if (p > 0) scheme = binUrl.substring(0, p);
+    int slash = binUrl.indexOf('/', h0);
+    String hostPort = (slash > 0) ? binUrl.substring(h0, slash) : binUrl.substring(h0);
+    if (slash > 0) path = binUrl.substring(slash);
+    int colon = hostPort.indexOf(':');
+    if (colon >= 0) {
+      host = hostPort.substring(0, colon);
+      port = (uint16_t)hostPort.substring(colon + 1).toInt();
+    } else {
+      host = hostPort;
+    }
+  }
+
+  // DNS (log)
+  IPAddress ip;
+  if (WiFi.hostByName(host.c_str(), ip)) {
+    OTA_LOG("[OTA] DNS %s -> %s", host.c_str(), ip.toString().c_str());
+  } else {
+    OTA_LOG("[OTA] DNS resolve FAIL for %s", host.c_str());
+    g_otaInProgress = false;
+    updateLedState(LED_BAD);
     return false;
   }
 
-  OTA_LOG("[OTA] waiting headers...");
-  unsigned long t0 = millis();
-  String statusLine = wcs.readStringUntil('\n'); statusLine.trim();
-  OTA_LOG("[OTA] status: %s", statusLine.c_str());
-  if (!statusLine.startsWith("HTTP/1.1 200") && !statusLine.startsWith("HTTP/1.0 200")) {
-    OTA_LOG("[OTA] HTTP not 200");
-    wcs.stop(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD);
+  // Jitter pour éviter les connexions back-to-back
+  delay(250 + (esp_random() % 300));
+
+  // --- TLS client
+  WiFiClientSecure tls;
+  tls.setCACert(CA_BUNDLE_PEM);
+#if defined(ARDUINO_ARCH_ESP32) && !defined(ARDUINO_ESP32S2_DEV)
+  tls.setHandshakeTimeout(15000);
+#endif
+  tls.setTimeout(45000);
+
+  HTTPClient http;
+   http.useHTTP10(true);
+  auto beginWithHeaders = [&]() -> bool {
+    bool isHttps = (scheme == "https");
+    bool ok = http.begin(tls, host, port, path, isHttps);
+    if (!ok) return false;
+    http.addHeader("Accept", "application/octet-stream");
+    http.addHeader("Accept-Encoding", "identity");
+    http.addHeader("Connection", "close");
+    http.addHeader("User-Agent", "breezly-esp32-ota/1.0");
+    http.setReuse(false);
+    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+#if defined(HTTPCLIENT_1_2_COMPATIBLE)
+    http.setConnectTimeout(15000);
+#endif
+    return true;
+  };
+
+  if (!beginWithHeaders()) {
+    OTA_LOG("[OTA] http.begin FAIL (host=%s port=%u path=%s)", host.c_str(), (unsigned)port, path.c_str());
+    g_otaInProgress = false;
+    updateLedState(LED_BAD);
     return false;
   }
 
-  int contentLen = -1;
-  bool chunked = false;
-  while (true) {
-    String h = wcs.readStringUntil('\n'); h.trim();
-    if (h.length()==0) break;
-    if (h.startsWith("Content-Length:") || h.startsWith("content-length:"))
-      contentLen = h.substring(h.indexOf(':')+1).toInt();
-    else if (h.startsWith("Transfer-Encoding:") && h.indexOf("chunked")>0)
-      chunked = true;
-  }
-  OTA_LOG("[OTA] headers: len=%d chunked=%d", contentLen, (int)chunked);
-  if (chunked) { OTA_LOG("[OTA] chunked not supported"); wcs.stop(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false; }
-  if (expectedSize>0 && contentLen>0 && (uint32_t)contentLen!=expectedSize) {
-    OTA_LOG("[OTA] length mismatch hdr=%d expected=%u", contentLen, (unsigned)expectedSize);
-    wcs.stop(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false;
+  // --- GET avec retries
+  int code = -1;
+  for (int attempt = 1; attempt <= 8; ++attempt) {
+    code = http.GET();
+    OTA_LOG("[OTA] BIN GET attempt %d -> code=%d (%s)", attempt, code, http.errorToString(code).c_str());
+    if (code == HTTP_CODE_OK) break;
+
+    if (code < 0 || (code >= 500 && code < 600)) {
+      http.end();
+      delay(1000 * attempt + (esp_random() % 500));
+      if (!beginWithHeaders()) {
+        OTA_LOG("[OTA] http.begin FAIL on retry (host=%s)", host.c_str());
+      }
+      continue;
+    }
+    break;
   }
 
-  const esp_partition_t* next = esp_ota_get_next_update_partition(NULL);
-  if (!next){ OTA_LOG("[OTA] No OTA partition"); wcs.stop(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false; }
-  size_t beginSize = (expectedSize>0)? expectedSize : (contentLen>0? (size_t)contentLen : UPDATE_SIZE_UNKNOWN);
-  if (beginSize!=UPDATE_SIZE_UNKNOWN && beginSize > next->size) {
-    OTA_LOG("[OTA] image too large (%u>%u)", (unsigned)beginSize, (unsigned)next->size);
-    wcs.stop(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false;
-  }
-  if (!Update.begin(beginSize)) {
-    OTA_LOG("[OTA] Update.begin err=%u", Update.getError());
-    wcs.stop(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false;
+  if (code != HTTP_CODE_OK) {
+    OTA_LOG("[OTA] HTTPClient GET failed, code=%d (%s)", code, http.errorToString(code).c_str());
+    http.end();
+    g_otaInProgress = false;
+    updateLedState(LED_BAD);
+    return false;
   }
 
-  const size_t CH = 2048;
-  uint8_t* buf = (uint8_t*)heap_caps_malloc(CH, MALLOC_CAP_8BIT);
-  if (!buf) { OTA_LOG("[OTA] malloc FAIL"); wcs.stop(); Update.end(); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false; }
+  Client* stream = http.getStreamPtr();
+  int contentLen = http.getSize();  // -1 si chunked
 
-  mbedtls_sha256_context sha; mbedtls_sha256_init(&sha); mbedtls_sha256_starts(&sha, 0);
+  // Si le serveur ne donne pas de Content-Length, on garde expectedSize
+  if (!expectedSize && contentLen > 0) {
+    expectedSize = (uint32_t)contentLen;
+  }
+
+  if (expectedSize && expectedSize > nextPart->size) {
+    OTA_LOG("[OTA] image too large: expectedSize=%u > partSize=%u",
+            (unsigned)expectedSize, (unsigned)nextPart->size);
+    http.end();
+    g_otaInProgress = false;
+    updateLedState(LED_BAD);
+    return false;
+  }
+
+  // === OTA native ESP-IDF ===
+  esp_ota_handle_t otaHandle = 0;
+  size_t otaSizeParam = expectedSize ? expectedSize : 0; // 0 = taille inconnue acceptable
+  esp_err_t err = esp_ota_begin(nextPart, otaSizeParam, &otaHandle);
+  if (err != ESP_OK) {
+    OTA_LOG("[OTA] esp_ota_begin FAILED err=%d (%s)", (int)err, esp_err_to_name(err));
+    http.end();
+    g_otaInProgress = false;
+    updateLedState(LED_BAD);
+    return false;
+  }
+  OTA_LOG("[OTA] esp_ota_begin OK (maxSize=%u)", (unsigned)nextPart->size);
+
+   OTA_HEAP("before buf malloc");
+
+  // On essaie 2048, puis 1024 si nécessaire
+  size_t CH = 2048;
+  uint8_t* buf = nullptr;
+
+  while (CH >= 1024 && buf == nullptr) {
+    buf = (uint8_t*)heap_caps_malloc(CH, MALLOC_CAP_8BIT);
+    if (!buf) {
+      OTA_LOG("[OTA] heap_caps_malloc(%u) FAIL -> try smaller", (unsigned)CH);
+      CH /= 2;   // 2048 -> 1024
+    }
+  }
+
+  if (!buf) {
+    OTA_LOG("[OTA] malloc FAIL even at 1024 bytes");
+    esp_ota_abort(otaHandle);
+    http.end();
+    g_otaInProgress = false;
+    updateLedState(LED_BAD);
+    return false;
+  }
+
+  OTA_LOG("[OTA] chunk size = %u bytes", (unsigned)CH);
+
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+  mbedtls_sha256_starts(&sha, 0);
+
   size_t written = 0;
   unsigned long lastLog = millis();
   unsigned long lastProgress = millis();
-  const unsigned long NO_PROGRESS_ABORT_MS = 30000;
+  static const unsigned long NO_PROGRESS_ABORT_MS = 120000;
 
-  while (wcs.connected() || wcs.available()) {
-    int n = wcs.read(buf, CH);
-    if (n > 0) {
-      if (written==0) OTA_LOG("[OTA] first chunk %d bytes", n);
-      lastProgress = millis();
-      mbedtls_sha256_update(&sha, buf, n);
+  bool firstChunk = true;
 
-      size_t w = Update.write(buf, n);
-      if (w != (size_t)n) {
-        OTA_LOG("[OTA] write err=%u (wrote=%u/got=%d)", Update.getError(), (unsigned)w, n);
-        free(buf); wcs.stop(); Update.abort(); mbedtls_sha256_free(&sha);
-        g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false;
+  while (true) {
+    int n = stream->readBytes(buf, CH);
+
+    if (n < 0) {
+      OTA_LOG("[OTA] stream read ERROR (%d)", n);
+      free(buf);
+      mbedtls_sha256_free(&sha);
+      esp_ota_abort(otaHandle);
+      http.end();
+      g_otaInProgress = false;
+      updateLedState(LED_BAD);
+      return false;
+    }
+
+    if (n == 0) {
+      if (!http.connected()) {
+        OTA_LOG("[OTA] HTTP disconnected, end of stream");
+        break;
       }
-      written += n;
-
-      if (contentLen>0 && (millis()-lastLog)>2000) {
-        lastLog = millis();
-        int pct = (int)((written*100ULL)/contentLen);
-        OTA_LOG("[OTA] %d%% (%u/%u)", pct, (unsigned)written, (unsigned)contentLen);
-        OTA_HEAP("stream");
-      }
-    } else {
-      if (!wcs.connected() && wcs.available()==0) break;
-      if (millis()-lastProgress > NO_PROGRESS_ABORT_MS) {
-        OTA_LOG("[OTA] no progress for %lu ms → abort", (unsigned long)(millis()-lastProgress));
-        free(buf); wcs.stop(); Update.abort(); mbedtls_sha256_free(&sha);
-        g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false;
+      if (millis() - lastProgress > NO_PROGRESS_ABORT_MS) {
+        OTA_LOG("[OTA] no progress timeout");
+        free(buf);
+        mbedtls_sha256_free(&sha);
+        esp_ota_abort(otaHandle);
+        http.end();
+        g_otaInProgress = false;
+        updateLedState(LED_BAD);
+        return false;
       }
       delay(5);
+      esp_task_wdt_reset();
+      continue;
     }
+
+    if (firstChunk) {
+      firstChunk = false;
+      OTA_LOG("[OTA] first 16 bytes of image:");
+      for (int i = 0; i < 16 && i < n; ++i) {
+        Serial.printf("%02X ", buf[i]);
+      }
+      Serial.println();
+    }
+
+    lastProgress = millis();
+    mbedtls_sha256_update(&sha, buf, n);
+
+    err = esp_ota_write(otaHandle, buf, n);
+    if (err != ESP_OK) {
+      OTA_LOG("[OTA] esp_ota_write FAIL err=%d (%s)", (int)err, esp_err_to_name(err));
+      free(buf);
+      mbedtls_sha256_free(&sha);
+      esp_ota_abort(otaHandle);
+      http.end();
+      g_otaInProgress = false;
+      updateLedState(LED_BAD);
+      return false;
+    }
+
+    written += n;
+
+    if ((millis() - lastLog) > 2000 && expectedSize) {
+      lastLog = millis();
+      int pct = (int)((written * 100ULL) / expectedSize);
+      OTA_LOG("[OTA] %d%% (%u/%u)", pct, (unsigned)written, (unsigned)expectedSize);
+    }
+
     esp_task_wdt_reset();
   }
 
   free(buf);
-  wcs.stop();
 
-  if (!Update.end()) {
-    OTA_LOG("[OTA] end err=%u", Update.getError());
-    mbedtls_sha256_free(&sha); g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false;
+  // Fin de l'image côté OTA
+  err = esp_ota_end(otaHandle);
+  if (err != ESP_OK) {
+    OTA_LOG("[OTA] esp_ota_end FAIL err=%d (%s)", (int)err, esp_err_to_name(err));
+    mbedtls_sha256_free(&sha);
+    http.end();
+    g_otaInProgress = false;
+    updateLedState(LED_BAD);
+    return false;
   }
 
-  uint8_t digest[32]; mbedtls_sha256_finish(&sha, digest); mbedtls_sha256_free(&sha);
-  if (expectedSize>0 && written!=expectedSize) {
+  uint8_t digest[32];
+  mbedtls_sha256_finish(&sha, digest);
+  mbedtls_sha256_free(&sha);
+  http.end();
+
+  if (expectedSize && written != expectedSize) {
     OTA_LOG("[OTA] size mismatch: written=%u expected=%u", (unsigned)written, (unsigned)expectedSize);
-    g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false;
+    g_otaInProgress = false;
+    updateLedState(LED_BAD);
+    return false;
   }
-  if (!hexEq(digest, expectedSha256Hex)) {
+
+  if (!expectedSha256Hex.isEmpty() && !hexEq(digest, expectedSha256Hex)) {
     OTA_LOG("[OTA] SHA256 mismatch");
-    g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false;
-  }
-  if (!Update.isFinished()) {
-    OTA_LOG("[OTA] not finished");
-    g_otaInProgress=false; otaInProgress=false; updateLedState(LED_BAD); return false;
+    g_otaInProgress = false;
+    updateLedState(LED_BAD);
+    return false;
   }
 
-  unsigned long dt = millis()-t0;
-  float kb = written/1024.0f;
-  float kbps = dt? (1000.0f*kb/dt) : 0.0f;
-  OTA_LOG("[OTA] OK flashed %u bytes in %lums (%.1f KB/s)", (unsigned)written, dt, kbps);
+  // On sélectionne la nouvelle partition comme partition de boot
+  err = esp_ota_set_boot_partition(nextPart);
+  if (err != ESP_OK) {
+    OTA_LOG("[OTA] esp_ota_set_boot_partition FAIL err=%d (%s)", (int)err, esp_err_to_name(err));
+    g_otaInProgress = false;
+    updateLedState(LED_BAD);
+    return false;
+  }
 
-  Preferences p; p.begin("ota", false); p.putBool("pending", true); p.putUShort("fail", 0); p.end();
+  OTA_LOG("[OTA] OK (%u bytes), boot partition set to %s", (unsigned)written, nextPart->label);
 
-  OTA_LOG("[OTA] Reboot...");
+  Preferences p; p.begin("ota", false);
+  p.putBool("pending", true);
+  p.putUShort("fail", 0);
+  p.end();
+
+  g_otaInProgress = false;
   delay(250);
   ESP.restart();
   return true;
 }
 
 
-// ====== 4) CHECK CLOUD OTA ======
+
+
+// ===================== Cloud OTA check =====================
 static unsigned long g_lastCheckMs = 0;
 static bool g_forceCheck = false;
 void triggerOtaCheckNow(){ g_forceCheck = true; }
 
 void checkAndPerformCloudOTA(){
-  OTA_VLOG("[OTA] check enter: wifi=%d inProg=%d force=%d", (WiFi.status()==WL_CONNECTED), (int)g_otaInProgress, (int)g_forceCheck);
+  OTA_VLOG("[OTA] check enter: wifi=%d inProg=%d force=%d",
+           (WiFi.status()==WL_CONNECTED), (int)g_otaInProgress, (int)g_forceCheck);
+
   if (WiFi.status()!=WL_CONNECTED){ OTA_LOG("[OTA] WiFi KO"); return; }
-    ensureTlsClockReady(20000);
+  ensureTlsClockReady(20000);
   if (!timeIsSaneHard()) { OTA_LOG("[OTA] clock not sane → skip"); return; }
-  if (g_otaInProgress || otaInProgress){ OTA_VLOG("[OTA] already in progress"); return; }
+  BoolFlagGuard netGuard(&g_netBusyForOta);  // met true à l’entrée et false à la sortie
+
+  if (g_otaInProgress){ OTA_VLOG("[OTA] already in progress"); return; }
 
   const unsigned long PERIOD = 30UL*60UL*1000UL;
-  //if (!g_forceCheck && (millis() - g_lastCheckMs) < PERIOD){
-  //  OTA_VLOG("[OTA] throttled: next in %lus", (unsigned)((PERIOD - (millis()-g_lastCheckMs))/1000UL));
-  //  return;
-  //}
+  // if (!g_forceCheck && (millis() - g_lastCheckMs) < PERIOD) return;
   g_lastCheckMs = millis();
   bool forced = g_forceCheck;
   g_forceCheck = false;
-
-  WiFiClientSecure wcs; 
-  wcs.setCACert(CA_BUNDLE_PEM);
-
-  HTTPClient http;
-
-  String manifestUrl = String(FW_MANIFEST_URL);
-  manifestUrl.replace("manifest.json", "latest.json");
-
-  String url = manifestUrl + "?t=" + String(millis());
+  String url = String(FW_MANIFEST_URL) + "&t=" + String(millis());
   OTA_LOG("[OTA] GET manifest: %s (forced=%d)", url.c_str(), (int)forced);
-  if (!http.begin(wcs, url)) { OTA_LOG("[OTA] http.begin FAIL"); return; }
-  http.addHeader("Accept-Encoding", "identity");
-  http.setReuse(false); http.useHTTP10(true);
-  http.setTimeout(5000);      // 5 s max par read
-  http.setReuse(false);
-  http.useHTTP10(true);
 
-  int code = http.GET(); 
-  OTA_LOG("[OTA] manifest code=%d", code);
-  
-  if (code!=HTTP_CODE_OK){ http.end(); return; }
-  String body = http.getString();    // peut bloquer jusqu'au timeout
-  esp_task_wdt_reset();
-  http.end();
-
-  OTA_VLOG("[OTA] Manifest head:\n%s", body.substring(0,300).c_str());
+  String body;
+  if (!fetchWithRetry(url, body)) {
+    String direct = "https://breezly-backend.onrender.com/firmware/esp32/wroom32e/prod/latest.json?t=" + String(millis());
+    OTA_LOG("[OTA] primary failed → try direct: %s", direct.c_str());
+    if (!fetchWithRetry(direct, body)) {
+      OTA_LOG("[OTA] manifest fetch failed (both)");
+      return;
+    }
+  }
+  OTA_LOG("[OTA] manifest OK, %u bytes", (unsigned)body.length());
+  OTA_VLOG("[OTA] Manifest head:\n%s", body.substring(0, 300).c_str());
 
   StaticJsonDocument<2048> doc;
-  DeserializationError err = deserializeJson(doc, body);
-  if (err){ OTA_LOG("[OTA] JSON parse error: %s", err.c_str()); return; }
+  DeserializationError jerr = deserializeJson(doc, body);
+  if (jerr) { OTA_LOG("[OTA] JSON parse error: %s", jerr.c_str()); return; }
 
   const char* product = doc["product"] | "";
   const char* model   = doc["model"]   | "";
@@ -380,13 +570,16 @@ void checkAndPerformCloudOTA(){
   int rollout         = doc["rollout"] | 100;
   bool force          = doc["force"]   | false;
   const char* minver  = doc["min_version"] | "";
-  JsonArray blocked   = doc["blocked_versions"].isNull()? JsonArray() : doc["blocked_versions"].as<JsonArray>();
+  JsonArray blocked   = doc["blocked_versions"].isNull()
+                        ? JsonArray() : doc["blocked_versions"].as<JsonArray>();
 
-  OTA_LOG("[OTA] manifest: ver=%s size=%u rollout=%d force=%d min=%s", ver, (unsigned)expectedSize, rollout, (int)force, minver);
+  OTA_LOG("[OTA] manifest: ver=%s size=%u rollout=%d force=%d min=%s",
+          ver, (unsigned)expectedSize, rollout, (int)force, minver);
   OTA_VLOG("[OTA] model=%s channel=%s product=%s", model, channel, product);
 
-  if (!ver[0] || !bin[0]){ OTA_LOG("[OTA] champs manquants"); return; }
+  if (!ver[0] || !bin[0]) { OTA_LOG("[OTA] champs manquants"); return; }
 
+  // Signature
   String canonical = String("{") +
     "\"product\":\""+String(product)+"\","+
     "\"model\":\""+String(model)+"\","+
@@ -394,7 +587,7 @@ void checkAndPerformCloudOTA(){
     "\"version\":\""+String(ver)+"\","+
     "\"url\":\""+String(bin)+"\","+
     "\"size\":"+String(expectedSize)+","+
-    "\"sha256\":\""+String(shaHex)+"\""+
+    "\"sha256\":\""+String(shaHex)+"\""
   "}";
 
   if (!sigB64[0] || !verifyManifestSignature(canonical, String(sigB64))){
@@ -416,30 +609,20 @@ void checkAndPerformCloudOTA(){
     force = true;
   }
 
-  auto hash32 = [](const String&s){
-    uint32_t h=2166136261u; for (size_t i=0;i<s.length();++i){ h ^= (uint8_t)s[i]; h *= 16777619u; }
-    return h;
-  };
+  auto hash32 = [](const String&s){ uint32_t h=2166136261u; for (size_t i=0;i<s.length();++i){ h ^= (uint8_t)s[i]; h *= 16777619u; } return h; };
   uint8_t bucket = (uint8_t)(hash32(sensorId) % 100);
   OTA_LOG("[OTA] rollout=%d%% bucket=%u sensorId=%s", rollout, bucket, sensorId.c_str());
-  if (!force && bucket >= rollout){
-    OTA_LOG("[OTA] skip by rollout");
-    return;
-  }
+  if (!force && bucket >= rollout){ OTA_LOG("[OTA] skip by rollout"); return; }
 
   int cmp = cmpSemver(String(CURRENT_FIRMWARE_VERSION), String(ver));
   OTA_LOG("[OTA] version cmp: current=%s target=%s -> %d", CURRENT_FIRMWARE_VERSION, ver, cmp);
-  if (!force && cmp >= 0){
-    OTA_LOG("[OTA] déjà à jour (skip)");
-    return;
-  }
+  if (!force && cmp >= 0){ OTA_LOG("[OTA] déjà à jour (skip)"); return; }
 
   OTA_LOG("[OTA] UPDATE → %s", bin);
   OTA_HEAP("before flash");
   logPartitions();
-  (void)product; (void)channel;
-  WiFiClientSecure binClient;
-  binClient.setCACert(CA_BUNDLE_PEM);
-  binClient.setTimeout(5000);         // ajoute ceci
-  httpDownloadToUpdate(String(bin), expectedSize, String(shaHex), binClient);
+
+  // Téléchargement/flash
+  bool ok = downloadAndFlashWithHTTPClient(String(bin), expectedSize, String(shaHex));
+  if (!ok) OTA_LOG("[OTA] download/flash failed");
 }
