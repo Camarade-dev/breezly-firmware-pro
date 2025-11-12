@@ -23,7 +23,7 @@ ScioSense_ENS160 ens160(0x52);
 HardwareSerial& PMS = Serial2;
 PmsData gPms;
 SemaphoreHandle_t gPmsMutex = nullptr;
-
+volatile bool g_netBusyForOta = false;
 Adafruit_NeoPixel led(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 volatile LedMode currentLedMode = LED_BOOT;
 volatile bool    ledOverride = false;

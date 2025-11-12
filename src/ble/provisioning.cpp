@@ -7,7 +7,8 @@
 #include "utils/crc_utils.h"   // computeChecksum(...)
 #include "mbedtls/md.h"
 #include "core/devkey_runtime.h"
-#include "led/led_status.h"   // ledSuspend()/ledResume()
+#include "led/led_status.h"    // ledSuspend()/ledResume()
+
 static NimBLEUUID serviceUUID("60f8a11f-e56f-4c3c-9658-5578e2f8d754");
 static NimBLEUUID credentialsCharacteristicUUID("d6f37ab1-4367-4001-b311-f219e161b736");
 static NimBLEUUID statusCharacteristicUUID      ("11f47ab2-1111-4002-b316-f219e161b736");
@@ -17,25 +18,70 @@ static NimBLECharacteristic* statusCharacteristic      = nullptr;
 static NimBLEServer*         pServer                   = nullptr;
 
 static String gBleName;
-static bool s_bleInitDone   = false;
-static bool s_advertising   = false;
+static bool s_bleInitDone = false;
+static bool s_advertising = false;
 
 extern bool bleInited;  // exporté via header
-// --- ajoute ce helper en haut du fichier ---
+
+// ------------------- WD & session -------------------
 static volatile uint32_t s_lastActivityMs = 0;
 static TaskHandle_t sWatchdogTask = nullptr;
-static bool s_wdEnabled = false;          // <— nouveau
+static bool s_wdEnabled = false;
 
-// 3 minutes de grâce par défaut (ajuste si tu veux)
 #ifndef PROV_IDLE_TIMEOUT_MS
-#define PROV_IDLE_TIMEOUT_MS 15000UL  // 15 s pour tester
+#define PROV_IDLE_TIMEOUT_MS 60000UL
 #endif
-static inline void wd_kick() { s_lastActivityMs = millis(); }
-static volatile bool s_gattConnected = false;   // NEW
-static inline void wd_enable(bool on) {
+#ifndef BLE_HS_CONN_HANDLE_NONE
+#define BLE_HS_CONN_HANDLE_NONE 0xFFFF
+#endif
+
+static volatile bool s_gattConnected = false;
+static uint16_t s_connHandle = BLE_HS_CONN_HANDLE_NONE;
+
+// --- Session state -----------------------------------------------------------
+enum class ProvPhase : uint8_t { IDLE, STARTING, SELECTING_SSID, TYPING, CLAIM, SENDING_CREDS, CONNECTING, DONE };
+
+static volatile ProvPhase s_phase = ProvPhase::IDLE;
+static volatile bool s_appForeground = true; // piloté par l’app
+static bool s_warned = false;                // pré-warning émis ?
+
+static inline void wd_kick(){ s_lastActivityMs = millis(); s_warned = false; }
+static inline void setPhase(ProvPhase p){ s_phase = p; wd_kick(); }
+static inline void setAppFg(bool fg){ s_appForeground = fg; wd_kick(); }
+
+static inline void wd_enable(bool on){
   s_wdEnabled = on;
   if (on) wd_kick();
+  Serial.printf("[WD] enable=%d\n", (int)on);
 }
+
+static uint32_t computePhaseTimeoutMs(){
+  // Timeouts côté app au 1er plan
+  uint32_t t_fg;
+  switch (s_phase) {
+    case ProvPhase::TYPING:          t_fg = 5UL*60*1000;  break; // 5 min
+    case ProvPhase::SELECTING_SSID:  t_fg = 3UL*60*1000;  break; // 3 min
+    case ProvPhase::CLAIM:           t_fg = 60UL*1000;    break; // 1 min
+    case ProvPhase::SENDING_CREDS:   t_fg = 60UL*1000;    break;
+    case ProvPhase::CONNECTING:      t_fg = 90UL*1000;    break; // 1m30
+    case ProvPhase::STARTING:        t_fg = 60UL*1000;    break;
+    case ProvPhase::DONE:            t_fg = 20UL*1000;    break;
+    default:                         t_fg = 60UL*1000;    break;
+  }
+  if (s_appForeground) return t_fg;
+
+  // App en arrière-plan : libérer vite l'appareil
+  switch (s_phase) {
+    case ProvPhase::TYPING:          return 30UL*1000;
+    case ProvPhase::SELECTING_SSID:  return 30UL*1000;
+    case ProvPhase::CLAIM:           return 15UL*1000;
+    case ProvPhase::SENDING_CREDS:   return 20UL*1000;
+    case ProvPhase::CONNECTING:      return 30UL*1000;
+    default:                         return 20UL*1000;
+  }
+}
+
+// ------------------- crypto & utils -------------------
 static bool hmac_sha256(const uint8_t* key, size_t keylen, const uint8_t* msg, size_t msglen, uint8_t out[32]){
   mbedtls_md_context_t ctx; mbedtls_md_init(&ctx);
   const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
@@ -48,8 +94,6 @@ static bool hmac_sha256(const uint8_t* key, size_t keylen, const uint8_t* msg, s
 }
 
 static String base64Encode(const uint8_t* buf, size_t len){
-  // Arduino base64: use extern or write minimal encoder; ici on s'appuie sur Arduino's built-in
-  // Si pas dispo chez toi, remplace par ton encodeur existant (tu en as déjà côté JS).
   String out; out.reserve(((len+2)/3)*4);
   static const char* tbl="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   for(size_t i=0;i<len;i+=3){
@@ -60,26 +104,7 @@ static String base64Encode(const uint8_t* buf, size_t len){
   }
   return out;
 }
-// --- remplace provisioningSetStatus par ---
-void provisioningSetStatus(const char* json){
-  if (statusCharacteristic){
-    // LOG sortant vers l'app
-    Serial.printf("[ESP->APP][NOTIFY] JSON len=%u\n", (unsigned)strlen(json));
-    Serial.printf("[ESP->APP][NOTIFY] %s\n", json);
-    statusCharacteristic->setValue(json);
-    statusCharacteristic->notify();
-  } else {
-    Serial.println("[ESP->APP][NOTIFY] statusCharacteristic NULL");
-  }
-}
 
-void provisioningNotifyConnected(){
-  provisioningSetStatus("{\"status\":\"connected\"}");
-  wd_enable(false);
-  s_gattConnected = false;  // on coupe la session BLE “logiquement”
-  Serial.println("[WD] provisioning complete -> WD disabled, gatt=0");
-}
-// === Helpers de log hex/ASCII ===
 static void printHex(const uint8_t* buf, size_t len, const char* tag = "HEX") {
   Serial.printf("[BLE][%s] len=%u : ", tag, (unsigned)len);
   for (size_t i = 0; i < len; ++i) Serial.printf("%02X", buf[i]);
@@ -97,10 +122,27 @@ static void printAsciiPreview(const uint8_t* buf, size_t len, size_t maxShow = 8
   Serial.println();
 }
 
+// ------------------- notify helpers -------------------
+void provisioningSetStatus(const char* json){
+  if (statusCharacteristic){
+    Serial.printf("[ESP->APP][NOTIFY] JSON len=%u\n", (unsigned)strlen(json));
+    Serial.printf("[ESP->APP][NOTIFY] %s\n", json);
+    statusCharacteristic->setValue(json);
+    statusCharacteristic->notify();
+  } else {
+    Serial.println("[ESP->APP][NOTIFY] statusCharacteristic NULL");
+  }
+}
 
+void provisioningNotifyConnected(){
+  provisioningSetStatus("{\"status\":\"connected\"}");
+  wd_enable(false);
+  s_gattConnected = false;
+  Serial.println("[WD] provisioning complete -> WD disabled, gatt=0");
+}
 
-// --- Helpers -----------------------------------------------------------------
-static void configureAdvertising() {
+// ------------------- advertising -------------------
+static void configureAdvertising(){
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   if (!adv) return;
 
@@ -114,11 +156,21 @@ static void configureAdvertising() {
   scanData.setName(gBleName.c_str());
   adv->setScanResponseData(scanData);
 }
-// provisioning.cpp (extrait)
 
+// ------------------- worker JSON -------------------
 static String g_acc;
 static TaskHandle_t sCredTask = nullptr;
 static SemaphoreHandle_t sAccMutex;
+
+// NEW: hooks C appelables depuis ton code Wi-Fi/MQTT pour avertir l’app en temps réel.
+void breezly_on_wifi_ok()            { provisioningSetStatus("{\"status\":\"wifi_ok\"}"); }
+void breezly_on_wifi_auth_failed()   { provisioningSetStatus("{\"status\":\"wifi_auth_failed\"}"); }
+void breezly_on_wifi_assoc_timeout() { provisioningSetStatus("{\"status\":\"wifi_assoc_timeout\"}"); }
+void breezly_on_inet_ok()            { provisioningSetStatus("{\"status\":\"inet_ok\"}"); }
+void breezly_on_mqtt_hello_ok()      { provisioningSetStatus("{\"status\":\"hello_ok\"}"); }
+void breezly_on_registered()         { provisioningSetStatus("{\"status\":\"registered\"}"); }
+void breezly_on_connected_final()    { provisioningSetStatus("{\"status\":\"connected\"}"); }
+
 static void credWorker(void*){
   for(;;){
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -126,14 +178,13 @@ static void credWorker(void*){
 
     String json;
     xSemaphoreTake(sAccMutex, portMAX_DELAY);
-    json = g_acc;
-    g_acc = "";
+    json = g_acc; g_acc = "";
     xSemaphoreGive(sAccMutex);
 
     Serial.printf("[BLE][WORKER] JSON total len=%u\n", (unsigned)json.length());
     Serial.printf("[BLE][WORKER] JSON payload: %s\n", json.c_str());
 
-    DynamicJsonDocument doc(1024);
+    DynamicJsonDocument doc(1536);
     DeserializationError err = deserializeJson(doc, json);
     if (err){
       Serial.printf("[BLE][WORKER][ERROR] JSON deserialization: %s\n", err.f_str());
@@ -142,36 +193,74 @@ static void credWorker(void*){
     }
 
     const char* op = doc["op"] | "";
-    if (strcmp(op, "abort") == 0) {
-      // Feedback à l’app + remise à zéro de l’état de provisioning
+
+    // --------- Annulation côté app ---------
+    if (!strcmp(op, "abort")) {
       provisioningSetStatus("{\"status\":\"aborted\",\"reason\":\"client_abort\"}");
-      g_acc = "";  // purge JSON accumulé
-      // Déconnexion “propre” si encore connecté côté GATT
-      NimBLEDevice::stopAdvertising(); // (facultatif, on va relancer)
-      // Si tu as un handle, tu peux forcer la déconnexion. Sinon, redémarrer la pub suffit.
+      g_acc = "";
       restartBLEAdvertising();
-      continue; // rien d’autre à faire
+      continue;
     }
 
-    Serial.printf("[BLE][WORKER] op=\"%s\"\n", op);
+    // --------- Sync UI → device ---------
+    if (!strcmp(op, "app_state")) {
+      const char* v = doc["value"] | "fg";
+      setAppFg(strcmp(v,"bg")!=0);
+      provisioningSetStatus("{\"status\":\"app_state_ok\"}");
+      continue;
+    }
+    if (!strcmp(op, "phase")) {
+      const char* v = doc["value"] | "IDLE";
+      if      (!strcmp(v,"STARTING"))       setPhase(ProvPhase::STARTING);
+      else if (!strcmp(v,"SELECTING_SSID")) setPhase(ProvPhase::SELECTING_SSID);
+      else if (!strcmp(v,"TYPING"))         setPhase(ProvPhase::TYPING);
+      else if (!strcmp(v,"CLAIM"))          setPhase(ProvPhase::CLAIM);
+      else if (!strcmp(v,"SENDING_CREDS"))  setPhase(ProvPhase::SENDING_CREDS);
+      else if (!strcmp(v,"CONNECTING"))     setPhase(ProvPhase::CONNECTING);
+      else if (!strcmp(v,"DONE"))           setPhase(ProvPhase::DONE);
+      else                                   setPhase(ProvPhase::IDLE);
+      provisioningSetStatus("{\"status\":\"phase_ok\"}");
+      continue;
+    }
 
-    String modeS = doc["mode"]     | "psk";
-    String ssidS = doc["ssid"]     | "";
-    String sIdS  = doc["sensorId"] | "";
-    String uIdS  = doc["userId"]   | "";
+    // --------- Maintenance ---------
+    if (!strcmp(op, "erase")) {
+      // Efface uniquement les creds Wi-Fi (pas les clés device)
+      prefs.begin("myApp", false);
+      prefs.remove("wifiSSID");
+      prefs.remove("wifiPassword");
+      prefs.remove("wifiAuthType");
+      prefs.remove("eapUsername");
+      prefs.remove("eapPassword");
+      prefs.remove("eapIdentity");
+      prefs.remove("eapAnon");
+      prefs.remove("checksum");
+      prefs.end();
+      provisioningSetStatus("{\"status\":\"erased\"}");
+      continue;
+    }
 
-    if (strcmp(op, "claim_challenge") == 0) {
+    if (!strcmp(op, "factory_reset")) {
+      // Efface creds + IDs utilisateur; garde l’ID matériel
+      prefs.begin("myApp", false);
+      prefs.clear(); // si tu veux vraiment tout virer du namespace "myApp"
+      prefs.end();
+      provisioningSetStatus("{\"status\":\"factory_done\"}");
+      // Option: reboot doux pour revenir direct en advertising propre
+      delay(100);
+      ESP.restart();
+      continue;
+    }
+
+    // --------- Claim HMAC ---------
+    if (!strcmp(op, "claim_challenge")) {
+      setPhase(ProvPhase::CLAIM);
       String nonceB64 = doc["nonce"] | "";
       uint32_t counter = doc["counter"] | 0;
-      Serial.printf("[BLE][WORKER] claim_challenge: nonceB64.len=%u counter=%u\n",
-                    (unsigned)nonceB64.length(), counter);
-      
-      if (g_deviceKeyB64.length() == 0 || nonceB64.length() == 0) {
-        Serial.println("[BLE][WORKER][ERROR] missing key or nonce");
+      if (g_deviceKeyB64.length()==0 || nonceB64.length()==0) {
         provisioningSetStatus("{\"op\":\"claim_proof\",\"err\":\"missing_key_or_nonce\"}");
         continue;
       }
-
       auto b64Dec = [](const String& s)->std::vector<uint8_t>{
         const char* tbl="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         auto idx=[&](char c)->int{ const char* p=strchr(tbl,c); return p? (int)(p-tbl) : (c=='='?-1:-2); };
@@ -184,123 +273,125 @@ static void credWorker(void*){
         }
         return out;
       };
-
-      std::vector<uint8_t> nonce = b64Dec(nonceB64);
-      Serial.printf("[BLE][WORKER] decoded nonce len=%u (expected 32)\n", (unsigned)nonce.size());
-      if (nonce.size() != 32) {
-        Serial.println("[BLE][WORKER][ERROR] bad_nonce_len");
+      auto nonce = b64Dec(nonceB64);
+      if (nonce.size()!=32) {
         provisioningSetStatus("{\"op\":\"claim_proof\",\"err\":\"bad_nonce_len\"}");
         continue;
       }
+      uint8_t msg[36]; memcpy(msg, nonce.data(), 32);
+      msg[32]=(uint8_t)((counter>>24)&0xFF);
+      msg[33]=(uint8_t)((counter>>16)&0xFF);
+      msg[34]=(uint8_t)((counter>>8)&0xFF);
+      msg[35]=(uint8_t)(counter&0xFF);
 
-      uint8_t msg[36]; size_t mlen = 0;
-      memcpy(msg, nonce.data(), 32); mlen = 32;
-      msg[mlen+0] = (uint8_t)((counter>>24)&0xFF);
-      msg[mlen+1] = (uint8_t)((counter>>16)&0xFF);
-      msg[mlen+2] = (uint8_t)((counter>>8)&0xFF);
-      msg[mlen+3] = (uint8_t)(counter&0xFF);
-      mlen += 4;
-      printHex(msg, mlen, "CLAIM_MSG");
-
-      std::vector<uint8_t> key = b64Dec(g_deviceKeyB64);
-      Serial.printf("[BLE][WORKER] decoded key len=%u\n", (unsigned)key.size());
-
+      auto key = b64Dec(g_deviceKeyB64);
       uint8_t mac[32];
-      if (!hmac_sha256(key.data(), key.size(), msg, mlen, mac)) {
-        Serial.println("[BLE][WORKER][ERROR] hmac_failed");
+      if (!hmac_sha256(key.data(), key.size(), msg, 36, mac)) {
         provisioningSetStatus("{\"op\":\"claim_proof\",\"err\":\"hmac_failed\"}");
         continue;
       }
       String macB64 = base64Encode(mac, 32);
-      Serial.printf("[BLE][WORKER] hmac(b64).len=%u\n", (unsigned)macB64.length());
-
-      StaticJsonDocument<128> out;
-      out["op"]   = "claim_proof";
-      out["hmac"] = macB64;
+      StaticJsonDocument<128> out; out["op"]="claim_proof"; out["hmac"]=macB64;
       String s; serializeJson(out, s);
       provisioningSetStatus(s.c_str());
       continue;
     }
 
-    // Logs généraux sur les credentials
-    Serial.printf("[BLE][WORKER] mode=%s, ssid.len=%u, sensorId.len=%u, userId.len=%u\n",
-                  modeS.c_str(), (unsigned)ssidS.length(), (unsigned)sIdS.length(), (unsigned)uIdS.length());
+    // --------- Credentials (EAP/PSK) ---------
+    if (!strcmp(op, "provision")) {
+      String modeS = doc["mode"]     | "psk";
+      String ssidS = doc["ssid"]     | "";
+      String sIdS  = doc["sensorId"] | "";
+      String uIdS  = doc["userId"]   | "";
 
-    if (modeS.equalsIgnoreCase("eap")) {
-      String userS = doc["username"]  | "";
-      String passS = doc["password"]  | "";
-      String idS   = doc["identity"]  | userS;
-      String anonS = doc["anonymous"] | "";
-      Serial.printf("[BLE][WORKER] EAP: user.len=%u pass.len=%u id.len=%u anon.len=%u\n",
-                    (unsigned)userS.length(), (unsigned)passS.length(), (unsigned)idS.length(), (unsigned)anonS.length());
+      setPhase(ProvPhase::SENDING_CREDS);
 
-      if (ssidS.isEmpty() || userS.isEmpty() || passS.isEmpty()){
-        Serial.println("[BLE][WORKER][ERROR] missing_fields (EAP)");
-        provisioningSetStatus("{\"status\":\"missing_fields\"}");
-        continue;
+      if (modeS.equalsIgnoreCase("eap")) {
+        String userS = doc["username"]  | "";
+        String passS = doc["password"]  | "";
+        String idS   = doc["identity"]  | userS;
+        String anonS = doc["anonymous"] | "";
+        if (ssidS.isEmpty() || userS.isEmpty() || passS.isEmpty()){
+          provisioningSetStatus("{\"status\":\"missing_fields\"}");
+          continue;
+        }
+        wifiSSID=ssidS; wifiAuthType=WIFI_CONN_EAP_PEAP_MSCHAPV2;
+        eapUsername=userS; eapPassword=passS; eapIdentity=idS; eapAnon=anonS;
+      } else {
+        String pwdS = doc["password"] | "";
+        if (ssidS.isEmpty() || pwdS.isEmpty()){
+          provisioningSetStatus("{\"status\":\"missing_fields\"}");
+          continue;
+        }
+        wifiSSID=ssidS; wifiPassword=pwdS; wifiAuthType=WIFI_CONN_PSK;
       }
-
-      wifiSSID=ssidS; wifiAuthType=WIFI_CONN_EAP_PEAP_MSCHAPV2;
-      eapUsername=userS; eapPassword=passS; eapIdentity=idS; eapAnon=anonS;
       if (!sIdS.isEmpty()) sensorId=sIdS;
       if (!uIdS.isEmpty()) userId=uIdS;
 
-      uint32_t checksum=computeChecksum(wifiSSID,String(""),sensorId,userId);
-      prefs.begin("myApp", false);
-      prefs.putString("wifiSSID", wifiSSID);
-      prefs.putUInt  ("wifiAuthType",(uint32_t)wifiAuthType);
-      prefs.putString("eapUsername",  eapUsername);
-      prefs.putString("eapPassword",  eapPassword);
-      prefs.putString("eapIdentity",  eapIdentity);
-      prefs.putString("eapAnon",      eapAnon);
-      prefs.putString("sensorId",     sensorId);
-      prefs.putString("userId",       userId);
-      prefs.putUInt  ("checksum",     checksum);
-      prefs.end();
-    } else {
-      String pwdS = doc["password"] | "";
-      Serial.printf("[BLE][WORKER] PSK: pwd.len=%u\n", (unsigned)pwdS.length());
-      if (ssidS.isEmpty() || pwdS.isEmpty()){
-        Serial.println("[BLE][WORKER][ERROR] missing_fields (PSK)");
-        provisioningSetStatus("{\"status\":\"missing_fields\"}");
-        continue;
-      }
-      wifiSSID=ssidS; wifiPassword=pwdS; wifiAuthType=WIFI_CONN_PSK;
-      if (!sIdS.isEmpty()) sensorId=sIdS;
-      if (!uIdS.isEmpty()) userId=uIdS;
-
-      uint32_t checksum=computeChecksum(wifiSSID,wifiPassword,sensorId,userId);
+      uint32_t checksum = computeChecksum(wifiSSID,(wifiAuthType==WIFI_CONN_PSK)?wifiPassword:String(""),sensorId,userId);
       prefs.begin("myApp", false);
       prefs.putString("wifiSSID",     wifiSSID);
-      prefs.putString("wifiPassword", wifiPassword);
+      if (wifiAuthType==WIFI_CONN_PSK) prefs.putString("wifiPassword", wifiPassword);
       prefs.putUInt  ("wifiAuthType", (uint32_t)wifiAuthType);
+      if (wifiAuthType==WIFI_CONN_EAP_PEAP_MSCHAPV2) {
+        prefs.putString("eapUsername", eapUsername);
+        prefs.putString("eapPassword", eapPassword);
+        prefs.putString("eapIdentity", eapIdentity);
+        prefs.putString("eapAnon",     eapAnon);
+      }
       prefs.putString("sensorId",     sensorId);
       prefs.putString("userId",       userId);
       prefs.putUInt  ("checksum",     checksum);
       prefs.end();
+
+      // Lance la connexion Wi-Fi côté loop/RTOS (ton code existant)
+      setPhase(ProvPhase::CONNECTING);
+      provisioningSetStatus("{\"status\":\"connecting\"}");
+
+      // >>> Ton code Wi-Fi doit appeler ces callbacks au bon moment :
+      // breezly_on_wifi_ok();
+      // breezly_on_wifi_auth_failed();    // en cas d’échec auth
+      // breezly_on_wifi_assoc_timeout();  // si pas de réponse AP
+      // breezly_on_inet_ok();             // quand ping/HTTP OK
+      // breezly_on_mqtt_hello_ok();       // quand publish MQTT “hello” (retained) OK
+      // breezly_on_registered();          // quand le cloud répond “sensor attached”
+      // breezly_on_connected_final();     // tout est prêt
+      needToConnectWiFi = true;
+      continue;
     }
 
-    needToConnectWiFi = true;
-    provisioningSetStatus("{\"status\":\"connecting\"}");
+    // Si on arrive ici : op non reconnue
+    provisioningSetStatus("{\"status\":\"unknown_op\"}");
   }
 }
+
+
+// ------------------- callbacks -------------------
 class ServerCb : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* s, ble_gap_conn_desc* d)  {
-    s_gattConnected = true;                     // <— flag sûr
+public:
+  void onConnect(NimBLEServer* s, NimBLEConnInfo& ci) override {
+    s_gattConnected = true;
+    s_connHandle = ci.getConnHandle();
+    setAppFg(true);
+    setPhase(ProvPhase::STARTING);
     wd_enable(true);
     provisioningSetStatus("{\"status\":\"ble_connected\"}");
-    Serial.println("[WD] onConnect: enable WD, gattConnected=1");
+    Serial.printf("[WD] onConnect: gatt=1, conn=%u\n", (unsigned)s_connHandle);
   }
-  void onDisconnect(NimBLEServer* s, ble_gap_conn_desc* d)  {
-    s_gattConnected = false;                    // <— flag sûr
+
+  void onDisconnect(NimBLEServer* s, NimBLEConnInfo& ci, int reason) override {
+    (void)ci;
+    Serial.printf("[WD] onDisconnect: reason=%d\n", reason);
+    s_gattConnected = false;
+    s_connHandle = BLE_HS_CONN_HANDLE_NONE;
+    setPhase(ProvPhase::IDLE);
+    setAppFg(true);
     provisioningSetStatus("{\"status\":\"idle\"}");
     g_acc = "";
     wd_enable(false);
-    Serial.println("[WD] onDisconnect: disable WD, gattConnected=0");
     restartBLEAdvertising();
   }
 };
-
 
 class CredentialsCallback : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo&) override {
@@ -325,11 +416,9 @@ class CredentialsCallback : public NimBLECharacteristicCallbacks {
         (last>=32 && last<127)?last:'.', (unsigned char)last);
     }
 
-    bool done = g_acc.endsWith("}");
-    if (done) {
-      Serial.println("[BLE][onWrite] detected end-of-JSON '}' -> wake worker");
-    }
+    const bool done = g_acc.endsWith("}");
     xSemaphoreGive(sAccMutex);
+
     if (!done) return;
 
     if (!sCredTask){
@@ -338,44 +427,55 @@ class CredentialsCallback : public NimBLECharacteristicCallbacks {
     xTaskNotifyGive(sCredTask);
   }
 };
-static void sessionWatchdog(void*) {
+
+// ------------------- watchdog task -------------------
+static void sessionWatchdog(void*){
+  Serial.println("[WD] task started");
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(500));
-
-    if (!s_wdEnabled)                continue;
-    if (!s_gattConnected)            continue;   // <— remplace getConnectedCount()
-    // (optionnel) si tu veux garder un garde-fou : if (!pServer) continue;
+    if (!s_wdEnabled)     continue;
+    if (!s_gattConnected) continue;
 
     const uint32_t now  = millis();
     const uint32_t idle = now - s_lastActivityMs;
 
-    // DEBUG : trace toutes les 5 s
     static uint32_t lastLog = 0;
     if (now - lastLog > 5000) {
-      Serial.printf("[WD] enabled=1, gatt=1, idle=%lu/%lu ms\n",
-                    (unsigned long)idle, (unsigned long)PROV_IDLE_TIMEOUT_MS);
+      Serial.printf("[WD] enabled=1, gatt=1, idle=%lu / phaseTO=%lu ms (phase=%u, fg=%u)\n",
+        (unsigned long)idle, (unsigned long)computePhaseTimeoutMs(),
+        (unsigned)s_phase, (unsigned)s_appForeground);
       lastLog = now;
     }
 
-    if (idle > PROV_IDLE_TIMEOUT_MS) {
-      Serial.println("[WD] TIMEOUT -> notify+restart adv");
-      // Ne notifie que si encore connecté (sinon ça ne sert à rien et peut planter)
+    const uint32_t to = computePhaseTimeoutMs();
+
+    // Pré-warning ~10s avant coupure (réarmé par wd_kick)
+    if (!s_warned && idle + 10000UL > to && idle < to) {
+      provisioningSetStatus("{\"status\":\"idle_warning\",\"in\":\"10s\"}");
+      s_warned = true;
+      continue;
+    }
+
+    if (idle > to) {
+      Serial.println("[WD] TIMEOUT -> notify + DISCONNECT");
       provisioningSetStatus("{\"status\":\"timeout\"}");
       g_acc = "";
-      restartBLEAdvertising();
-      wd_kick();               // évite une rafale
-      // On garde s_wdEnabled= true : si l’app se reconnecte, on repart
+      if (pServer && s_connHandle != BLE_HS_CONN_HANDLE_NONE) {
+        pServer->disconnect(s_connHandle);
+      } else {
+        restartBLEAdvertising();
+      }
+      s_warned = false;
+      wd_kick(); // évite rafale
     }
   }
 }
 
-
-
-// --- API ---------------------------------------------------------------------
-void setupBLE(bool startAdvertising) {
+// ------------------- API -------------------
+void setupBLE(bool startAdvertising){
   wd_kick();
-  Serial.printf("[WD] init: timeout=%lu ms\n", (unsigned long)PROV_IDLE_TIMEOUT_MS);
-  // Anti double-init : si déjà init, on peut juste (re)lancer la pub.
+  Serial.printf("[WD] init: baseTO=%lu ms\n", (unsigned long)PROV_IDLE_TIMEOUT_MS);
+
   if (s_bleInitDone) {
     if (startAdvertising && !s_advertising) {
       configureAdvertising();
@@ -386,7 +486,7 @@ void setupBLE(bool startAdvertising) {
     return;
   }
 
-  // 1) Nom BLE persistant comme dans ton code qui marche
+  // Nom BLE persistant
   char bleName[25];
   prefs.begin("myApp", true);
   String storedBleName = prefs.getString("bleName", "");
@@ -403,10 +503,7 @@ void setupBLE(bool startAdvertising) {
   }
   gBleName = String(bleName);
 
-  // ⚠️ Laisse la coexistence Wi-Fi/BLE gérer : NE PAS couper le Wi-Fi ici.
-  //    Pas de esp_bt_controller_mem_release() non plus. (C’était la cause la plus probable.)
-
-  // 2) Init NimBLE identique à la version monolithique
+  // Init NimBLE
   Serial.printf("[BLE] INIT NimBLE (%s)\n", bleName);
   NimBLEDevice::init(bleName);
   NimBLEDevice::setMTU(185);
@@ -420,7 +517,6 @@ void setupBLE(bool startAdvertising) {
     credentialsCharacteristicUUID,
     NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
   );
-
   credentialsCharacteristic->setCallbacks(new CredentialsCallback());
   credentialsCharacteristic->createDescriptor("2901")->setValue("WiFi Credentials");
 
@@ -431,14 +527,14 @@ void setupBLE(bool startAdvertising) {
   statusCharacteristic->createDescriptor("2901")->setValue("Device Status");
   statusCharacteristic->setValue("{\"status\":\"not_connected\"}");
 
-  pService->start();             // <- IMPORTANT : start le service AVANT de configurer la pub
+  pService->start();
   delay(50);
 
-  configureAdvertising();        // payload (nom + service UUID)
+  configureAdvertising();
   delay(20);
 
   if (startAdvertising) {
-    NimBLEDevice::startAdvertising();   // appel “haut niveau” fiable
+    NimBLEDevice::startAdvertising();
     s_advertising = NimBLEDevice::getAdvertising()->isAdvertising();
     Serial.printf("[BLE] advertising=%d\n", (int)s_advertising);
   } else {
@@ -446,14 +542,15 @@ void setupBLE(bool startAdvertising) {
   }
 
   s_bleInitDone = true;
-  bleInited     = true;
+  bleInited = true;
+
   if (!sWatchdogTask) {
     xTaskCreatePinnedToCore(sessionWatchdog, "BLE_WD", 4096, nullptr, 1, &sWatchdogTask, 0);
   }
 }
 
-void restartBLEAdvertising() {
-  if (!s_bleInitDone) return;         // pas d’init -> pas de restart
+void restartBLEAdvertising(){
+  if (!s_bleInitDone) return;
   NimBLEAdvertising* a = NimBLEDevice::getAdvertising();
   if (!a) return;
 

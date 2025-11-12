@@ -12,3 +12,4 @@ void triggerOtaCheckNow();
 
 // (exposé si tu veux afficher l’état)
 bool otaIsInProgress();
+void otaSetInProgress(bool v);
