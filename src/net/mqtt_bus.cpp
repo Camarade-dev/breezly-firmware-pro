@@ -17,7 +17,14 @@
 #include "../ca_bundle.h"
 
 #include "../app_config.h"  
+#if defined(BREEZLY_PROD)
+static const char* MQTT_PREFIX = "prod/";
+#elif defined(BREEZLY_DEV)
 static const char* MQTT_PREFIX = "dev/";
+#else
+// fallback: on considère dev par défaut
+static const char* MQTT_PREFIX = "dev/";
+#endif
 // ======= PARAMS BROKER (reprends les tiens) =======
 static const char* MQTT_HOST = "607207c4394d44b8bad11a33e8ed591d.s1.eu.hivemq.cloud";
 static const int   MQTT_PORT = 8883;

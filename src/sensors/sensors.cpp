@@ -20,9 +20,9 @@ extern uint16_t be16(const uint8_t *b); // déjà déclaré dans globals.h
 // Affine "usine" (+ petit plancher pour éviter 0 moches)
 static constexpr float kPM1_Af  = 1.000f;
 static constexpr float kPM1_Bf  = 0.0f;
-static constexpr float kPM25_Af = 1.000f;
+static constexpr float kPM25_Af = 2.000f;
 static constexpr float kPM25_Bf = 1.5f;
-static constexpr float kPM10_Af = 1.000f;
+static constexpr float kPM10_Af = 2.100f;
 static constexpr float kPM10_Bf = 1.5f;
 
 // Activ. fusion counts
