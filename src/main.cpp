@@ -18,8 +18,11 @@
 #include "core/devkey_runtime.h"
 #include "power/cpu_pm.h"
 #include "sensors/calibration.h"
-#include "esp_flash_encrypt.h"
 static bool s_twdtReady = false;
+static bool s_mqttStarted = false;   // NEW : MQTT pas encore démarré
+// Indique que la fenêtre OTA de boot est terminée (succès, échec ou skip)
+volatile bool g_otaBootWindowDone = false;
+
 void doFactoryResetOnMainLoop(){
   updateLedState(LED_UPDATING);
   Serial.println("[RESET] Arrêt propre avant reset...");
@@ -84,10 +87,8 @@ static bool s_bleStartAdv = false;
 // ble/provisioning.cpp ou core/globals.cpp (où tu lis tes prefs)
 
 void setup(){
-  delay(5000);
+  delay(500);
   Serial.begin(115200);
-  Serial.printf("Flash chip size: %u MB\n", ESP.getFlashChipSize()/(1024*1024));
-  Serial.printf("[DBG] flash enc enabled = %d\n", esp_flash_encryption_enabled());
   enableCpuPM();
   otaOnBootValidate(); 
   twdtInitOnce();
@@ -155,14 +156,17 @@ void setup(){
   while(!bleInited && millis()-t0 < 2000) { twdtResetSafe();
  delay(10); }
 
-  ledTaskStart();
-  sensorsInit();
-  calInit();      // charge NVS et compose A/B
-  calCompose(); 
-  gPmsMutex = xSemaphoreCreateMutex();
-  pmsTaskStart(16, 17);
-  pmsInitPins(15); // SET=15
-  pmsSleep();
+  // ⚠️ On NE démarre plus les capteurs / PMS ici.
+  // On les démarrera après la fenêtre OTA de boot, une fois qu'on a
+  // soit mis à jour, soit décidé de rester sur la version actuelle.
+  ledTaskStart(); 
+  // sensorsInit();
+  // calInit();
+  // calCompose(); 
+  // gPmsMutex = xSemaphoreCreateMutex();
+  // pmsTaskStart(16, 17);
+  // pmsInitPins(15); // SET=15
+  // pmsSleep();
   // 2) Tenter la connexion Wi-Fi immédiate si on a des identifiants
   //    (en cas d’échec, connectToWiFi() s’occupe de relancer l’advertising BLE)
   if (!missingCreds) {
@@ -178,8 +182,9 @@ void setup(){
     // NE PAS bloquer ici. loop() s'occupe d'appeler connectToWiFi()
   }
   twdtResetSafe(); delay(1);
-  mqtt_bus_start_task();   // démarre le bus MQTT (tâche propriétaire)
-  mqtt_request_connect();  // demande une première connexion
+  // ⚠️ NE PLUS démarrer MQTT ici
+  // mqtt_bus_start_task();
+  // mqtt_request_connect();
 
   Serial.println("[BOOT] Setup terminé");
   updateLedState(LED_BOOT);
@@ -351,7 +356,35 @@ void loop(){
       enterModemSleep(false);
     }
   }
-}
+} 
+        if (!s_mqttStarted
+      && wifiConnected
+      && g_otaBootWindowDone        // ✅ fenêtre OTA terminée
+      && !otaIsInProgress()
+      && !g_factoryResetPending) {
+
+    Serial.println("[BOOT] Start sensors + MQTT after OTA window");
+
+    // ======= CAPTEURS / PMS =======
+    if (!gPmsMutex) {
+      gPmsMutex = xSemaphoreCreateMutex();
+    }
+
+    sensorsInit();
+    calInit();
+    calCompose();
+
+    pmsTaskStart(16, 17);
+    pmsInitPins(15);
+    pmsSleep();
+
+    // ======= MQTT =======
+    mqtt_bus_start_task();
+    mqtt_request_connect();
+    s_mqttStarted = true;
+  }
+
+
   twdtResetSafe();
   vTaskDelay(5/portTICK_PERIOD_MS);
   #if USE_DEEP_SLEEP

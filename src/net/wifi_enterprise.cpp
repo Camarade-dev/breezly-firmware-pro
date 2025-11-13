@@ -10,6 +10,7 @@ extern "C" {
   #include "esp_event.h"
   #include "esp_eap_client.h"   // API Enterprise moderne (ESP-IDF 5.x)
 }
+#include "esp_wifi.h"
 extern bool bleInited;
 extern void restartBLEAdvertising();
 
@@ -115,7 +116,7 @@ bool connectToWiFiEnterprise() {
   }
   Serial.println();
 
-  if (ok) {
+      if (ok) {
     wifiConnected = true;
     breezly_on_wifi_ok();
     Serial.printf("[EAP] OK IP=%s  RSSI=%d\n",
@@ -136,8 +137,28 @@ bool connectToWiFiEnterprise() {
     // 3) Final
     provisioningNotifyConnected();
     startSNTPAfterConnected();
+
+    // 🎯 NEW : libérer les buffers EAP (identité / mdp / CA) devenus inutiles
+    // → ça rend quelques kB de heap, utile avant l’OTA.
+
+      esp_eap_client_clear_identity();
+
+
+      esp_eap_client_clear_username();
+
+
+      esp_eap_client_clear_password();
+
+
+      esp_eap_client_clear_new_password();
+
+      esp_eap_client_clear_ca_cert();
+    //esp_wifi_sta_enterprise_disable(); test si ça nique la requete
+
     return true;
   }
+
+
 
   // Échec : préciser la cause
   wifiConnected = false;
