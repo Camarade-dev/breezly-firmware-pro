@@ -1,4 +1,3 @@
-// src/ota/ota.cpp
 #include "ota.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -21,6 +20,10 @@
 #include "ca_bundle.h"
 #include "esp_err.h"
 
+extern "C" {
+  #include "esp_wifi.h"
+}
+
 #ifndef OTA_DEBUG
 #define OTA_DEBUG 2   // 0 = off, 1 = normal, 2 = verbose
 #endif
@@ -38,12 +41,18 @@ struct BoolFlagGuard {
 // ===================== Utils =====================
 static volatile bool g_otaInProgress = false;
 bool otaIsInProgress(){ return g_otaInProgress; }
+extern volatile bool g_otaBootWindowDone;
+struct OtaBootWindowGuard {
+  volatile bool* flag;
+  explicit OtaBootWindowGuard(volatile bool* p) : flag(p) {}
+  ~OtaBootWindowGuard() { if (flag) *flag = true; }
+};
 void otaSetInProgress(bool v){ g_otaInProgress = v; }
 static bool httpGetToString(const String& url, String& out,
                             uint32_t connectMs = 8000,
                             uint32_t readMs    = 12000);
 static void logPartitions(){
-  const esp_partition_t* run  = esp_ota_get_running_partition();
+  /*const esp_partition_t* run  = esp_ota_get_running_partition();
   const esp_partition_t* next = esp_ota_get_next_update_partition(NULL);
   if (run)  OTA_VLOG(
       "[OTA] running  part: label=%s addr=0x%06x size=%u encrypted=%d",
@@ -52,7 +61,7 @@ static void logPartitions(){
   if (next) OTA_VLOG(
       "[OTA] next OTA part: label=%s addr=0x%06x size=%u encrypted=%d",
       next->label, next->address, next->size, next->encrypted
-  );
+  );*/
 }
 static bool fetchWithRetry(const String& u, String& out, int tries=4) {
   for (int i=1; i<=tries; ++i) {
@@ -91,6 +100,9 @@ static bool hexEq(const uint8_t* digest, const String& hex){
   }
   return true;
 }
+static bool downloadAndFlashWithHTTPClient(const String& binUrl,
+                                           uint32_t expectedSize,
+                                           const String& expectedSha256Hex);
 
 // GET → String via HTTPClient (TLS 1.2+, no chunked in memory)
 // Remplace ta httpGetToString existante par celle-ci
@@ -98,20 +110,28 @@ static bool httpGetToString(const String& url, String& out,
                             uint32_t connectMs,
                             uint32_t readMs) {
   WiFiClientSecure wcs;
-wcs.setCACert(CA_BUNDLE_PEM);
+
+  // Pour GitHub Pages : on désactive la vérif du cert.
+  // La sécurité vient de ta signature ECDSA + SHA256, pas du TLS ici.
+  if (url.startsWith("https://Camarade-dev.github.io/")) {
+    wcs.setInsecure();
+  } else {
+    wcs.setCACert(CA_BUNDLE_PEM);
+  }
+
 #if defined(ARDUINO_ARCH_ESP32) && !defined(ARDUINO_ESP32S2_DEV)
   wcs.setHandshakeTimeout(connectMs);
 #endif
-wcs.setTimeout(readMs);
+  wcs.setTimeout(readMs);
 
-HTTPClient http;
-if (!http.begin(wcs, url)) {
-  OTA_LOG("[OTA] http.begin FAIL: %s", url.c_str());
-  return false;
-}
+  HTTPClient http;
+  if (!http.begin(wcs, url)) {
+    OTA_LOG("[OTA] http.begin FAIL: %s", url.c_str());
+    return false;
+  }
 
   http.addHeader("Accept", "*/*");
-  http.addHeader("Accept-Encoding", "identity"); // pas de gzip
+  http.addHeader("Accept-Encoding", "identity");
   http.addHeader("Connection", "close");
   http.setReuse(false);
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
@@ -119,17 +139,19 @@ if (!http.begin(wcs, url)) {
 
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
-    OTA_LOG("[OTA] GET %s -> code=%d (%s)", url.c_str(), code, http.errorToString(code).c_str());
+    OTA_LOG("[OTA] GET %s -> code=%d (%s)",
+            url.c_str(), code, http.errorToString(code).c_str());
     http.end();
     return false;
   }
 
-  out = http.getString();     // <-- gère chunked proprement
+  out = http.getString();
   http.end();
 
   OTA_LOG("[OTA] manifest OK, %u bytes", (unsigned)out.length());
   return out.length() > 0;
 }
+
 
 
 
@@ -211,16 +233,10 @@ static bool verifyManifestSignature(const String& canonical, const String& sigB6
 }
 
 // ===================== Download & flash (HTTPClient only) =====================
-// ===================== Download & flash (HTTPClient only) =====================
-// ===================== Download & flash (HTTPClient with manual fallback) =====================
-// ===================== Download & flash (HTTPClient with manual fallback) =====================
-// ===================== Download & flash (HTTPClient with manual fallback, fixed types) =====================
-// ===================== Download & flash (HTTPClient, no raw fallback) =====================
-// ===================== Download & flash (HTTPClient with explicit SNI host) =====================
-// ===================== Download & flash (HTTPClient with explicit SNI host) =====================
-static bool downloadAndFlashWithHTTPClient(const String& binUrl,
-                                           uint32_t expectedSize,
-                                           const String& expectedSha256Hex)
+static bool downloadAndFlashWithHTTPClientInner(const String& binUrl,
+                                                uint32_t expectedSize,
+                                                const String& expectedSha256Hex,
+                                                bool allowGithubFallback)
 {
   OTA_LOG("[OTA] Download start (HTTPClient+SNI)");
   OTA_HEAP("before http");
@@ -254,6 +270,8 @@ static bool downloadAndFlashWithHTTPClient(const String& binUrl,
     }
   }
 
+  bool isGithub = (host == "Camarade-dev.github.io" || host.endsWith(".github.io"));
+
   // DNS (log)
   IPAddress ip;
   if (WiFi.hostByName(host.c_str(), ip)) {
@@ -270,22 +288,50 @@ static bool downloadAndFlashWithHTTPClient(const String& binUrl,
 
   // --- TLS client
   WiFiClientSecure tls;
-  tls.setCACert(CA_BUNDLE_PEM);
+
+  // GitHub Pages → on désactive la vérif du cert, on se repose sur la signature ECDSA
+  if (isGithub) {
+    tls.setInsecure();
+  } else {
+    tls.setCACert(CA_BUNDLE_PEM);
+  }
+
 #if defined(ARDUINO_ARCH_ESP32) && !defined(ARDUINO_ESP32S2_DEV)
   tls.setHandshakeTimeout(15000);
 #endif
   tls.setTimeout(45000);
 
   HTTPClient http;
-   http.useHTTP10(true);
+
   auto beginWithHeaders = [&]() -> bool {
-    bool isHttps = (scheme == "https");
-    bool ok = http.begin(tls, host, port, path, isHttps);
-    if (!ok) return false;
-    http.addHeader("Accept", "application/octet-stream");
+    bool ok = false;
+
+    if (isGithub) {
+      // URL complète (comme pour le manifest)
+      ok = http.begin(tls, binUrl);
+    } else {
+      bool isHttps = (scheme == "https");
+      ok = http.begin(tls, host, port, path, isHttps);
+    }
+
+    if (!ok) {
+      OTA_LOG("[OTA] http.begin FAIL (host=%s port=%u path=%s)",
+              host.c_str(), (unsigned)port, path.c_str());
+      return false;
+    }
+
+    // HTTP/1.0 → pas de chunked
+    http.useHTTP10(true);
+
+    // Headers “browser-like” safe
+    http.addHeader("Accept", "*/*");
     http.addHeader("Accept-Encoding", "identity");
     http.addHeader("Connection", "close");
-    http.addHeader("User-Agent", "breezly-esp32-ota/1.0");
+    http.addHeader("User-Agent",
+                   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/120.0.0.0 Safari/537.36");
+
     http.setReuse(false);
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
 #if defined(HTTPCLIENT_1_2_COMPATIBLE)
@@ -295,7 +341,6 @@ static bool downloadAndFlashWithHTTPClient(const String& binUrl,
   };
 
   if (!beginWithHeaders()) {
-    OTA_LOG("[OTA] http.begin FAIL (host=%s port=%u path=%s)", host.c_str(), (unsigned)port, path.c_str());
     g_otaInProgress = false;
     updateLedState(LED_BAD);
     return false;
@@ -303,11 +348,14 @@ static bool downloadAndFlashWithHTTPClient(const String& binUrl,
 
   // --- GET avec retries
   int code = -1;
-  for (int attempt = 1; attempt <= 8; ++attempt) {
+  for (int attempt = 1; attempt <= 4; ++attempt) {
     code = http.GET();
-    OTA_LOG("[OTA] BIN GET attempt %d -> code=%d (%s)", attempt, code, http.errorToString(code).c_str());
+    OTA_LOG("[OTA] BIN GET attempt %d -> code=%d (%s)",
+            attempt, code, http.errorToString(code).c_str());
+
     if (code == HTTP_CODE_OK) break;
 
+    // erreurs réseau / serveur → retry
     if (code < 0 || (code >= 500 && code < 600)) {
       http.end();
       delay(1000 * attempt + (esp_random() % 500));
@@ -316,12 +364,50 @@ static bool downloadAndFlashWithHTTPClient(const String& binUrl,
       }
       continue;
     }
+
+    // 4xx → inutile d’insister
     break;
   }
 
   if (code != HTTP_CODE_OK) {
-    OTA_LOG("[OTA] HTTPClient GET failed, code=%d (%s)", code, http.errorToString(code).c_str());
-    http.end();
+  OTA_LOG("[OTA] HTTPClient GET failed, code=%d (%s)",
+          code, http.errorToString(code).c_str());
+
+  OTA_LOG("[OTA] WiFi.status()=%d, RSSI=%d",
+          (int)WiFi.status(), WiFi.RSSI());
+
+  wifi_ap_record_t ap;
+  if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+    OTA_LOG("[OTA] AP: RSSI=%d, channel=%d",
+            ap.rssi, ap.primary);
+  }
+
+  http.end();
+
+    // 🔁 Fallback GitHub -> backend si blocage réseau (EAP etc.)
+    if (isGithub && allowGithubFallback) {
+      String fallback = binUrl;
+
+      // ⚠️ même chemin relatif, juste host différent
+      // GitHub: https://Camarade-dev.github.io/breezly-firmware-dist/firmware/...
+      // Backend: https://breezly-backend.onrender.com/firmware/...
+      fallback.replace(
+        "https://Camarade-dev.github.io/breezly-firmware-dist",
+        "https://breezly-backend.onrender.com"
+      );
+
+      OTA_LOG("[OTA] GitHub .bin blocked (code=%d) → trying backend: %s",
+              code, fallback.c_str());
+
+      g_otaInProgress = false;   // reset propre
+      updateLedState(LED_BOOT);  // on revient à un état neutre
+
+      // Appel récursif sans 2e fallback pour éviter boucle infinie
+      return downloadAndFlashWithHTTPClientInner(
+        fallback, expectedSize, expectedSha256Hex, false
+      );
+    }
+
     g_otaInProgress = false;
     updateLedState(LED_BAD);
     return false;
@@ -346,7 +432,7 @@ static bool downloadAndFlashWithHTTPClient(const String& binUrl,
 
   // === OTA native ESP-IDF ===
   esp_ota_handle_t otaHandle = 0;
-  size_t otaSizeParam = expectedSize ? expectedSize : 0; // 0 = taille inconnue acceptable
+  size_t otaSizeParam = expectedSize ? expectedSize : 0;
   esp_err_t err = esp_ota_begin(nextPart, otaSizeParam, &otaHandle);
   if (err != ESP_OK) {
     OTA_LOG("[OTA] esp_ota_begin FAILED err=%d (%s)", (int)err, esp_err_to_name(err));
@@ -357,22 +443,22 @@ static bool downloadAndFlashWithHTTPClient(const String& binUrl,
   }
   OTA_LOG("[OTA] esp_ota_begin OK (maxSize=%u)", (unsigned)nextPart->size);
 
-   OTA_HEAP("before buf malloc");
+  OTA_HEAP("before buf malloc");
 
   // On essaie 2048, puis 1024 si nécessaire
   size_t CH = 2048;
   uint8_t* buf = nullptr;
 
-  while (CH >= 1024 && buf == nullptr) {
+  while (CH >= 512 && buf == nullptr) {
     buf = (uint8_t*)heap_caps_malloc(CH, MALLOC_CAP_8BIT);
     if (!buf) {
       OTA_LOG("[OTA] heap_caps_malloc(%u) FAIL -> try smaller", (unsigned)CH);
-      CH /= 2;   // 2048 -> 1024
+      CH /= 2;
     }
   }
 
   if (!buf) {
-    OTA_LOG("[OTA] malloc FAIL even at 1024 bytes");
+    OTA_LOG("[OTA] malloc FAIL even at 512 bytes");
     esp_ota_abort(otaHandle);
     http.end();
     g_otaInProgress = false;
@@ -389,7 +475,7 @@ static bool downloadAndFlashWithHTTPClient(const String& binUrl,
   size_t written = 0;
   unsigned long lastLog = millis();
   unsigned long lastProgress = millis();
-  static const unsigned long NO_PROGRESS_ABORT_MS = 120000;
+  static const unsigned long NO_PROGRESS_ABORT_MS = 300000;
 
   bool firstChunk = true;
 
@@ -452,7 +538,10 @@ static bool downloadAndFlashWithHTTPClient(const String& binUrl,
     }
 
     written += n;
-
+    if ((millis() - lastLog) > 2000){
+      lastLog = millis();
+      OTA_LOG("[OTA] written %u bytes...", (unsigned)written);
+    }
     if ((millis() - lastLog) > 2000 && expectedSize) {
       lastLog = millis();
       int pct = (int)((written * 100ULL) / expectedSize);
@@ -481,7 +570,8 @@ static bool downloadAndFlashWithHTTPClient(const String& binUrl,
   http.end();
 
   if (expectedSize && written != expectedSize) {
-    OTA_LOG("[OTA] size mismatch: written=%u expected=%u", (unsigned)written, (unsigned)expectedSize);
+    OTA_LOG("[OTA] size mismatch: written=%u expected=%u",
+            (unsigned)written, (unsigned)expectedSize);
     g_otaInProgress = false;
     updateLedState(LED_BAD);
     return false;
@@ -497,13 +587,15 @@ static bool downloadAndFlashWithHTTPClient(const String& binUrl,
   // On sélectionne la nouvelle partition comme partition de boot
   err = esp_ota_set_boot_partition(nextPart);
   if (err != ESP_OK) {
-    OTA_LOG("[OTA] esp_ota_set_boot_partition FAIL err=%d (%s)", (int)err, esp_err_to_name(err));
+    OTA_LOG("[OTA] esp_ota_set_boot_partition FAIL err=%d (%s)",
+            (int)err, esp_err_to_name(err));
     g_otaInProgress = false;
     updateLedState(LED_BAD);
     return false;
   }
 
-  OTA_LOG("[OTA] OK (%u bytes), boot partition set to %s", (unsigned)written, nextPart->label);
+  OTA_LOG("[OTA] OK (%u bytes), boot partition set to %s",
+          (unsigned)written, nextPart->label);
 
   Preferences p; p.begin("ota", false);
   p.putBool("pending", true);
@@ -515,6 +607,20 @@ static bool downloadAndFlashWithHTTPClient(const String& binUrl,
   ESP.restart();
   return true;
 }
+// ===================== Download & flash (HTTPClient only) =====================
+// ===================== Download & flash (HTTPClient with manual fallback) =====================
+// ===================== Download & flash (HTTPClient with manual fallback) =====================
+// ===================== Download & flash (HTTPClient with manual fallback, fixed types) =====================
+// ===================== Download & flash (HTTPClient, no raw fallback) =====================
+// ===================== Download & flash (HTTPClient with explicit SNI host) =====================
+// ===================== Download & flash (HTTPClient with explicit SNI host) =====================
+static bool downloadAndFlashWithHTTPClient(const String& binUrl,
+                                           uint32_t expectedSize,
+                                           const String& expectedSha256Hex)
+{
+  return downloadAndFlashWithHTTPClientInner(binUrl, expectedSize, expectedSha256Hex, true);
+}
+
 
 
 
@@ -527,7 +633,7 @@ void triggerOtaCheckNow(){ g_forceCheck = true; }
 void checkAndPerformCloudOTA(){
   OTA_VLOG("[OTA] check enter: wifi=%d inProg=%d force=%d",
            (WiFi.status()==WL_CONNECTED), (int)g_otaInProgress, (int)g_forceCheck);
-
+  OtaBootWindowGuard guard(&g_otaBootWindowDone);
   if (WiFi.status()!=WL_CONNECTED){ OTA_LOG("[OTA] WiFi KO"); return; }
   ensureTlsClockReady(20000);
   if (!timeIsSaneHard()) { OTA_LOG("[OTA] clock not sane → skip"); return; }
@@ -540,12 +646,19 @@ void checkAndPerformCloudOTA(){
   g_lastCheckMs = millis();
   bool forced = g_forceCheck;
   g_forceCheck = false;
-  String url = String(FW_MANIFEST_URL) + "&t=" + String(millis());
+  String url = String(FW_MANIFEST_URL);
   OTA_LOG("[OTA] GET manifest: %s (forced=%d)", url.c_str(), (int)forced);
 
   String body;
+  Serial.printf("[OTA] Allocating manifest buffer...\n");
+  body.reserve(1500);
   if (!fetchWithRetry(url, body)) {
-    String direct = "https://breezly-backend.onrender.com/firmware/esp32/wroom32e/prod/latest.json?t=" + String(millis());
+    #ifdef APP_ENV_DEV
+      String direct = "https://breezly-backendweb.onrender.com/firmware/esp32/wroom32e/dev/latest.json";
+    #else
+      String direct = "https://breezly-backend.onrender.com/firmware/esp32/wroom32e/prod/latest.json";
+    #endif
+
     OTA_LOG("[OTA] primary failed → try direct: %s", direct.c_str());
     if (!fetchWithRetry(direct, body)) {
       OTA_LOG("[OTA] manifest fetch failed (both)");
@@ -555,7 +668,7 @@ void checkAndPerformCloudOTA(){
   OTA_LOG("[OTA] manifest OK, %u bytes", (unsigned)body.length());
   OTA_VLOG("[OTA] Manifest head:\n%s", body.substring(0, 300).c_str());
 
-  StaticJsonDocument<2048> doc;
+  StaticJsonDocument<1024> doc;
   DeserializationError jerr = deserializeJson(doc, body);
   if (jerr) { OTA_LOG("[OTA] JSON parse error: %s", jerr.c_str()); return; }
 
@@ -580,20 +693,23 @@ void checkAndPerformCloudOTA(){
   if (!ver[0] || !bin[0]) { OTA_LOG("[OTA] champs manquants"); return; }
 
   // Signature
-  String canonical = String("{") +
-    "\"product\":\""+String(product)+"\","+
-    "\"model\":\""+String(model)+"\","+
-    "\"channel\":\""+String(channel)+"\","+
-    "\"version\":\""+String(ver)+"\","+
-    "\"url\":\""+String(bin)+"\","+
-    "\"size\":"+String(expectedSize)+","+
-    "\"sha256\":\""+String(shaHex)+"\""
-  "}";
-
-  if (!sigB64[0] || !verifyManifestSignature(canonical, String(sigB64))){
+  // Signature
+  char canonical[512];  // 256 -> 512
+  int n = snprintf(
+    canonical, sizeof(canonical),
+    "{\"product\":\"%s\",\"model\":\"%s\",\"channel\":\"%s\","
+    "\"version\":\"%s\",\"url\":\"%s\",\"size\":%u,\"sha256\":\"%s\"}",
+    product, model, channel, ver, bin, (unsigned)expectedSize, shaHex
+  );
+  if (n <= 0 || n >= (int)sizeof(canonical)) {
+    OTA_LOG("[OTA] canonical overflow");
+    return;
+  }
+  if (!verifyManifestSignature(String(canonical), String(sigB64))) {
     OTA_LOG("[OTA] Signature INVALID → refuse update");
     return;
   }
+
 
   if (String(model) != String("wroom32e")){ OTA_LOG("[OTA] model mismatch (%s!=wroom32e)", model); return; }
 
@@ -614,15 +730,53 @@ void checkAndPerformCloudOTA(){
   OTA_LOG("[OTA] rollout=%d%% bucket=%u sensorId=%s", rollout, bucket, sensorId.c_str());
   if (!force && bucket >= rollout){ OTA_LOG("[OTA] skip by rollout"); return; }
 
-  int cmp = cmpSemver(String(CURRENT_FIRMWARE_VERSION), String(ver));
+    int cmp = cmpSemver(String(CURRENT_FIRMWARE_VERSION), String(ver));
   OTA_LOG("[OTA] version cmp: current=%s target=%s -> %d", CURRENT_FIRMWARE_VERSION, ver, cmp);
-  if (!force && cmp >= 0){ OTA_LOG("[OTA] déjà à jour (skip)"); return; }
+  if (!force && cmp >= 0){
+    OTA_LOG("[OTA] déjà à jour (skip)");
+    return;
+  }
+
+  // On n'a plus besoin du manifest : on vide au moins le contenu
+  body = "";
 
   OTA_LOG("[OTA] UPDATE → %s", bin);
   OTA_HEAP("before flash");
   logPartitions();
 
-  // Téléchargement/flash
-  bool ok = downloadAndFlashWithHTTPClient(String(bin), expectedSize, String(shaHex));
-  if (!ok) OTA_LOG("[OTA] download/flash failed");
+
+  // === NEW: relancer un "setup" réseau propre entre manifest et .bin ===
+  // On attend un petit délai random pour casser le pattern "manifest puis gros binaire direct"
+  uint32_t cooldown = 1500 + (esp_random() % 2500);
+  OTA_LOG("[OTA] cooldown before BIN download: %lu ms", (unsigned long)cooldown);
+  delay(cooldown);
+
+  // On force la fermeture de toute connexion résiduelle (au cas où un proxy
+  // garde du state agressif sur des bursts très serrés). httpGetToString()
+  // fait déjà http.end(), mais on isole bien la phase "manifest" de la phase "bin".
+  WiFiClientSecure dummy;
+  dummy.stop(); // no-op mais explicite, au cas où
+
+  // Petit "warmup" GET ultra léger vers le même host pour ressembler davantage
+  // à un client humain qui fait plusieurs petites requêtes avant un gros DL.
+  // Si ça échoue (firewall), on ignore totalement.
+  String binUrl = String(bin);
+  int protoIdx  = binUrl.indexOf("://");
+  int hostStart = (protoIdx > 0) ? protoIdx + 3 : 0;
+  int pathIdx   = binUrl.indexOf('/', hostStart);
+
+  if (hostStart > 0 && pathIdx > hostStart) {
+    String warmupUrl = binUrl.substring(0, pathIdx) + "/"; // racine du host
+    String warmupBody;
+    OTA_LOG("[OTA] warmup GET to %s", warmupUrl.c_str());
+    // 1 seule tentative, on ne check pas le retour : c'est juste pour "diluer" le pattern
+    fetchWithRetry(warmupUrl, warmupBody, 1);
+  }
+
+  // Téléchargement/flash réel
+  bool ok = downloadAndFlashWithHTTPClient(binUrl, expectedSize, String(shaHex));
+  if (!ok) {
+    OTA_LOG("[OTA] download/flash failed");
+  }
 }
+

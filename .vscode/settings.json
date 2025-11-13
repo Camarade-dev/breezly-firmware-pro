@@ -3,6 +3,8 @@
     "C_Cpp.errorSquiggles": "disabled",
     "files.associations": {
         "string": "cpp",
-        "cmath": "cpp"
+        "cmath": "cpp",
+        "deque": "cpp",
+        "vector": "cpp"
     }
 }

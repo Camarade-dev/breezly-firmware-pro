@@ -17,7 +17,7 @@
 #include "../ca_bundle.h"
 
 #include "../app_config.h"  
-static const char* MQTT_PREFIX = "prod/";
+static const char* MQTT_PREFIX = "dev/";
 // ======= PARAMS BROKER (reprends les tiens) =======
 static const char* MQTT_HOST = "607207c4394d44b8bad11a33e8ed591d.s1.eu.hivemq.cloud";
 static const int   MQTT_PORT = 8883;
@@ -407,13 +407,6 @@ static bool mqtt_do_connect() {
   if (!wifiConnected || !timeIsSane()) return false;
   if (g_netBusyForOta || otaIsInProgress()) return false;
   s_tls.setCACert(CA_BUNDLE_PEM);
-  s_tls.setTimeout(10000);
-
-  s_mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  s_mqtt.setBufferSize(2048);
-  s_mqtt.setKeepAlive(30);
-  s_mqtt.setSocketTimeout(10);
-  s_mqtt.setCallback(onMqttMessage);
 
   s_tls.setTimeout(10000);
 
@@ -430,8 +423,12 @@ static bool mqtt_do_connect() {
   lw["ts"]=(uint64_t)(time(nullptr)*1000ULL);
   static String lwtPayload; lwtPayload.clear(); serializeJson(lw, lwtPayload);
 
-  String clientId = "breezly_" + sensorId;
-bool ok = s_mqtt.connect(
+  String envSuffix = String(MQTT_PREFIX).startsWith("prod/") ? "prod" : "dev";
+  String clientId = "breezly-sensor-" + envSuffix + "-" + sensorId;
+
+  Serial.printf("[MQTT] trying clientId=%s host=%s port=%d\n",
+                clientId.c_str(), MQTT_HOST, MQTT_PORT);
+  bool ok = s_mqtt.connect(
     clientId.c_str(),
     MQTT_USER, MQTT_PASS,
     mqtt_topic_status().c_str(),

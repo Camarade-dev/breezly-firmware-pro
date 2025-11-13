@@ -39,11 +39,15 @@ def read_mac(port):
         return None
 
 # IMPORTANT: parameter must be named 'env'
+# IMPORTANT: parameter must be named 'env'
 def after_upload(target, source, env):
     print("[post-upload] hook loaded")
 
-    # read from PlatformIO options first, then env vars
-    api_url = env.GetProjectOption("custom_api_url") or os.environ.get("API_URL", "https://breezly-backend.onrender.com")
+    # lit d'abord l’option PlatformIO, sinon API_URL, sinon défaut DEV
+    api_url = (
+        env.GetProjectOption("custom_api_url")
+        or os.environ.get("API_URL", "https://breezly-backendweb.onrender.com")
+    )
     factory = env.GetProjectOption("custom_factory_token") or os.environ.get("FACTORY_TOKEN", "")
     devkey  = env.GetProjectOption("custom_device_key_b64") or os.environ.get("DEVICE_KEY_B64", "")
 
@@ -65,7 +69,6 @@ def after_upload(target, source, env):
         "location": "Bureau"
     }
 
-    # minimal HTTP POST using stdlib
     cmd = [
         sys.executable, "-c",
         (
@@ -81,5 +84,6 @@ def after_upload(target, source, env):
     env_env["API_URL"] = api_url
     env_env["FACTORY_TOKEN"] = factory
     subprocess.check_call(cmd, env=env_env)
+
 
 env.AddPostAction("upload", after_upload)
