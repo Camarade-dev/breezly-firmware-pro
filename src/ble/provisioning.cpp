@@ -16,6 +16,7 @@ static NimBLEUUID statusCharacteristicUUID      ("11f47ab2-1111-4002-b316-f219e1
 static NimBLECharacteristic* credentialsCharacteristic = nullptr;
 static NimBLECharacteristic* statusCharacteristic      = nullptr;
 static NimBLEServer*         pServer                   = nullptr;
+static bool s_provisioningDone = false;
 
 static String gBleName;
 static bool s_bleInitDone = false;
@@ -169,7 +170,18 @@ void breezly_on_wifi_assoc_timeout() { provisioningSetStatus("{\"status\":\"wifi
 void breezly_on_inet_ok()            { provisioningSetStatus("{\"status\":\"inet_ok\"}"); }
 void breezly_on_mqtt_hello_ok()      { provisioningSetStatus("{\"status\":\"hello_ok\"}"); }
 void breezly_on_registered()         { provisioningSetStatus("{\"status\":\"registered\"}"); }
-void breezly_on_connected_final()    { provisioningSetStatus("{\"status\":\"connected\"}"); }
+void breezly_on_connected_final() {
+  provisioningSetStatus("{\"status\":\"connected\"}");
+  wd_enable(false);
+  s_provisioningDone = true;
+
+  Serial.println("[WD] provisioning complete -> WD disabled (prod mode)");
+
+  // Optionnel : couper aussi directement la pub BLE ici
+  NimBLEDevice::getAdvertising()->stop();
+  s_advertising = false;
+}
+
 
 static void credWorker(void*){
   for(;;){
@@ -389,8 +401,16 @@ public:
     provisioningSetStatus("{\"status\":\"idle\"}");
     g_acc = "";
     wd_enable(false);
-    restartBLEAdvertising();
+
+    if (!s_provisioningDone) {
+      // En mode provisioning → prêt pour un nouvel essai
+      restartBLEAdvertising();
+    } else {
+      // En mode prod → on ne relance PAS l'advertising
+      Serial.println("[BLE] disconnect after provisioning -> keep BLE OFF");
+    }
   }
+
 };
 
 class CredentialsCallback : public NimBLECharacteristicCallbacks {
@@ -551,6 +571,12 @@ void setupBLE(bool startAdvertising){
 
 void restartBLEAdvertising(){
   if (!s_bleInitDone) return;
+
+  if (s_provisioningDone) {
+    Serial.println("[BLE] restart requested but provisioningDone=1 -> ignoring");
+    return;
+  }
+
   NimBLEAdvertising* a = NimBLEDevice::getAdvertising();
   if (!a) return;
 

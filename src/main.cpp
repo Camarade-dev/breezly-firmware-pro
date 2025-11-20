@@ -20,6 +20,7 @@
 #include "sensors/calibration.h"
 static bool s_twdtReady = false;
 static bool s_mqttStarted = false;   // NEW : MQTT pas encore démarré
+static bool s_firstPublishDone = false;
 // Indique que la fenêtre OTA de boot est terminée (succès, échec ou skip)
 volatile bool g_otaBootWindowDone = false;
 
@@ -271,9 +272,25 @@ void loop(){
     const unsigned long ENS_PERIOD = ENS_READ_PERIOD_MS_DAY;
     const unsigned long PMS_PERIOD = PMS_SAMPLE_PERIOD_MS_DAY;
     unsigned long nowMs = millis();
-    
-    bool doEns = (long)(nowMs - lastEns) >= (long)ENS_PERIOD;
-    bool doPms = (long)(nowMs - lastPms) >= (long)PMS_PERIOD;
+
+    bool doEns = false;
+    bool doPms = false;
+
+    // 🔹 1) Première mesure "instantanée" pour l'UX
+    if (!s_firstPublishDone) {
+      doEns = true;          // on envoie ENS tout de suite
+      // doPms = true;       // → à activer si tu veux aussi forcer un PMS direct (je ne le recommande pas forcément)
+      s_firstPublishDone = true;
+
+      // On reset les fenêtres de période à partir de maintenant
+      lastEns = nowMs;
+      // lastPms = nowMs;    // seulement si tu forces aussi doPms ci-dessus
+    }
+    // 🔹 2) Ensuite, comportement normal périodique
+    else {
+      doEns = (long)(nowMs - lastEns) >= (long)ENS_PERIOD;
+      doPms = (long)(nowMs - lastPms) >= (long)PMS_PERIOD;
+    }
 
     float t,h; int aqi=0,tvoc=0,eco2=0;
     PmsData p = {}; bool havePms = false;
@@ -283,13 +300,11 @@ void loop(){
         sensorsReadEns160(aqi,tvoc,eco2,t,h);
         lastEns = nowMs;
       } else {
-        // lecture AHT/ENS KO : on retentera au prochain tick
-        doEns = false;
+        doEns = false; // on annule si la lecture a foiré
       }
     }
 
     if (doPms){
-      // échantillon ponctuel bloquant : wake -> warmup -> read -> sleep
       havePms = pmsSampleBlocking(PMS_WARMUP_MS, p);
       lastPms = nowMs;
     }
@@ -343,12 +358,11 @@ void loop(){
       }
 
       j["sensorId"]=sensorId; j["userId"]=userId;
-
       String s; serializeJson(j,s);
       mqtt_enqueue("capteurs/qualite_air", s, 0, false);
       Serial.println(s);
       mqtt_flush(200);
-
+      ledNotifyPublish();
 
       // Fenêtre interactive courte après publish
       enterModemSleep(true);
