@@ -123,8 +123,8 @@ static void gracefulUnpairAndReboot(const char* reason){
 bool mqtt_is_connected() { return s_connected; }
 
 bool mqtt_enqueue(const String& t, const String& p, uint8_t qos, bool retain) {
+  
   if (!s_queue) return false;
-
   // 🧩 Applique le préfixe MQTT (ex: "dev/") uniquement si le topic n'en a pas déjà un
   String topicFull;
   if (t.startsWith("breezly/") || t.startsWith("dev/") || t.startsWith("prod/")) {
@@ -132,7 +132,6 @@ bool mqtt_enqueue(const String& t, const String& p, uint8_t qos, bool retain) {
   } else {
     topicFull = String(MQTT_PREFIX) + t;
   }
-
   PubMsg m{
     strdup(topicFull.c_str()),
     strdup(p.c_str()),
@@ -470,8 +469,10 @@ static bool mqtt_do_connect() {
     s_mqtt.publish(helloTopic.c_str(), hs.c_str(), true);
 
     s_hello_ok = true;
+
     breezly_on_mqtt_hello_ok();
     maybe_fire_connected_final();
+
   }
 
   // 2) S’abonner au topic status pour capter “registered”
@@ -485,7 +486,7 @@ static void mqttTask(void*) {
   s_queue = xQueueCreate(24, sizeof(PubMsg));
   s_ev    = xEventGroupCreate();
   s_ready = true;
-
+    Serial.println("[MQTT] mqtttask " + String(millis()));
   for (;;) {
     if (g_netBusyForOta || otaIsInProgress()) {
       if (s_connected) { s_mqtt.disconnect(); s_connected = false; }
@@ -502,14 +503,12 @@ static void mqttTask(void*) {
       }
       if (shouldTry) {
         s_lastConnAttemptMs = millis();
-
         // <<<< AJOUT
         ensureTlsClockReady(20000);
         time_t now = time(nullptr);
         Serial.printf("[MQTT] pre-connect, unix=%ld sane=%d\n", (long)now, (int)timeIsSaneHard());
         if (!timeIsSaneHard()) { vTaskDelay(250/portTICK_PERIOD_MS); continue; }
         // >>>>
-
         if (mqtt_do_connect()) s_connected = true;
       }
       vTaskDelay(50 / portTICK_PERIOD_MS);
