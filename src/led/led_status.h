@@ -10,3 +10,4 @@ void ledSuspend();   // coupe l’anim/show RMT pendant l’OTA
 void ledResume();    // relance après OTA
 bool ledIsMuted();   // (optionnel)
 void ledNotifyPublish();
+void ledSetAirQualityScore(float score01);

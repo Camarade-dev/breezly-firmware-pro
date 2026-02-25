@@ -62,7 +62,7 @@ def after_upload(target, source, env):
     external_id = f"PROV_{reverse_pairs(mac)}"
 
     payload = {
-        "external_Id": external_id,
+        "external_id": external_id,
         "deviceKeyB64": devkey,
         "name": external_id,
         "type": "temperature",

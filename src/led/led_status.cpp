@@ -8,7 +8,7 @@ static volatile bool s_ledMuted = false;
 
 // --- PULSE sur publish capteurs ---
 static volatile bool s_pulseRequested = false;
-
+static volatile float s_airScore01 = 0.0f;
 // 0.0 → 1.0 sur la durée d’une impulsion
 static float s_pulseT = 1.0f;          
 static const uint32_t PULSE_DURATION_MS = 1800;  // durée totale de la pulsation
@@ -83,6 +83,16 @@ static uint8_t applyGamma(uint8_t v){
   if (out > 255) out = 255;
   return (uint8_t)out;
 }
+void ledSetAirQualityScore(float score01){
+  if (score01 < 0.0f) score01 = 0.0f;
+  if (score01 > 1.0f) score01 = 1.0f;
+  s_airScore01 = score01;
+
+  // On réutilise LED_GOOD comme "mode affichage qualité air"
+  if (!ledOverride) {
+    currentLedMode = LED_GOOD;
+  }
+}
 
 // HSV → RGB (h,s,v ∈ [0,1])
 static void hsvToRgb(float h, float s, float v, uint8_t &r, uint8_t &g, uint8_t &b){
@@ -122,14 +132,40 @@ static void baseColorForMode(LedMode mode, uint8_t &r, uint8_t &g, uint8_t &b){
   switch (mode){
     case LED_BOOT:      // bleu doux
       r = 10;  g = 40;  b = 120;  break;
-    case LED_PAIRING:   // on override plus bas avec un gradient dynamique
+
+    case LED_PAIRING:   // sera overridé plus bas par le gradient BLE
       r = 10;  g = 60;  b = 180;  break;
-    case LED_GOOD:      // vert premium (pas trop agressif)
-      r = 0;   g = 200; b = 80;   break;
-    case LED_MODERATE:  // jaune/ambré
+
+    case LED_GOOD: {
+      // Ici : "GOOD" = affichage continu de la qualité d’air
+      float s = s_airScore01;                // 0 = vert, 1 = rouge
+      if (s < 0.0f) s = 0.0f;
+      if (s > 1.0f) s = 1.0f;
+
+      // Dégradé vert (#00C850) → jaune (#FFD000) → rouge (#E62828)
+      // On le fait en HSV: vert ≈ 0.33, jaune ≈ 0.16, rouge ≈ 0.0
+      float h;
+      if (s < 0.5f) {
+        // 0.0 → 0.5 : vert → jaune
+        float t = s / 0.5f;          // 0 → 1
+        h = 0.33f + (0.16f - 0.33f) * t;
+      } else {
+        // 0.5 → 1.0 : jaune → rouge
+        float t = (s - 0.5f) / 0.5f; // 0 → 1
+        h = 0.16f + (0.00f - 0.16f) * t;
+      }
+      float sat = 0.95f;
+      float val = 1.00f;
+      hsvToRgb(h, sat, val, r, g, b);
+      break;
+    }
+
+    case LED_MODERATE:  // si tu l’utilises encore ailleurs : ambré
       r = 220; g = 140; b = 20;   break;
-    case LED_BAD:       // rouge plus classe, pas 255 pur
+
+    case LED_BAD:       // rouge "classe"
       r = 230; g = 40;  b = 40;   break;
+
     case LED_UPDATING:  // cyan
       r = 0;   g = 180; b = 200;  break;
     case LED_OFF:
@@ -137,6 +173,7 @@ static void baseColorForMode(LedMode mode, uint8_t &r, uint8_t &g, uint8_t &b){
       r = 0;   g = 0;   b = 0;    break;
   }
 }
+
 
 // ------------------------------------------------------------------
 // Tâche LED : boucle d’animation
@@ -191,21 +228,29 @@ static void ledTask(void *){
     }
 
     // === A) Intensité "respiration" de base ========================
+    // === A) Intensité "respiration" de base ========================
     float baseFactor = 1.0f;
 
     if (mode == LED_GOOD || mode == LED_MODERATE || mode == LED_BAD){
-      // respiration très discrète : ~0.55 → 0.65
-      baseFactor = 0.55f + 0.10f * (0.5f * (1.0f - cosf(s_idlePhase)));
+      // AVANT : ~0.55 → 0.65 (assez lumineux)
+      // MAINTENANT : ~0.25 → 0.40 (beaucoup plus soft)
+      baseFactor = 0.25f + 0.15f * (0.5f * (1.0f - cosf(s_idlePhase)));
+      // min ≈ 0.25  /  max ≈ 0.40
     } else if (mode == LED_UPDATING){
-      baseFactor = 0.70f + 0.20f * (0.5f * (1.0f - cosf(s_idlePhase)));
+      // Avant plus fort, ici on le rend aussi plus discret
+      baseFactor = 0.30f + 0.20f * (0.5f * (1.0f - cosf(s_idlePhase)));
+      // ~0.30 → 0.50
     } else if (mode == LED_PAIRING){
-      // pairing un peu plus “vivant”, mais toujours soft
-      baseFactor = 0.60f + 0.18f * (0.5f * (1.0f - cosf(s_idlePhase)));
+      // Pairing un peu vivant mais quand même calmé
+      baseFactor = 0.30f + 0.18f * (0.5f * (1.0f - cosf(s_idlePhase)));
+      // ~0.30 → 0.48
     } else if (mode == LED_BOOT){
-      baseFactor = 0.7f;
+      // Boot fixe mais plus doux
+      baseFactor = 0.30f;
     } else { // LED_OFF ou autres
       baseFactor = 0.0f;
     }
+
 
     // Petit jitter très léger pour BAD
     if (mode == LED_BAD && baseFactor > 0.0f){

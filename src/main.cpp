@@ -18,6 +18,10 @@
 #include "core/devkey_runtime.h"
 #include "power/cpu_pm.h"
 #include "sensors/calibration.h"
+#ifndef FLASH_BUILD_SIG
+#define FLASH_BUILD_SIG "nosig"
+#endif
+
 static bool s_twdtReady = false;
 static bool s_mqttStarted = false;   // NEW : MQTT pas encore démarré
 static bool s_firstPublishDone = false;
@@ -85,11 +89,164 @@ static const uint8_t WIFI_FAILS_BEFORE_PROV = 1;          // dès le 1er échec,
 
 // --- Trampo pour init BLE sur core 0 ---
 static bool s_bleStartAdv = false;
-// ble/provisioning.cpp ou core/globals.cpp (où tu lis tes prefs)
+// Score continu de qualité d’air : 0 = très bon, 1 = très mauvais
+// Score continu de qualité d’air : 0 = très bon, 1 = très mauvais
+
+// Score continu de qualité d’air : 0 = très bon, 1 = très mauvais
+
+static float clamp01(float v){
+  if (v < 0.0f) return 0.0f;
+  if (v > 1.0f) return 1.0f;
+  return v;
+}
+
+// 0 = air top, 1 = air vraiment mauvais
+// Couleur pilotée par le PIRE indicateur, mais avec seuils "soft"
+// et courbe adoucie pour éviter de stresser l’utilisateur.
+static float computeAirQualityScore(float tempC,
+                                    float humidity,
+                                    int   aqi,
+                                    int   tvoc,
+                                    int   eco2,
+                                    float pm25_ux)
+{
+  // 1) Humidité : confort élargi 35–65%, 20–80 = extrêmes
+  float humScore = 0.0f;
+  if (humidity < 35.0f) {
+    humScore = (35.0f - humidity) / (35.0f - 20.0f);   // 35 → 0, 20 → 1
+  } else if (humidity > 65.0f) {
+    humScore = (humidity - 65.0f) / (80.0f - 65.0f);   // 65 → 0, 80 → 1
+  }
+  humScore = clamp01(humScore);
+
+  // 2) Température : 20–24°C idéal, 18–26 ok
+  float tempScore = 0.0f;
+  if (tempC < 20.0f) {
+    tempScore = (20.0f - tempC) / 4.0f;        // 20 → 0, 16 → 1
+  } else if (tempC > 24.0f) {
+    tempScore = (tempC - 24.0f) / 4.0f;        // 24 → 0, 28 → 1
+  }
+  tempScore = clamp01(tempScore);
+
+  // 3) AQI ENS160 (1–5) : mapping "soft"
+  // 1 = excellent, 2 = bon, 3 = moyen, 4 = mauvais, 5 = très mauvais
+  float aqiScore = 0.0f;
+  switch (aqi) {
+    case 1: aqiScore = 0.00f; break;  // excellent
+    case 2: aqiScore = 0.10f; break;  // bon
+    case 3: aqiScore = 0.25f; break;  // moyen léger
+    case 4: aqiScore = 0.60f; break;  // mauvais
+    case 5: aqiScore = 1.00f; break;  // très mauvais
+    default:
+      if (aqi <= 1)      aqiScore = 0.0f;
+      else if (aqi >= 5) aqiScore = 1.0f;
+      else               aqiScore = (float)(aqi - 1) / 4.0f;
+      break;
+  }
+  aqiScore = clamp01(aqiScore);
+
+  // 4) TVOC (ppb) – un peu plus tolérant
+  //   ≤ 300 : neutre
+  //   300–2000 : monte doucement
+  //   ≥ 2000 : rouge
+  float tvocScore = 0.0f;
+  if (tvoc <= 300)          tvocScore = 0.0f;
+  else if (tvoc >= 2000)    tvocScore = 1.0f;
+  else                      tvocScore = (float)(tvoc - 300) / (2000.0f - 300.0f);
+  tvocScore = clamp01(tvocScore);
+
+  // 5) eCO2 (ppm)
+  //   ≤ 900 : neutre
+  //   900–2000 : monte
+  //   ≥ 2000 : rouge
+  float eco2Score = 0.0f;
+  if (eco2 <= 900)          eco2Score = 0.0f;
+  else if (eco2 >= 2000)    eco2Score = 1.0f;
+  else                      eco2Score = (float)(eco2 - 900) / (2000.0f - 900.0f);
+  eco2Score = clamp01(eco2Score);
+
+  // 6) PM2.5 UX (µg/m³) (fusionné / lissé)
+  //   0–10 : très bon
+  //   10–20 : moyen
+  //   20–35 : mauvais
+  //   >35 : très mauvais
+  float pm25Score = 0.0f;
+  if (pm25_ux > 0.0f) {   // si pas dispo → 0 (ne pénalise pas)
+    if (pm25_ux <= 10.0f)       pm25Score = 0.0f;
+    else if (pm25_ux >= 35.0f)  pm25Score = 1.0f;
+    else                        pm25Score = (pm25_ux - 10.0f) / (35.0f - 10.0f);
+  }
+  pm25Score = clamp01(pm25Score);
+
+  // 7) PIRE indicateur
+  float worst = humScore;
+  if (tempScore > worst)  worst = tempScore;
+  if (aqiScore  > worst)  worst = aqiScore;
+  if (tvocScore > worst)  worst = tvocScore;
+  if (eco2Score > worst)  worst = eco2Score;
+  if (pm25Score > worst)  worst = pm25Score;
+
+  // 8) Adoucir visuellement les états moyens :
+  //    - 0 ou proche → reste très vert
+  //    - valeurs moyennes tirent un peu vers le bas
+  //    - les états vraiment mauvais restent bien rouges
+  float softened = powf(worst, 1.4f);   // gamma doux > 1
+
+  return clamp01(softened);
+}
+
+static void resetWifiOnEveryFlash() {
+  Preferences boot;
+  if (!boot.begin("boot", false)) return;
+
+  String last = boot.getString("last_sig", "");
+  String now  = String(FLASH_BUILD_SIG);
+
+  if (last == now) {
+    boot.end();
+    return; // ✅ même firmware => pas de reset
+  }
+
+  Serial.printf("[RESET] New flash detected. last=%s now=%s\n",
+                last.c_str(), now.c_str());
+
+  // IMPORTANT: écrire la signature AVANT de faire des trucs destructifs,
+  // sinon tu peux boucler si reboot/power loss pendant le reset
+  boot.putString("last_sig", now);
+  boot.end();
+
+  // --- reset Wi-Fi ESP32 (ce que tu veux vraiment) ---
+  WiFi.disconnect(true, true);
+  delay(50);
+  esp_wifi_restore();
+    Preferences p;
+if (p.begin("myApp", false)) {
+  p.putUInt("wifiAuthType", (uint32_t)WIFI_CONN_PSK);
+  p.putString("wifiSSID", "");
+  p.putString("wifiPassword", "");
+  p.putString("eapUsername", "");
+  p.putString("eapPassword", "");
+  p.putString("eapIdentity", "");
+  p.putString("eapAnon", "");
+  p.end();
+}
+
+  // (optionnel) si tu veux aussi vider TES prefs applicatives :
+  // Preferences p;
+  // if (p.begin("myApp", false)) { p.clear(); p.end(); }
+
+  delay(100);
+  ESP.restart(); // reboot propre (1 seule fois par flash)
+}
 
 void setup(){
   delay(500);
   Serial.begin(115200);
+
+#if FACTORY_RESET_ON_FLASH
+  resetWifiOnEveryFlash();
+#endif
+
   enableCpuPM();
   otaOnBootValidate(); 
   twdtInitOnce();
@@ -310,21 +467,10 @@ void loop(){
     }
 
     if (doEns || doPms){
-      // LED feedback humidité (comme chez toi)
-      if (doEns){
-        if (h>=40 && h<=60) updateLedState(LED_GOOD);
-        else if ((h>=20&&h<40)||(h>60&&h<=70)) updateLedState(LED_MODERATE);
-        else updateLedState(LED_BAD);
-      }
-
-            StaticJsonDocument<512> j;
-      if (doEns){
-        j["temperature"]=t; j["humidity"]=h; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
-      }
+      float pm1f = NAN, pm25f = NAN, pm10f = NAN;
 
       if (havePms){
         // 1) FUSION + LISSSAGE → valeurs UX au dixième
-        float pm1f=0, pm25f=0, pm10f=0;
         pmsPostProcess(p, pm1f, pm25f, pm10f);
 
         auto round1 = [](float v)->float {
@@ -332,36 +478,60 @@ void loop(){
         };
 
         // 2) Publis structurées
+        StaticJsonDocument<512> j;
+        if (doEns){
+          j["temperature"]=t; j["humidity"]=h; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
+        }
+
         // --- ux : valeurs fusionnées/lissées (pour l’app & le backend)
         JsonObject ux = j["pms"]["ux"].to<JsonObject>();
         ux["pm1"]  = round1(pm1f);
         ux["pm25"] = round1(pm25f);
         ux["pm10"] = round1(pm10f);
-        ux["source"] = "fused-v1";   // méta rapide si tu veux versionner
+        ux["source"] = "fused-v1";
 
-        // --- atm : bruts du module (entiers, comme avant)
+        // --- atm : bruts du module
         JsonObject atm = j["pms"]["atm"].to<JsonObject>();
         atm["pm1"]  = p.pm1_atm;
         atm["pm25"] = p.pm25_atm;
         atm["pm10"] = p.pm10_atm;
 
-        // --- cf1 : bruts mode CF=1 (entiers, référence)
+        // --- cf1 : bruts CF=1
         JsonObject cf1 = j["pms"]["cf1"].to<JsonObject>();
         cf1["pm1"]  = p.pm1_cf1;
         cf1["pm25"] = p.pm25_cf1;
         cf1["pm10"] = p.pm10_cf1;
 
-        // --- counts : compteurs par taille (diagnostic, anti-zéro)
+        // --- counts
         JsonObject cnt = j["pms"]["counts"].to<JsonObject>();
         cnt["gt03"]=p.gt03; cnt["gt05"]=p.gt05; cnt["gt10"]=p.gt10;
         cnt["gt25"]=p.gt25; cnt["gt50"]=p.gt50; cnt["gt100"]=p.gt100;
+
+        j["sensorId"]=sensorId; j["userId"]=userId;
+        String s; serializeJson(j,s);
+        mqtt_enqueue("capteurs/qualite_air", s, 0, false);
+        Serial.println(s);
+        mqtt_flush(200);
+      } else {
+        // cas sans PMS dispo : on envoie ENS uniquement
+        StaticJsonDocument<512> j;
+        if (doEns){
+          j["temperature"]=t; j["humidity"]=h; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
+        }
+        j["sensorId"]=sensorId; j["userId"]=userId;
+        String s; serializeJson(j,s);
+        mqtt_enqueue("capteurs/qualite_air", s, 0, false);
+        Serial.println(s);
+        mqtt_flush(200);
       }
 
-      j["sensorId"]=sensorId; j["userId"]=userId;
-      String s; serializeJson(j,s);
-      mqtt_enqueue("capteurs/qualite_air", s, 0, false);
-      Serial.println(s);
-      mqtt_flush(200);
+      // === Score qualité d’air continu → LED ===
+      if (doEns){
+        float pm25ForScore = isfinite(pm25f) ? pm25f : 0.0f;
+        float airScore = computeAirQualityScore(t, h, aqi, tvoc, eco2, pm25ForScore);
+        ledSetAirQualityScore(airScore);
+      }
+
       ledNotifyPublish();
 
       // Fenêtre interactive courte après publish
@@ -369,6 +539,7 @@ void loop(){
       lightNapMs(INTERACTIVE_WINDOW_MS);
       enterModemSleep(false);
     }
+
   }
 } 
         if (!s_mqttStarted

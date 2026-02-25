@@ -139,6 +139,7 @@ bool mqtt_enqueue(const String& t, const String& p, uint8_t qos, bool retain) {
     retain
   };
   Serial.printf("[MQTT] Enqueue vers topic: %s\n", topicFull.c_str());
+  Serial.printf("[MQTT] sub ctrl=%s\n", mqtt_topic_ctrl().c_str());
   if (!m.topic || !m.payload) {
     if (m.topic) free(m.topic);
     if (m.payload) free(m.payload);
