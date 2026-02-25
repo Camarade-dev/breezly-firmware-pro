@@ -110,14 +110,7 @@ static bool httpGetToString(const String& url, String& out,
                             uint32_t connectMs,
                             uint32_t readMs) {
   WiFiClientSecure wcs;
-
-  // Pour GitHub Pages : on désactive la vérif du cert.
-  // La sécurité vient de ta signature ECDSA + SHA256, pas du TLS ici.
-  if (url.startsWith("https://Camarade-dev.github.io/")) {
-    wcs.setInsecure();
-  } else {
-    wcs.setCACert(CA_BUNDLE_PEM);
-  }
+  wcs.setCACert(CA_BUNDLE_PEM);
 
 #if defined(ARDUINO_ARCH_ESP32) && !defined(ARDUINO_ESP32S2_DEV)
   wcs.setHandshakeTimeout(connectMs);
@@ -286,15 +279,9 @@ static bool downloadAndFlashWithHTTPClientInner(const String& binUrl,
   // Jitter pour éviter les connexions back-to-back
   delay(250 + (esp_random() % 300));
 
-  // --- TLS client
+  // --- TLS client (validation cert pour tous les hôtes, dont GitHub Pages)
   WiFiClientSecure tls;
-
-  // GitHub Pages → on désactive la vérif du cert, on se repose sur la signature ECDSA
-  if (isGithub) {
-    tls.setInsecure();
-  } else {
-    tls.setCACert(CA_BUNDLE_PEM);
-  }
+  tls.setCACert(CA_BUNDLE_PEM);
 
 #if defined(ARDUINO_ARCH_ESP32) && !defined(ARDUINO_ESP32S2_DEV)
   tls.setHandshakeTimeout(15000);
