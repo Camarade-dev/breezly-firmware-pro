@@ -1,6 +1,6 @@
 #include "calibration.h"
 static constexpr float kTEMP_Af = 1.000f;
-static constexpr float kTEMP_Bf = -4.000f;
+static constexpr float kTEMP_Bf = 0.000f;
 static constexpr float kHUM_Af  = 1.000f;
 static constexpr float kHUM_Bf  = 0.000f;
 #include <math.h> // si tu gardes des utilitaires maths ici

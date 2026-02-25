@@ -140,19 +140,13 @@ bool connectToWiFiEnterprise() {
 
     // 🎯 NEW : libérer les buffers EAP (identité / mdp / CA) devenus inutiles
     // → ça rend quelques kB de heap, utile avant l’OTA.
-
-      esp_eap_client_clear_identity();
-
-
+    // en fait ça fait crash la co mqtt après 30min / 1h d’uptime (fuite mémoire ?)
+     /* esp_eap_client_clear_identity();
       esp_eap_client_clear_username();
-
-
       esp_eap_client_clear_password();
-
-
       esp_eap_client_clear_new_password();
-
-      esp_eap_client_clear_ca_cert();
+      esp_eap_client_clear_ca_cert(); 
+    */
     //esp_wifi_sta_enterprise_disable(); test si ça nique la requete
 
     return true;
