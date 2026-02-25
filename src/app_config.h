@@ -1,6 +1,6 @@
 #pragma once
 
-#define CURRENT_FIRMWARE_VERSION "1.0.21"
+#define CURRENT_FIRMWARE_VERSION "1.0.24"
 
 #ifdef APP_ENV_DEV
 // Canal DEV → manifest dev
