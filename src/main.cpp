@@ -290,9 +290,12 @@ void setup(){
   if (wifiAuthType == WIFI_CONN_PSK) {
     Serial.printf("PWD : %s\n", wifiPassword.c_str());
   } else {
-    Serial.printf("EAP user: %s\n", eapUsername.c_str());
-    Serial.printf("EAP mdp : %s\n", eapPassword.c_str());
-    Serial.printf("EAP anon: %s\n", eapAnon.c_str());
+    Serial.print("EAP user: ");
+    Serial.println(eapUsername);
+    Serial.print("EAP mdp : ");
+    Serial.println(eapPassword);
+    Serial.print("EAP anon: ");
+    Serial.println(eapAnon);
   }
   Serial.printf("validAuth=%d manquePSK=%d manqueEAP=%d needProv=%d\n",
                 (int)validAuth, (int)manquePSK, (int)manqueEAP, (int)needProv);

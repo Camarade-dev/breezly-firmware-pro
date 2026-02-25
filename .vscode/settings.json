@@ -1,10 +1,12 @@
 {
-    "idf.pythonInstallPath": "C:\\Espressif\\tools\\idf-python\\3.11.2\\python.exe",
-    "C_Cpp.errorSquiggles": "disabled",
-    "files.associations": {
-        "string": "cpp",
-        "cmath": "cpp",
-        "deque": "cpp",
-        "vector": "cpp"
-    }
+  "idf.pythonInstallPath": "C:\\Espressif\\tools\\idf-python\\3.11.2\\python.exe",
+  "C_Cpp.errorSquiggles": "disabled",
+  "C_Cpp.intelliSenseEngine": "default",
+  "clangd.enable": false,
+  "files.associations": {
+    "string": "cpp",
+    "cmath": "cpp",
+    "deque": "cpp",
+    "vector": "cpp"
+  }
 }

@@ -2,13 +2,13 @@
 #include <Arduino.h>
 #include <WiFi.h>
 extern bool bleInited;
-extern volatile bool otaInProgress;
+bool otaIsInProgress(void);  // ota/ota.h
 extern "C" {
   #include "esp_wifi.h"   // <-- déclare esp_wifi_set_ps / wifi_ps_type_t
 }
 static inline void enterModemSleep(bool enable){
   // Pendant OTA / provisioning, on évite d’endormir le modem
-  if (otaInProgress || bleInited) return;
+  if (otaIsInProgress() || bleInited) return;
   esp_wifi_set_ps(enable ? WIFI_PS_MAX_MODEM : WIFI_PS_NONE);
 }
 

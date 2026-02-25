@@ -3,3 +3,9 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+; Secrets et fichiers générés par pre-build (ne jamais committer)
+secrets.ini
+src/core/devkey.h
+src/net/mqtt_secrets.h
+.last_build_sig
