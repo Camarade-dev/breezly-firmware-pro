@@ -161,16 +161,33 @@ void otaOnBootValidate(){
   logPartitions();
   OTA_HEAP("boot");
 
+  const uint16_t MAX_FAILS = 3;
+
   if (pending){
+    if (fail >= MAX_FAILS){
+      // We are the partition that was rolled back TO (the good one). Clear pending and mark valid; do not rollback again.
+      Preferences r; r.begin("ota", false);
+      r.putBool("pending", false);
+      r.putUShort("fail", 0);
+      r.putUShort("bootcnt", 0);
+      r.end();
+#if ESP_IDF_VERSION_MAJOR >= 4
+      esp_ota_mark_app_valid_cancel_rollback();
+#endif
+      OTA_LOG("[OTA] Rollback target: clear pending, mark valid");
+      return;
+    }
     Preferences q; q.begin("ota", false);
     q.putUShort("bootcnt", bootcnt+1);
     q.putUShort("fail", fail+1);
     q.end();
 
-    const uint16_t MAX_FAILS = 3;
     if ((fail+1) >= MAX_FAILS){
+      Preferences rb; rb.begin("ota", false);
+      rb.putString("rolled_back_ver", CURRENT_FIRMWARE_VERSION);
+      rb.end();
+      OTA_LOG("[OTA] Too many failed boots → rollback (record rolled_back_ver=%s)", CURRENT_FIRMWARE_VERSION);
 #if ESP_IDF_VERSION_MAJOR >= 4
-      OTA_LOG("[OTA] Too many failed boots → rollback");
       esp_ota_mark_app_invalid_rollback_and_reboot();
 #else
       OTA_LOG("[OTA] Too many failed boots (IDF<4) → reboot factory");
@@ -179,6 +196,13 @@ void otaOnBootValidate(){
       ESP.restart();
 #endif
     }
+#ifdef OTA_TEST_ROLLBACK_SIMULATE_CRASH
+    else {
+      OTA_LOG("[OTA] TEST: simulate failed boot %u/3 → reboot", (unsigned)(fail+1));
+      delay(500);
+      ESP.restart();
+    }
+#endif
   }
 
 #if ESP_IDF_VERSION_MAJOR >= 4
@@ -188,6 +212,7 @@ void otaOnBootValidate(){
   r.putBool("pending", false);
   r.putUShort("fail", 0);
   r.putUShort("bootcnt", 0);
+  r.putString("rolled_back_ver", "");  // clear so future OTAs to newer versions are allowed
   r.end();
   OTA_LOG("[OTA] App marked VALID");
 }
@@ -721,6 +746,14 @@ void checkAndPerformCloudOTA(){
   OTA_LOG("[OTA] version cmp: current=%s target=%s -> %d", CURRENT_FIRMWARE_VERSION, ver, cmp);
   if (!force && cmp >= 0){
     OTA_LOG("[OTA] déjà à jour (skip)");
+    return;
+  }
+
+  Preferences pSkip; pSkip.begin("ota", true);
+  String rolledBack = pSkip.getString("rolled_back_ver", "");
+  pSkip.end();
+  if (rolledBack.length() > 0 && String(ver) == rolledBack){
+    OTA_LOG("[OTA] skip: version %s was rolled back (reject re-install)", ver);
     return;
   }
 
