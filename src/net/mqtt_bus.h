@@ -29,3 +29,7 @@ String mqtt_topic_device_base();                  // "breezly/devices/{sensorId}
 String mqtt_topic_ota();                          // base + "/ota"
 String mqtt_topic_ctrl();                         // base + "/control"
 String mqtt_topic_status();                       // base + "/status"
+String mqtt_topic_telemetry();                    // base + "/telemetry"
+
+// Emit telemetry event (enqueued; payload: type, fw_version, device_id, ts, context)
+bool mqtt_telemetry_emit(const char* type, const char* context_json);

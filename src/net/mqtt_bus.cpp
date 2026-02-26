@@ -15,6 +15,7 @@
 #include "../net/sntp_utils.h"
 #include <string>
 #include "../ca_bundle.h"
+#include <esp_system.h>
 
 #include "../app_config.h"
 #include "mqtt_secrets.h"
@@ -52,6 +53,24 @@ String mqtt_topic_device_base() { return withPrefix("breezly/devices/" + sensorI
 String mqtt_topic_ota()    { return mqtt_topic_device_base() + "/ota"; }
 String mqtt_topic_ctrl()   { return mqtt_topic_device_base() + "/control"; }
 String mqtt_topic_status() { return mqtt_topic_device_base() + "/status"; }
+String mqtt_topic_telemetry() { return mqtt_topic_device_base() + "/telemetry"; }
+
+bool mqtt_telemetry_emit(const char* type, const char* context_json) {
+  if (!type) return false;
+  DynamicJsonDocument doc(512);
+  doc["type"] = type;
+  doc["fw_version"] = CURRENT_FIRMWARE_VERSION;
+  doc["device_id"] = sensorId;
+  doc["ts"] = (uint64_t)(time(nullptr) * 1000ULL);
+  if (context_json && context_json[0]) {
+    StaticJsonDocument<256> ctx;
+    if (deserializeJson(ctx, context_json) == DeserializationError::Ok)
+      doc["context"] = ctx.as<JsonObject>();
+  }
+  String payload;
+  serializeJson(doc, payload);
+  return mqtt_enqueue(mqtt_topic_telemetry(), payload, 0, false);
+}
 static volatile bool s_hello_ok      = false;
 static volatile bool s_registered_ok = false;
 
@@ -444,8 +463,10 @@ static bool mqtt_do_connect() {
   );
   if (!ok) {
     Serial.printf("[MQTT] connect FAIL state=%d time=%ld\n", s_mqtt.state(), time(nullptr));
+    mqtt_telemetry_emit("MQTT_CONNECT_FAIL", "{}");
     return false;
   }
+  mqtt_telemetry_emit("MQTT_CONNECT_OK", "{}");
 
   // Subscriptions
   s_mqtt.subscribe(mqtt_topic_ota().c_str(), 0);
@@ -459,6 +480,41 @@ static bool mqtt_do_connect() {
   j["firmwareVersion"]=CURRENT_FIRMWARE_VERSION;
   String s; serializeJson(j, s);
   s_mqtt.publish((String(MQTT_PREFIX) + "capteurs/boot").c_str(), s.c_str(), false);
+
+  // Telemetry: FW_BOOT with reset reason (ESP32: esp_reset_reason(), not ESP.getResetReason())
+  {
+    const char* rr = "unknown";
+    switch (esp_reset_reason()) {
+      case ESP_RST_POWERON:  rr = "power_on";     break;
+      case ESP_RST_EXT:      rr = "external";    break;
+      case ESP_RST_SW:       rr = "software";    break;
+      case ESP_RST_PANIC:    rr = "panic";       break;
+      case ESP_RST_INT_WDT:  rr = "int_wdt";     break;
+      case ESP_RST_TASK_WDT: rr = "task_wdt";    break;
+      case ESP_RST_WDT:      rr = "wdt";         break;
+      case ESP_RST_DEEPSLEEP:rr = "deep_sleep";  break;
+      case ESP_RST_BROWNOUT: rr = "brownout";    break;
+      case ESP_RST_SDIO:     rr = "sdio";        break;
+      default:               rr = "unknown";     break;
+    }
+    String ctx = "{\"reset_reason\":\"" + String(rr) + "\"}";
+    mqtt_telemetry_emit("FW_BOOT", ctx.c_str());
+  }
+  // Telemetry: OTA_SUCCESS from previous boot (saved before ESP.restart())
+  {
+    Preferences p;
+    if (p.begin("ota", true)) {
+      String successVer = p.getString("success_ver", "");
+      p.end();
+      if (successVer.length()) {
+        String ctx = "{\"version\":\"" + successVer + "\"}";
+        mqtt_telemetry_emit("OTA_SUCCESS", ctx.c_str());
+        p.begin("ota", false);
+        p.remove("success_ver");
+        p.end();
+      }
+    }
+  }
 
   publish_status_retained("online");
   {
@@ -481,6 +537,9 @@ static bool mqtt_do_connect() {
 
   return true;
 }
+
+static const uint32_t TELEMETRY_HEARTBEAT_MS = 5 * 60 * 1000;  // 5 min
+static uint32_t s_lastHeartbeatMs = 0;
 
 // ======= Tâche propriétaire =======
 static void mqttTask(void*) {
@@ -527,10 +586,22 @@ static void mqttTask(void*) {
     PubMsg m;
     int drained = 0;
     while (drained < 8 && xQueueReceive(s_queue, &m, 0) == pdTRUE) {
-    s_mqtt.publish(m.topic, m.payload, m.retain);  // QoS/retain comme avant
-    free(m.topic);
-    free(m.payload);
-    drained++;
+      if (!s_mqtt.publish(m.topic, m.payload, m.retain))
+        mqtt_telemetry_emit("MQTT_PUBLISH_FAIL", "{}");
+      free(m.topic);
+      free(m.payload);
+      drained++;
+    }
+
+    // Telemetry heartbeat every 5 min
+    uint32_t now = millis();
+    if (s_lastHeartbeatMs == 0) s_lastHeartbeatMs = now;
+    if ((now - s_lastHeartbeatMs) >= TELEMETRY_HEARTBEAT_MS) {
+      s_lastHeartbeatMs = now;
+      char ctx[128];
+      snprintf(ctx, sizeof(ctx), "{\"uptime\":%lu,\"wifi_rssi\":%d,\"heap\":%lu}",
+               (unsigned long)now, WiFi.RSSI(), (unsigned long)esp_get_free_heap_size());
+      mqtt_telemetry_emit("FW_HEARTBEAT", ctx);
     }
 
     vTaskDelay(10 / portTICK_PERIOD_MS);
