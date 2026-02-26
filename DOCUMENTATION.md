@@ -50,6 +50,8 @@ Dernière mise à jour : 2026-02
 | Secrets : build sans repo | Vérifier .gitignore (esp32 + backend) et `git status` : aucun fichier secret suivi | secrets.ini, devkey.h, mqtt_secrets.h (esp32) et ec_private.pem / ec_public.pem (backend) dans .gitignore | Secrets commités | OK | esp32_wroom_32e/.gitignore : secrets.ini, src/core/devkey.h, src/net/mqtt_secrets.h, .last_build_sig ; back-end-breezly/.gitignore : tools/ec_private.pem, tools/ec_public.pem. Vérifier en local : `git status` ne doit pas lister ces fichiers. | — | — | 2026-02 |
 | Recovery : flash manuel | `pio run -e esp32-wroom-32e-prod -t upload --upload-port COMx` ou esptool `write_flash 0x10000 firmware.bin` | Flash OK ; device boot sur image flashée | Échec write_flash ou boot | OK | Upload SUCCESS ; Wrote 1446256 bytes at 0x00010000 ; Hash verified ; post-upload register OK | PROV_80BAD0215788 | — | 2026-02 |
 
+*Post-upload (provisioning)* : le script `post_upload_register.py` attend après le flash que le device boot et envoie sur la série la ligne `BREEZLY_EXTERNAL_ID=PROV_xxxx` (même valeur que le nom BLE). Ainsi l’external_id utilisé pour le provisioning est toujours celui du device flashé, y compris en téléversement parallèle ou si le port esptool lit un autre device. Si cette ligne n’est pas reçue (timeout ou `pyserial` absent), fallback sur `esptool read_mac` (avec risque de décalage port/device). Optionnel : `pip install pyserial` pour activer la lecture série.
+
 ---
 
 ## Parcours test minimal (≤ 20 min)

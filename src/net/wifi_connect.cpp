@@ -68,7 +68,12 @@ static bool connectToWiFiPSK() {
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
   wifiAutoTxPower();
   wifiConnected = true;
-  mqtt_telemetry_emit("WIFI_CONNECT_OK", "{}");
+  {
+    char ctx[120];
+    snprintf(ctx, sizeof(ctx), "{\"ip\":\"%s\",\"rssi\":%d}",
+             WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    mqtt_telemetry_emit("WIFI_CONNECT_OK", ctx);
+  }
   breezly_on_wifi_ok();
   // Étape 1 : Wi-Fi OK 
   provSet("status", "wifi_ok");
@@ -96,8 +101,8 @@ static bool connectToWiFiPSK() {
 
   // ÉCHEC: on tente d’éclairer la cause
   wifiConnected = false;
-  char ctx[64];
-  snprintf(ctx, sizeof(ctx), "{\"reason\":%d}", s_lastDiscReasonPsk);
+  char ctx[80];
+  snprintf(ctx, sizeof(ctx), "{\"reason\":%d,\"retryCount\":%u}", s_lastDiscReasonPsk, (unsigned)wifiFailCount);
   mqtt_telemetry_emit("WIFI_CONNECT_FAIL", ctx);
   const char* st = mapDiscReasonToStatus(s_lastDiscReasonPsk);
   provSet("status", st);

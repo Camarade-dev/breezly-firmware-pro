@@ -506,25 +506,28 @@ void setupBLE(bool startAdvertising){
     return;
   }
 
-  // Nom BLE persistant
+  // Nom BLE dérivé du MAC eFuse (source de vérité matérielle).
+  // On met à jour la valeur persistée si elle est absente ou divergente
+  // pour éviter les mismatches après clone/flash d'images.
   char bleName[25];
-  prefs.begin("myApp", true);
-  String storedBleName = prefs.getString("bleName", "");
-  prefs.end();
+  uint64_t chipid = ESP.getEfuseMac();
+  sprintf(bleName, "PROV_%012llX", chipid);
 
-  if (storedBleName.isEmpty()) {
-    uint64_t chipid = ESP.getEfuseMac();
-    sprintf(bleName, "PROV_%012llX", chipid);
-    prefs.begin("myApp", false);
+  prefs.begin("myApp", false);
+  String storedBleName = prefs.getString("bleName", "");
+  if (storedBleName != String(bleName)) {
+    if (!storedBleName.isEmpty()) {
+      Serial.printf("[BLE] bleName migrate: stored=%s -> efuse=%s\n", storedBleName.c_str(), bleName);
+    }
     prefs.putString("bleName", bleName);
-    prefs.end();
-  } else {
-    storedBleName.toCharArray(bleName, sizeof(bleName));
   }
+  prefs.end();
   gBleName = String(bleName);
 
   // Init NimBLE
   Serial.printf("[BLE] INIT NimBLE (%s)\n", bleName);
+  // Ligne lue par le script post-upload pour provisionner avec le même external_id que le nom BLE (évite décalage port / device en téléversement parallèle)
+  Serial.printf("BREEZLY_EXTERNAL_ID=%s\n", bleName);
   NimBLEDevice::init(bleName);
   NimBLEDevice::setMTU(185);
   NimBLEDevice::setDeviceName(bleName);
