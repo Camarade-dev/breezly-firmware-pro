@@ -7,6 +7,7 @@ extern "C" {
 #include "../power/wifi_txpower.h"
 #include "../core/globals.h"
 #include "../net/sntp_utils.h"
+#include "../net/mqtt_bus.h"
 #include "../ble/provisioning.h"
 #include "../led/led_status.h"
 #include "wifi_enterprise.h"   // connectToWiFiEnterprise()
@@ -67,6 +68,7 @@ static bool connectToWiFiPSK() {
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
   wifiAutoTxPower();
   wifiConnected = true;
+  mqtt_telemetry_emit("WIFI_CONNECT_OK", "{}");
   breezly_on_wifi_ok();
   // Étape 1 : Wi-Fi OK 
   provSet("status", "wifi_ok");
@@ -94,6 +96,9 @@ static bool connectToWiFiPSK() {
 
   // ÉCHEC: on tente d’éclairer la cause
   wifiConnected = false;
+  char ctx[64];
+  snprintf(ctx, sizeof(ctx), "{\"reason\":%d}", s_lastDiscReasonPsk);
+  mqtt_telemetry_emit("WIFI_CONNECT_FAIL", ctx);
   const char* st = mapDiscReasonToStatus(s_lastDiscReasonPsk);
   provSet("status", st);
   // Traduit quelques causes communes en hooks dédiés

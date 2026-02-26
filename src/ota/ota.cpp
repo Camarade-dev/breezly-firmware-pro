@@ -1,4 +1,5 @@
 #include "ota.h"
+#include "../net/mqtt_bus.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -612,6 +613,11 @@ static bool downloadAndFlashWithHTTPClientInner(const String& binUrl,
   Preferences p; p.begin("ota", false);
   p.putBool("pending", true);
   p.putUShort("fail", 0);
+  String pendingVer = p.getString("pending_ver", "");
+  if (pendingVer.length()) {
+    p.putString("success_ver", pendingVer);
+    p.remove("pending_ver");
+  }
   p.end();
 
   g_otaInProgress = false;
@@ -794,9 +800,23 @@ void checkAndPerformCloudOTA(){
   }
 
   // Téléchargement/flash réel
+  {
+    String ctx;
+    ctx = "{\"target_version\":\"" + String(ver) + "\"}";
+    mqtt_telemetry_emit("OTA_START", ctx.c_str());
+  }
+  Preferences prefsOta;
+  prefsOta.begin("ota", false);
+  prefsOta.putString("pending_ver", ver);
+  prefsOta.end();
+
   bool ok = downloadAndFlashWithHTTPClient(binUrl, expectedSize, String(shaHex));
   if (!ok) {
     OTA_LOG("[OTA] download/flash failed");
+    mqtt_telemetry_emit("OTA_FAIL", "{}");
+    prefsOta.begin("ota", false);
+    prefsOta.remove("pending_ver");
+    prefsOta.end();
   }
 }
 
