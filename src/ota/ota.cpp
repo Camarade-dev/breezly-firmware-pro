@@ -615,6 +615,7 @@ static bool downloadAndFlashWithHTTPClientInner(const String& binUrl,
   p.putUShort("fail", 0);
   String pendingVer = p.getString("pending_ver", "");
   if (pendingVer.length()) {
+    p.putString("from_ver", CURRENT_FIRMWARE_VERSION);
     p.putString("success_ver", pendingVer);
     p.remove("pending_ver");
   }
@@ -813,7 +814,9 @@ void checkAndPerformCloudOTA(){
   bool ok = downloadAndFlashWithHTTPClient(binUrl, expectedSize, String(shaHex));
   if (!ok) {
     OTA_LOG("[OTA] download/flash failed");
-    mqtt_telemetry_emit("OTA_FAIL", "{}");
+    char otaFailCtx[120];
+    snprintf(otaFailCtx, sizeof(otaFailCtx), "{\"stage\":\"download_flash\",\"code\":-1}");
+    mqtt_telemetry_emit("OTA_FAIL", otaFailCtx);
     prefsOta.begin("ota", false);
     prefsOta.remove("pending_ver");
     prefsOta.end();

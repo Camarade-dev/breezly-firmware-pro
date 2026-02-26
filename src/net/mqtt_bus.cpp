@@ -19,6 +19,7 @@
 
 #include "../app_config.h"
 #include "mqtt_secrets.h"
+#include <esp_ota_ops.h>
 #if defined(BREEZLY_PROD)
 static const char* MQTT_PREFIX = "prod/";
 #elif defined(BREEZLY_DEV)
@@ -462,8 +463,11 @@ static bool mqtt_do_connect() {
     lwtPayload.c_str()
   );
   if (!ok) {
-    Serial.printf("[MQTT] connect FAIL state=%d time=%ld\n", s_mqtt.state(), time(nullptr));
-    mqtt_telemetry_emit("MQTT_CONNECT_FAIL", "{}");
+    int state = s_mqtt.state();
+    Serial.printf("[MQTT] connect FAIL state=%d time=%ld\n", state, time(nullptr));
+    char ctx[80];
+    snprintf(ctx, sizeof(ctx), "{\"reason\":%d}", state);
+    mqtt_telemetry_emit("MQTT_CONNECT_FAIL", ctx);
     return false;
   }
   mqtt_telemetry_emit("MQTT_CONNECT_OK", "{}");
@@ -481,7 +485,57 @@ static bool mqtt_do_connect() {
   String s; serializeJson(j, s);
   s_mqtt.publish((String(MQTT_PREFIX) + "capteurs/boot").c_str(), s.c_str(), false);
 
-  // Telemetry: FW_BOOT with reset reason (ESP32: esp_reset_reason(), not ESP.getResetReason())
+  // Telemetry: boot_count + reboot loop detection (NVS window 10 min)
+  {
+    Preferences bootPrefs;
+    bootPrefs.begin("boot", false);
+    uint32_t bootCount = bootPrefs.getUInt("count", 0) + 1;
+    bootPrefs.putUInt("count", bootCount);
+    String tsList = bootPrefs.getString("ts", "");
+    const uint32_t nowSec = (uint32_t)time(nullptr);
+    const uint32_t windowSec = 10 * 60;
+    int bootsInWindow = 0;
+    if (tsList.length()) {
+      int idx = 0;
+      while (idx < (int)tsList.length()) {
+        int end = tsList.indexOf(',', idx);
+        if (end < 0) end = tsList.length();
+        String part = tsList.substring(idx, end);
+        uint32_t t = (uint32_t)part.toInt();
+        if (nowSec - t <= windowSec) bootsInWindow++;
+        idx = end + 1;
+      }
+    }
+    bootsInWindow++;
+    String newTs = tsList.length() ? (String(nowSec) + "," + tsList) : String(nowSec);
+    int count = 0;
+    int cut = -1;
+    for (int i = 0; i < (int)newTs.length(); i++) {
+      if (newTs[i] == ',') count++;
+      if (count >= 5) { cut = i; break; }
+    }
+    if (cut > 0) {
+      int comma = newTs.lastIndexOf(',', cut - 1);
+      newTs = comma >= 0 ? newTs.substring(0, comma) : newTs.substring(0, cut);
+    }
+    bootPrefs.putString("ts", newTs);
+    bootPrefs.end();
+    if (bootsInWindow >= 3) {
+      const char* rr = "unknown";
+      switch (esp_reset_reason()) {
+        case ESP_RST_BROWNOUT: rr = "brownout"; break;
+        case ESP_RST_PANIC:    rr = "panic";    break;
+        case ESP_RST_INT_WDT:
+        case ESP_RST_TASK_WDT:
+        case ESP_RST_WDT:      rr = "wdt";      break;
+        default:               rr = "other";   break;
+      }
+      char loopCtx[120];
+      snprintf(loopCtx, sizeof(loopCtx), "{\"boots10min\":%d,\"lastResetReason\":\"%s\"}", bootsInWindow, rr);
+      mqtt_telemetry_emit("FW_REBOOT_LOOP", loopCtx);
+    }
+  }
+  // Telemetry: FW_BOOT with reset_reason, boot_count, brownout_flag, build_id, partition
   {
     const char* rr = "unknown";
     switch (esp_reset_reason()) {
@@ -497,20 +551,41 @@ static bool mqtt_do_connect() {
       case ESP_RST_SDIO:     rr = "sdio";        break;
       default:               rr = "unknown";     break;
     }
-    String ctx = "{\"reset_reason\":\"" + String(rr) + "\"}";
-    mqtt_telemetry_emit("FW_BOOT", ctx.c_str());
+    bool brownout = (esp_reset_reason() == ESP_RST_BROWNOUT);
+    Preferences bootPrefs;
+    bootPrefs.begin("boot", true);
+    uint32_t bootCount = bootPrefs.getUInt("count", 1);
+    bootPrefs.end();
+    const esp_partition_t* run = esp_ota_get_running_partition();
+    const char* partLabel = run ? run->label : "unknown";
+    DynamicJsonDocument ctx(320);
+    ctx["reset_reason"] = rr;
+    ctx["boot_count"] = bootCount;
+    ctx["brownout_flag"] = brownout;
+    ctx["fw_version"] = CURRENT_FIRMWARE_VERSION;
+    ctx["build_id"] = BUILD_ID;
+    ctx["partition"] = partLabel;
+    String ctxStr;
+    serializeJson(ctx, ctxStr);
+    mqtt_telemetry_emit("FW_BOOT", ctxStr.c_str());
   }
-  // Telemetry: OTA_SUCCESS from previous boot (saved before ESP.restart())
+  // Telemetry: OTA_SUCCESS from previous boot (fromVersion, toVersion)
   {
     Preferences p;
     if (p.begin("ota", true)) {
       String successVer = p.getString("success_ver", "");
+      String fromVer = p.getString("from_ver", "");
       p.end();
       if (successVer.length()) {
-        String ctx = "{\"version\":\"" + successVer + "\"}";
-        mqtt_telemetry_emit("OTA_SUCCESS", ctx.c_str());
+        DynamicJsonDocument ctx(200);
+        ctx["toVersion"] = successVer;
+        ctx["fromVersion"] = fromVer.length() ? fromVer : CURRENT_FIRMWARE_VERSION;
+        String ctxStr;
+        serializeJson(ctx, ctxStr);
+        mqtt_telemetry_emit("OTA_SUCCESS", ctxStr.c_str());
         p.begin("ota", false);
         p.remove("success_ver");
+        p.remove("from_ver");
         p.end();
       }
     }
@@ -540,6 +615,7 @@ static bool mqtt_do_connect() {
 
 static const uint32_t TELEMETRY_HEARTBEAT_MS = 5 * 60 * 1000;  // 5 min
 static uint32_t s_lastHeartbeatMs = 0;
+static uint32_t s_minFreeHeap = 0xFFFFFFFFU;
 
 // ======= Tâche propriétaire =======
 static void mqttTask(void*) {
@@ -586,8 +662,11 @@ static void mqttTask(void*) {
     PubMsg m;
     int drained = 0;
     while (drained < 8 && xQueueReceive(s_queue, &m, 0) == pdTRUE) {
-      if (!s_mqtt.publish(m.topic, m.payload, m.retain))
-        mqtt_telemetry_emit("MQTT_PUBLISH_FAIL", "{}");
+      if (!s_mqtt.publish(m.topic, m.payload, m.retain)) {
+        char pubFailCtx[180];
+        snprintf(pubFailCtx, sizeof(pubFailCtx), "{\"topic\":\"%.80s\",\"code\":%d}", m.topic ? m.topic : "", (int)s_mqtt.state());
+        mqtt_telemetry_emit("MQTT_PUBLISH_FAIL", pubFailCtx);
+      }
       free(m.topic);
       free(m.payload);
       drained++;
@@ -598,9 +677,13 @@ static void mqttTask(void*) {
     if (s_lastHeartbeatMs == 0) s_lastHeartbeatMs = now;
     if ((now - s_lastHeartbeatMs) >= TELEMETRY_HEARTBEAT_MS) {
       s_lastHeartbeatMs = now;
-      char ctx[128];
-      snprintf(ctx, sizeof(ctx), "{\"uptime\":%lu,\"wifi_rssi\":%d,\"heap\":%lu}",
-               (unsigned long)now, WiFi.RSSI(), (unsigned long)esp_get_free_heap_size());
+      uint32_t freeHeap = (uint32_t)esp_get_free_heap_size();
+      if (freeHeap < s_minFreeHeap) s_minFreeHeap = freeHeap;
+      char ctx[220];
+      snprintf(ctx, sizeof(ctx),
+               "{\"uptime_ms\":%lu,\"wifi_rssi\":%d,\"free_heap\":%lu,\"min_free_heap\":%lu,\"mqtt_connected\":%s}",
+               (unsigned long)now, WiFi.RSSI(), (unsigned long)freeHeap, (unsigned long)s_minFreeHeap,
+               s_connected ? "true" : "false");
       mqtt_telemetry_emit("FW_HEARTBEAT", ctx);
     }
 
