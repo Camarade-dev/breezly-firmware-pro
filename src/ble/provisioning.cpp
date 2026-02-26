@@ -2,6 +2,7 @@
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include "esp_mac.h"
 
 #include "core/globals.h"      // wifiSSID, wifiPassword, sensorId, userId, prefs, needToConnectWiFi
 #include "utils/crc_utils.h"   // computeChecksum(...)
@@ -23,6 +24,27 @@ static bool s_bleInitDone = false;
 static bool s_advertising = false;
 
 extern bool bleInited;  // exporté via header
+
+static void buildExternalId(char out[25]) {
+  uint8_t mac[6] = {0};
+  esp_err_t e = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  if (e == ESP_OK) {
+    snprintf(out, 25, "PROV_%02X%02X%02X%02X%02X%02X",
+      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return;
+  }
+
+  // Fallback: ESP.getEfuseMac() renvoie souvent l'ordre inverse de l'affichage MAC.
+  // On reformate en ordre STA MAC pour rester cohérent avec esptool/read_mac.
+  uint64_t raw = ESP.getEfuseMac();
+  snprintf(out, 25, "PROV_%02X%02X%02X%02X%02X%02X",
+    (uint8_t)(raw & 0xFF),
+    (uint8_t)((raw >> 8) & 0xFF),
+    (uint8_t)((raw >> 16) & 0xFF),
+    (uint8_t)((raw >> 24) & 0xFF),
+    (uint8_t)((raw >> 32) & 0xFF),
+    (uint8_t)((raw >> 40) & 0xFF));
+}
 
 // ------------------- WD & session -------------------
 static volatile uint32_t s_lastActivityMs = 0;
@@ -510,8 +532,7 @@ void setupBLE(bool startAdvertising){
   // On met à jour la valeur persistée si elle est absente ou divergente
   // pour éviter les mismatches après clone/flash d'images.
   char bleName[25];
-  uint64_t chipid = ESP.getEfuseMac();
-  sprintf(bleName, "PROV_%012llX", chipid);
+  buildExternalId(bleName);
 
   prefs.begin("myApp", false);
   String storedBleName = prefs.getString("bleName", "");

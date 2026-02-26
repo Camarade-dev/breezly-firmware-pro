@@ -1,17 +1,13 @@
 # scripts/post_upload_register.py
-
-
-# Provisionne le device après upload. Préfère l'external_id lu sur la série (envoyé par le
-# firmware au boot) pour garantir la cohérence avec le nom BLE (téléversement parallèle, etc.).
+# Provisionne le device après upload via external_id dérivé du MAC (esptool read_mac).
 
 Import("env")
-import os, re, sys, subprocess, json, time
+import os, re, sys, subprocess, json
 
-SERIAL_BAUD = 115200
-BOOT_WAIT_S = 5
-SERIAL_READ_TIMEOUT_S = 18
-MARKER = "BREEZLY_EXTERNAL_ID="
-ALLOW_MAC_FALLBACK = os.environ.get("ALLOW_MAC_FALLBACK", "0").strip() == "1"
+def reverse_pairs(mac_hex):
+    """Inverse l'ordre des paires d'octets pour coller au format buildExternalId() du firmware."""
+    mac_hex = mac_hex.replace(":", "").upper()
+    return "".join([mac_hex[i:i+2] for i in range(0, 12, 2)][::-1])
 
 def get_esptool_path():
     try:
@@ -22,11 +18,25 @@ def get_esptool_path():
 
 def get_upload_port():
     try:
-        return env.GetProjectOption("upload_port")
+        p = env.GetProjectOption("upload_port")
+        if p and str(p).strip():
+            return str(p).strip()
     except Exception:
-        return os.environ.get("UPLOAD_PORT", "")
+        pass
+    try:
+        p = env.subst("$UPLOAD_PORT")
+        if p and str(p).strip() and str(p).strip() != "$UPLOAD_PORT":
+            return str(p).strip()
+    except Exception:
+        pass
+    for k in ("UPLOAD_PORT", "PLATFORMIO_UPLOAD_PORT"):
+        p = os.environ.get(k, "")
+        if p and str(p).strip():
+            return str(p).strip()
+    return ""
 
 def read_mac(port):
+    """Lit le MAC via esptool."""
     esptool_py = get_esptool_path()
     if not esptool_py:
         print("[post-upload] esptool.py introuvable")
@@ -37,52 +47,22 @@ def read_mac(port):
     cmd += ["read_mac"]
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-        m = re.search(r"MAC:\s*([0-9A-Fa-f:]{17})", out)
-        return m.group(1).replace(":", "").upper() if m else None
+        m = re.search(r"MAC:\s*([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})", out)
+        if m:
+            return m.group(1).replace(":", "").upper()
+        m = re.search(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})", out)
+        if m:
+            return m.group(1).replace(":", "").upper()
+        print(f"[post-upload] read_mac: format inattendu: {out[:200]!r}")
+        return None
+    except subprocess.CalledProcessError as e:
+        out = getattr(e, "output", None) or getattr(e, "stdout", "") or str(e)
+        print(f"[post-upload] read_mac fail (exit {e.returncode}): {out[:300]}")
+        return None
     except Exception as e:
         print(f"[post-upload] read_mac fail: {e}")
         return None
 
-def external_id_from_serial(port):
-    """Lit l'external_id envoyé par le device sur la série au boot (même valeur que le nom BLE)."""
-    if not port or not str(port).strip():
-        return None
-    try:
-        import serial
-    except ImportError:
-        print("[post-upload] pyserial non disponible, fallback esptool read_mac")
-        return None
-    try:
-        ser = serial.Serial(port, SERIAL_BAUD, timeout=0.5)
-    except Exception as e:
-        print(f"[post-upload] ouverture série {port} impossible: {e}")
-        return None
-    try:
-        deadline = time.monotonic() + SERIAL_READ_TIMEOUT_S
-        buf = ""
-        while time.monotonic() < deadline:
-            chunk = ser.read(256)
-            if chunk:
-                buf += chunk.decode("utf-8", errors="ignore")
-            while "\n" in buf or "\r" in buf:
-                line, _, buf = buf.partition("\n")
-                if "\r" in line:
-                    line = line.split("\r")[0]
-                line = line.strip()
-                if line.startswith(MARKER):
-                    val = line[len(MARKER):].strip()
-                    if val.startswith("PROV_") and len(val) == 17:
-                        return val
-            time.sleep(0.05)
-        return None
-    finally:
-        try:
-            ser.close()
-        except Exception:
-            pass
-
-# IMPORTANT: parameter must be named 'env'
-# IMPORTANT: parameter must be named 'env'
 def after_upload(target, source, env):
     print("[post-upload] hook loaded")
     port = get_upload_port()
@@ -91,7 +71,6 @@ def after_upload(target, source, env):
     else:
         print("[post-upload] aucun upload_port configuré")
 
-    # lit d'abord l’option PlatformIO, sinon API_URL, sinon défaut DEV
     api_url = (
         env.GetProjectOption("custom_api_url")
         or os.environ.get("API_URL", "https://breezly-backendweb.onrender.com")
@@ -104,27 +83,10 @@ def after_upload(target, source, env):
     if not devkey:
         raise RuntimeError("DEVICE_KEY_B64 manquante (custom_device_key_b64 / DEVICE_KEY_B64)")
 
-    # 1) Attendre le boot puis lire l'external_id sur la série (identique au nom BLE)
-    print(f"[post-upload] attente boot {BOOT_WAIT_S}s puis lecture série...")
-    time.sleep(BOOT_WAIT_S)
-    external_id = external_id_from_serial(port)
-
-    # 2) Fallback optionnel: esptool read_mac.
-    # Désactivé par défaut pour éviter de provisionner un mauvais external_id
-    # (ex: série indisponible -> mismatch DB vs nom BLE réel).
-    if not external_id:
-        if not ALLOW_MAC_FALLBACK:
-            raise RuntimeError(
-                "Impossible de lire BREEZLY_EXTERNAL_ID sur série. "
-                "Provisioning interrompu pour éviter un external_id incohérent. "
-                "Installe pyserial / vérifie le port série, ou exporte ALLOW_MAC_FALLBACK=1 pour forcer le fallback."
-            )
-        print("[post-upload] pas de BREEZLY_EXTERNAL_ID sur série, fallback esptool read_mac (ALLOW_MAC_FALLBACK=1)")
-        mac = read_mac(port)
-        if not mac:
-            raise RuntimeError("Impossible de lire le MAC (esptool)")
-        external_id = f"PROV_{mac[:12]}"
-
+    mac = read_mac(port)
+    if not mac:
+        raise RuntimeError("Impossible de lire le MAC (esptool)")
+    external_id = f"PROV_{reverse_pairs(mac)}"
     print(f"[post-upload] external_id pour provision: {external_id}")
 
     payload = {
@@ -150,6 +112,5 @@ def after_upload(target, source, env):
     env_env["API_URL"] = api_url
     env_env["FACTORY_TOKEN"] = factory
     subprocess.check_call(cmd, env=env_env)
-
 
 env.AddPostAction("upload", after_upload)
