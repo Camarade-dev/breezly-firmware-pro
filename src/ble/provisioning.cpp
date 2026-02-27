@@ -246,14 +246,24 @@ static void credWorker(void*){
     }
     if (!strcmp(op, "phase")) {
       const char* v = doc["value"] | "IDLE";
-      if      (!strcmp(v,"STARTING"))       setPhase(ProvPhase::STARTING);
-      else if (!strcmp(v,"SELECTING_SSID")) setPhase(ProvPhase::SELECTING_SSID);
-      else if (!strcmp(v,"TYPING"))         setPhase(ProvPhase::TYPING);
-      else if (!strcmp(v,"CLAIM"))          setPhase(ProvPhase::CLAIM);
-      else if (!strcmp(v,"SENDING_CREDS"))  setPhase(ProvPhase::SENDING_CREDS);
-      else if (!strcmp(v,"CONNECTING"))     setPhase(ProvPhase::CONNECTING);
-      else if (!strcmp(v,"DONE"))           setPhase(ProvPhase::DONE);
-      else                                   setPhase(ProvPhase::IDLE);
+
+      ProvPhase newPhase = ProvPhase::IDLE;
+      if      (!strcmp(v,"STARTING"))       newPhase = ProvPhase::STARTING;
+      else if (!strcmp(v,"SELECTING_SSID")) newPhase = ProvPhase::SELECTING_SSID;
+      else if (!strcmp(v,"TYPING"))         newPhase = ProvPhase::TYPING;
+      else if (!strcmp(v,"CLAIM"))          newPhase = ProvPhase::CLAIM;
+      else if (!strcmp(v,"SENDING_CREDS"))  newPhase = ProvPhase::SENDING_CREDS;
+      else if (!strcmp(v,"CONNECTING"))     newPhase = ProvPhase::CONNECTING;
+      else if (!strcmp(v,"DONE"))           newPhase = ProvPhase::DONE;
+      else                                   newPhase = ProvPhase::IDLE;
+
+      setPhase(newPhase);
+
+      // Étend le feedback LED jaune dès le début du process de provisioning
+      if (newPhase != ProvPhase::IDLE && newPhase != ProvPhase::DONE) {
+        ledOnProvisioningStart();
+      }
+
       provisioningSetStatus("{\"status\":\"phase_ok\"}");
       continue;
     }

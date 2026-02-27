@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <ArduinoJson.h>
 
 // ========= Message de publication =========
 // AVANT
@@ -33,3 +34,12 @@ String mqtt_topic_telemetry();                    // base + "/telemetry"
 
 // Emit telemetry event (enqueued; payload: type, fw_version, device_id, ts, context)
 bool mqtt_telemetry_emit(const char* type, const char* context_json);
+
+// ---------- Control API (used by mqtt_ctrl after validation) ----------
+void mqtt_bus_publish_control_ack(const char* type, bool ok, const char* reason = nullptr);
+void mqtt_bus_clear_control_retained();
+void mqtt_bus_handle_set_wifi(const JsonDocument& j);
+void mqtt_bus_handle_update();
+void mqtt_bus_handle_set_night_mode(const JsonDocument& j);
+void mqtt_bus_handle_forget_wifi(const JsonDocument& j);
+void mqtt_bus_handle_factory_reset(const JsonDocument& j);
