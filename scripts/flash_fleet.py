@@ -105,11 +105,14 @@ def pio_build(pio_exe, env_name, cwd):
         raise RuntimeError(f"Build échoué ({code})")
     print(f"[{now()}] Build OK")
 
-def pio_upload_one(pio_exe, env_name, port, cwd):
+def pio_upload_one(pio_exe, env_name, port, cwd, variant=None):
     # 1. On prépare une copie de l'environnement actuel
     my_env = os.environ.copy()
     # 2. On active notre "Cheat Code" pour geler le timestamp
     my_env["PIO_UPLOAD_ONLY"] = "1"
+    if variant:
+        # Transmet le variant au hook post_upload_register.py
+        my_env["DEVICE_VARIANT"] = variant
     
     cmd = [
         pio_exe, 
@@ -149,6 +152,11 @@ def main():
         nargs="*",
         default=["cp210"],
         help="Filtre: conserve seulement les devices dont (port/desc/hwid) contient un de ces mots (ex: CP210 CH340)",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=["STD", "PREMIUM"],
+        help="Variant matériel des devices flashés dans cette flotte (STD ou PREMIUM). Transmis au backend pour la calibration température.",
     )
 
     parser.add_argument(
@@ -199,7 +207,7 @@ def main():
     failed = []
 
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        futs = {ex.submit(pio_upload_one, args.pio_exe, args.env, p, cwd): p for p in ports}
+        futs = {ex.submit(pio_upload_one, args.pio_exe, args.env, p, cwd, args.variant): p for p in ports}
 
         for fut in as_completed(futs):
             port = futs[fut]
