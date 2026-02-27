@@ -1,4 +1,5 @@
 #include "mqtt_bus.h"
+#include "mqtt_ctrl.h"
 #include "../core/log.h"
 #include <Arduino.h>
 #include <WiFi.h>
@@ -255,6 +256,14 @@ static void publish_control_ack(const char* type, bool ok, const char* reason=nu
   s_mqtt.publish(mqtt_topic_status().c_str(), s.c_str(), false);
 }
 
+void mqtt_bus_publish_control_ack(const char* type, bool ok, const char* reason) {
+  publish_control_ack(type, ok, reason);
+}
+void mqtt_bus_clear_control_retained() {
+  s_mqtt.publish(mqtt_topic_ctrl().c_str(), "", true);
+  s_mqtt.loop();
+}
+
 static void handleSetWifi(const JsonDocument& j){
   String err;
   bool ok = applyWifiPrefsFromJson(j, err);
@@ -272,10 +281,7 @@ static void handleSetWifi(const JsonDocument& j){
   eapAnon      = prefs.getString("eapAnon", "");
   prefs.end();
 
-  // Efface le retained sur /control AVANT coupure Wi-Fi
-  String ctrlTopic = mqtt_topic_ctrl();
-  s_mqtt.publish(ctrlTopic.c_str(), "", true);  // clear retained
-  s_mqtt.loop();
+  mqtt_bus_clear_control_retained();
   delay(50);
 
   // Laisse la couche Wi-Fi se reconnecter via ton flux existant
@@ -284,6 +290,100 @@ static void handleSetWifi(const JsonDocument& j){
   needToConnectWiFi = true;
   updateLedState(LED_BOOT);
 }
+
+void mqtt_bus_handle_set_wifi(const JsonDocument& j) { handleSetWifi(j); }
+
+static void handleUpdate() {
+  LOGI("OTA", "Trigger via MQTT");
+  otaSetInProgress(true);
+  xTaskCreatePinnedToCore([](void*) {
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    checkAndPerformCloudOTA();
+    otaSetInProgress(false);
+    vTaskDelete(NULL);
+  }, "OTA_TASK", 8192, NULL, 1, NULL, 0);
+}
+void mqtt_bus_handle_update() { handleUpdate(); }
+
+static void handleSetNightMode(const JsonDocument& j) {
+  const char* mode = j["mode"] | "auto";
+  int v = 0;
+  if (strcmp(mode, "on") == 0) v = 1;
+  else if (strcmp(mode, "off") == 0) v = 2;
+  ledSetNightModeOverride(v);
+  publish_control_ack("set_night_mode", true);
+}
+void mqtt_bus_handle_set_night_mode(const JsonDocument& j) { handleSetNightMode(j); }
+
+static void handleForgetWifi(const JsonDocument& j) {
+  uint64_t cmdTs = j["ts"] | 0ULL;
+  const char* cmdId = j["cmdId"] | "";
+  Preferences pGuard;
+  uint64_t lastTs = 0;
+  String lastId = "";
+  if (pGuard.begin("myApp", true)) {
+    lastTs = pGuard.getULong64("forget_ts", 0ULL);
+    lastId = pGuard.getString("forget_id", "");
+    pGuard.end();
+  }
+  if ((cmdId[0] && lastId == cmdId) || (cmdTs && cmdTs <= lastTs)) {
+    publish_control_ack("forget_wifi", true, "ignored_duplicate");
+    return;
+  }
+  if (pGuard.begin("myApp", false)) {
+    pGuard.putULong64("forget_ts", cmdTs ? cmdTs : (uint64_t)time(nullptr) * 1000ULL);
+    if (cmdId[0]) pGuard.putString("forget_id", cmdId);
+    pGuard.end();
+  }
+  Preferences p;
+  if (p.begin("myApp", false)) {
+    p.putUInt("wifiAuthType", (uint32_t)WIFI_CONN_PSK);
+    p.putString("wifiSSID", "");
+    p.putString("wifiPassword", "");
+    p.putString("eapUsername", "");
+    p.putString("eapPassword", "");
+    p.putString("eapIdentity", "");
+    p.putString("eapAnon", "");
+    p.end();
+  }
+  prefs.begin("myApp", true);
+  wifiSSID     = prefs.getString("wifiSSID", "");
+  wifiPassword = prefs.getString("wifiPassword", "");
+  wifiAuthType = (WifiAuthType)prefs.getUInt("wifiAuthType", (uint32_t)WIFI_CONN_PSK);
+  eapIdentity  = prefs.getString("eapIdentity", "");
+  eapUsername  = prefs.getString("eapUsername", "");
+  eapPassword  = prefs.getString("eapPassword", "");
+  eapAnon      = prefs.getString("eapAnon", "");
+  prefs.end();
+  publish_control_ack("forget_wifi", true);
+  publish_status_retained("erasing", "forget_wifi");
+  mqtt_bus_clear_control_retained();
+  delay(80);
+  mqtt_flush(200);
+  s_mqtt.disconnect();
+  WiFi.disconnect(true, true);
+  updateLedState(LED_PAIRING);
+  delay(120);
+  ESP.restart();
+}
+void mqtt_bus_handle_forget_wifi(const JsonDocument& j) { handleForgetWifi(j); }
+
+static void handleFactoryReset(const JsonDocument& j) {
+  (void)j;
+  LOGI("RESET", "Factory reset via MQTT");
+  DynamicJsonDocument ack(128);
+  ack["ack"] = "factory_reset";
+  ack["ok"] = true;
+  String out;
+  serializeJson(ack, out);
+  s_mqtt.publish(mqtt_topic_status().c_str(), out.c_str(), false);
+  g_factoryResetPending = true;
+  xTaskCreatePinnedToCore([](void*) {
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    vTaskDelete(NULL);
+  }, "FACTORY_RESET", 4096, NULL, 1, NULL, 0);
+}
+void mqtt_bus_handle_factory_reset(const JsonDocument& j) { handleFactoryReset(j); }
 
 // ======= Callback message (CTRL/OTA) =======
 static void onMqttMessage(char* topic, uint8_t* payload, unsigned int len) {
@@ -319,120 +419,8 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int len) {
     
     if (!action[0]) return;
 
-    if (strcmp(action, "set_wifi")==0) { handleSetWifi(j); return; }
-
-    if (strcmp(action, "update")==0) {
-        LOGI("OTA", "Trigger via MQTT");
-        otaSetInProgress(true); // ← pause immédiate de la tâche MQTT
-        xTaskCreatePinnedToCore([](void*){
-        vTaskDelay(100/portTICK_PERIOD_MS);
-        checkAndPerformCloudOTA();
-        otaSetInProgress(false);
-        vTaskDelete(NULL);
-      }, "OTA_TASK", 8192, NULL, 1, NULL, 0);
-      return;
-    }
-    if (strcmp(action, "set_night_mode")==0) {
-      const char* mode = j["mode"] | "auto";
-      int v = 0;
-      if (strcmp(mode, "on")==0) v = 1;
-      else if (strcmp(mode, "off")==0) v = 2;
-      ledSetNightModeOverride(v);
-      publish_control_ack("set_night_mode", true);
-      return;
-    }
-    if (strcmp(action, "forget_wifi")==0) {
-      // —— Idempotence guard
-      uint64_t cmdTs = j["ts"] | 0ULL;
-      const char* cmdId = j["cmdId"] | "";
-
-      Preferences pGuard;
-      uint64_t lastTs = 0;
-      String   lastId = "";
-      if (pGuard.begin("myApp", true)) {
-        lastTs = pGuard.getULong64("forget_ts", 0ULL);
-        lastId = pGuard.getString("forget_id", "");
-        pGuard.end();
-      }
-
-      // If same id or older/equal timestamp, ignore (stale retained)
-      if ((cmdId[0] && lastId == cmdId) || (cmdTs && cmdTs <= lastTs)) {
-        publish_control_ack("forget_wifi", true, "ignored_duplicate");
-        return;
-      }
-
-      // Persist the newest cmd markers BEFORE doing anything destructive
-      if (pGuard.begin("myApp", false)) {
-        pGuard.putULong64("forget_ts", cmdTs ? cmdTs : (uint64_t)time(nullptr)*1000ULL);
-        if (cmdId[0]) pGuard.putString("forget_id", cmdId);
-        pGuard.end();
-      }
-
-      Preferences p;
-      if (p.begin("myApp", false)) {
-        p.putUInt("wifiAuthType", (uint32_t)WIFI_CONN_PSK);
-        p.putString("wifiSSID", "");
-        p.putString("wifiPassword", "");
-        p.putString("eapUsername", "");
-        p.putString("eapPassword", "");
-        p.putString("eapIdentity", "");
-        p.putString("eapAnon", "");
-        p.end();
-      }
-
-      // 2) Recharger les globals RAM (cohérence)
-      prefs.begin("myApp", true);
-      wifiSSID     = prefs.getString("wifiSSID", "");
-      wifiPassword = prefs.getString("wifiPassword", "");
-      wifiAuthType = (WifiAuthType)prefs.getUInt("wifiAuthType",(uint32_t)WIFI_CONN_PSK);
-      eapIdentity  = prefs.getString("eapIdentity", "");
-      eapUsername  = prefs.getString("eapUsername", "");
-      eapPassword  = prefs.getString("eapPassword", "");
-      eapAnon      = prefs.getString("eapAnon", "");
-      prefs.end();
-
-      // 3) ACK immédiat (non retained)
-      publish_control_ack("forget_wifi", true);
-
-      // 4) Publier un état RETAINED "erasing" pour l'app (feedback UX)
-      publish_status_retained("erasing", "forget_wifi");
-
-      // 5) Clear le retained /control pour éviter ré-application post-reboot
-      String ctrlTopic = mqtt_topic_ctrl();
-      s_mqtt.publish(ctrlTopic.c_str(), "", true);
-      s_mqtt.loop();
-      delay(80);
-
-      // 6) Vide au mieux la file de publish utilisateurs
-      mqtt_flush(200);
-
-      // 7) Couper proprement MQTT + Wi-Fi
-      s_mqtt.disconnect();
-      WiFi.disconnect(true, true);
-
-      // 8) LED → pairing (visuel immédiat) puis redémarrage "propre"
-      updateLedState(LED_PAIRING);
-      delay(120);
-      ESP.restart();
-      return;
-    }
-
-    if (strcmp(action, "factory_reset")==0) {
-      LOGI("RESET", "Factory reset via MQTT");
-      DynamicJsonDocument ack(128);
-      ack["ack"]="factory_reset";
-      ack["ok"]=true;
-      String out; serializeJson(ack, out);
-      s_mqtt.publish(mqtt_topic_status().c_str(), out.c_str(), false);
-
-      g_factoryResetPending = true;
-      xTaskCreatePinnedToCore([](void*){
-        vTaskDelay(50/portTICK_PERIOD_MS);
-        // le reset réel est géré dans main (doFactoryResetOnMainLoop)
-        vTaskDelete(NULL);
-      }, "FACTORY_RESET", 4096, NULL, 1, NULL, 0);
-      return;
-    }
+    // Delegate to ctrl module (validation + HMAC + replay + dispatch)
+    mqttCtrlHandleMessage(t.c_str(), (const uint8_t*)msg.c_str(), (unsigned int)msg.length());
     return;
   }
 

@@ -31,3 +31,22 @@ static const char* FW_MANIFEST_URL =
 #define BACKOFF_MQTT_MAX_MS           (5UL * 60UL * 1000UL)
 #define BACKOFF_MQTT_FACTOR           2.0f
 #define BACKOFF_MQTT_JITTER_PERCENT   10
+
+// ---------- Control payload v1 (anti-replay + HMAC) ----------
+#if defined(BREEZLY_PROD)
+#define CTRL_REQUIRE_SIG              1
+#define CTRL_ALLOW_UNSIGNED           0
+#define CTRL_FACTORY_RESET_ENABLED    0
+#else
+#define CTRL_REQUIRE_SIG              0
+#define CTRL_ALLOW_UNSIGNED          1
+#define CTRL_FACTORY_RESET_ENABLED    1
+#endif
+#define CTRL_MAX_SKEW_SEC             (300)
+#define CTRL_CMDID_RING_SIZE          (16)
+#define CTRL_RATE_LIMIT_MIN_MS        (2000UL)   // 1 cmd / 2s
+#define CTRL_RATE_LIMIT_BURST         (3)
+#define CTRL_FACTORY_RESET_REQUIRE_HOLD_MS  (5000)
+#define CTRL_PAYLOAD_MAX_BYTES        (1024)
+#define CTRL_SET_WIFI_SSID_MAX        (64)
+#define CTRL_SET_WIFI_PASSWORD_MAX   (128)
