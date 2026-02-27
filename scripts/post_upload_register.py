@@ -1,6 +1,6 @@
 # scripts/post_upload_register.py
 # Provisionne le device après upload via external_id dérivé du MAC (esptool read_mac).
-
+# --variant STD|PREMIUM
 Import("env")
 import os, re, sys, subprocess, json
 
@@ -78,6 +78,16 @@ def after_upload(target, source, env):
     factory = env.GetProjectOption("custom_factory_token") or os.environ.get("FACTORY_TOKEN", "")
     devkey  = env.GetProjectOption("custom_device_key_b64") or os.environ.get("DEVICE_KEY_B64", "")
 
+    # Variant du device : optionnelle.
+    # 1) Si définie dans platformio.ini (custom_device_variant), on l'utilise.
+    # 2) Sinon on lit DEVICE_VARIANT passée par flash_fleet.py ou l'environnement.
+    try:
+        variant = env.GetProjectOption("custom_device_variant")
+    except Exception:
+        variant = None
+    if not variant:
+        variant = os.environ.get("DEVICE_VARIANT", "")
+
     if not factory:
         raise RuntimeError("FACTORY token manquant (custom_factory_token / FACTORY_TOKEN)")
     if not devkey:
@@ -86,7 +96,9 @@ def after_upload(target, source, env):
     mac = read_mac(port)
     if not mac:
         raise RuntimeError("Impossible de lire le MAC (esptool)")
-    external_id = f"PROV_{reverse_pairs(mac)}"
+    # On aligne strictement l'external_id sur le buildExternalId() du firmware :
+    # PROV_ + MAC dans l'ordre renvoyé par esptool/read_mac et esp_read_mac.
+    external_id = f"PROV_{mac}"
     print(f"[post-upload] external_id pour provision: {external_id}")
 
     payload = {
@@ -96,6 +108,8 @@ def after_upload(target, source, env):
         "type": "temperature",
         "location": "Bureau"
     }
+    if variant:
+        payload["variant"] = variant
 
     cmd = [
         sys.executable, "-c",
