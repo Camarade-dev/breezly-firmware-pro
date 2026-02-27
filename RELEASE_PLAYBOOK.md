@@ -9,6 +9,7 @@ Procédure minimale pour une release firmware commerciale.
 - **Fichier:** `src/app_config.h`
 - **Définition:** `#define CURRENT_FIRMWARE_VERSION "x.y.zz"`
 - **Règle:** Incrémenter avant chaque release (ex. `1.0.21` → `1.0.22` pour correctif, `1.1.0` pour feature).
+- **Backoff Wi‑Fi/MQTT:** Mêmes fichiers; paramètres `BACKOFF_WIFI_*` et `BACKOFF_MQTT_*` (min/max/factor/jitter, auth_fail_min). Simulation: build avec `-DBACKOFF_SIM_TEST` (env `esp32-wroom-32e-prod-backoff-sim`).
 
 ---
 

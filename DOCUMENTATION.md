@@ -11,7 +11,7 @@ Dernière mise à jour : 2026-02-27
 |--------|------|
 | **Version firmware** | `1.0.25` (définie dans `src/app_config.h`) |
 | **P0 (Commercial ready)** | **Validé** — Build prod, flash, boot, WiFi, BLE provisioning, MQTT, publish capteurs, OTA (manifest + fallback backend + download 3 streams), OTA rollback safe, secrets hors repo, recovery flash manuel. Tous les tests terrain du tableau ci-dessous sont OK. |
-| **Ensuite (P1)** | Backoff exponentiel Wi‑Fi/MQTT, APP_ENV_DEV (manifest dev/prod), état OTA unifié (suppression variable globale), procédure factory/EOL documentée et exécutée. Reset reason : déjà envoyé en télémétrie MQTT (FW_BOOT, FW_REBOOT_LOOP) ; log Serial au boot optionnel non fait. |
+| **P1 (en cours)** | **Backoff exponentiel Wi‑Fi/MQTT : implémenté** (voir § Backoff). Reste : APP_ENV_DEV (manifest dev/prod), état OTA unifié (suppression variable globale), procédure factory/EOL documentée et exécutée. Reset reason : déjà en télémétrie MQTT (FW_BOOT, FW_REBOOT_LOOP). |
 | **P2** | Logs par niveau, timeout I2C/reset bus capteurs, sanity checks AQI/TVOC/eCO2 avant publish. |
 
 *Pour le détail des validations : tableau « Validation terrain » et section « GO/NO-GO shipping ».*
@@ -25,7 +25,7 @@ Dernière mise à jour : 2026-02-27
 3. **Grep** : aucune occurrence de patterns sensibles (échantillons internes non affichés) dans le repo. setInsecure présent uniquement dans sntp_utils.cpp (fallback HTTP Date, pas OTA). Pas de clé privée OTA dans le repo (uniquement clé publique dans ota.cpp).
 4. **Build prod** exige `secrets.ini` dans esp32_wroom_32e (ou variables d’env). Commande : `cd esp32_wroom_32e && pio run -e esp32-wroom-32e-prod`.
 5. **GO/NO-GO** et **Validation terrain** : tableaux ci-dessous ; à cocher après tests réels. Critères OK/KO et procédures sont définis pour reproductibilité.
-6. **Ce qui manque** (P1/P2) : backoff exponentiel Wi‑Fi/MQTT, APP_ENV_DEV (manifest dev/prod), état OTA unifié, procédure factory/EOL, logs par niveau. Reset reason : déjà en télémétrie MQTT (FW_BOOT, FW_REBOOT_LOOP). Détail en section « Ce qui manque encore ».
+6. **Ce qui manque** (P1/P2) : APP_ENV_DEV (manifest dev/prod), état OTA unifié, procédure factory/EOL, logs par niveau. **Backoff exponentiel Wi‑Fi/MQTT : implémenté** (voir § Backoff). Reset reason : déjà en télémétrie MQTT (FW_BOOT, FW_REBOOT_LOOP). Détail en section « Ce qui manque encore ».
 7. **Docs détaillées** (audit, playbook, factory, preuves P0) en annexe uniquement.
 
 ---
@@ -62,6 +62,7 @@ Dernière mise à jour : 2026-02-27
 | OTA : rollback safe (staging) | Env `esp32-wroom-32e-prod-rollback-test` : OTA vers firmware qui simule 3 boots en échec | Rollback vers partition précédente ; 4ᵉ boot = ancienne app ; pas de ré-install à l’infini | Brick ou boucle sans recovery | OK | Serial : 3× simulate failed boot → Too many failed boots → rollback ; Rollback target: clear pending ; au check OTA suivant : « skip: version 1.0.23 was rolled back (reject re-install) » | PROV_80BAD0215788 | — | 2026-02 |
 | Secrets : build sans repo | Vérifier .gitignore (esp32 + backend) et `git status` : aucun fichier secret suivi | secrets.ini, devkey.h, mqtt_secrets.h (esp32) et ec_private.pem / ec_public.pem (backend) dans .gitignore | Secrets commités | OK | esp32_wroom_32e/.gitignore : secrets.ini, src/core/devkey.h, src/net/mqtt_secrets.h, .last_build_sig ; back-end-breezly/.gitignore : tools/ec_private.pem, tools/ec_public.pem. Vérifier en local : `git status` ne doit pas lister ces fichiers. | — | — | 2026-02 |
 | Recovery : flash manuel | `pio run -e esp32-wroom-32e-prod -t upload --upload-port COMx` ou esptool `write_flash 0x10000 firmware.bin` | Flash OK ; device boot sur image flashée | Échec write_flash ou boot | OK | Upload SUCCESS ; Wrote 1446256 bytes at 0x00010000 ; Hash verified ; post-upload register OK | PROV_80BAD0215788 | — | 2026-02 |
+| Backoff Wi‑Fi / MQTT | Mauvais mdp Wi‑Fi : observer Serial `[WiFi] fail reason=... backoff next in XXX ms` (délais croissants, auth_fail ≥ 30 s). Broker down : observer `[MQTT] backoff next in XXX ms`. Wi‑Fi down puis up : retries Wi‑Fi en backoff ; MQTT reprend après Wi‑Fi OK. | Délais non fixes ; pas de spam ; reset après succès | Délais fixes ou boucle agressive | À remplir | — | — | — | — |
 
 *Post-upload (provisioning)* : le script `post_upload_register.py` attend après le flash que le device boot et envoie sur la série la ligne `BREEZLY_EXTERNAL_ID=PROV_xxxx` (même valeur que le nom BLE). Ainsi l’external_id utilisé pour le provisioning est toujours celui du device flashé, y compris en téléversement parallèle ou si le port esptool lit un autre device. Si cette ligne n’est pas reçue (timeout ou `pyserial` absent), fallback sur `esptool read_mac` (avec risque de décalage port/device). Optionnel : `pip install pyserial` pour activer la lecture série.
 
@@ -76,6 +77,7 @@ Dernière mise à jour : 2026-02-27
 5. **Wi‑Fi OK** — Connexion établie (Serial : [WiFi] OK IP=...). *Validé 2026-02.*
 6. **MQTT status + 1 trame capteur** — Connect, LWT, au moins un message status et une trame qualite_air. *Validé 2026-02 (HiveMQ, topic prod/capteurs/qualite_air).*
 7. **(Option) OTA staging** — Bump version, manifest à jour ; déclencher OTA ; reboot ; version visible. *OTA validé : backend sert manifest + .bin (3 streams). Rollback safe validé : env rollback-test → 3 reboots → rollback → « skip: version X was rolled back » au check suivant.*
+8. **(Option) Backoff** — Mauvais mdp Wi‑Fi ou broker MQTT down : vérifier en Serial que les délais de retry augmentent (backoff) et ne restent pas fixes. *Voir § Backoff et tableau Validation terrain.*
 
 ---
 
@@ -273,7 +275,7 @@ Le script écrit dans `breezly-firmware-dist/...` et dans `back-end-breezly/publ
 
 | Priorité | Item | État code | Test validé |
 |----------|------|-----------|-------------|
-| P1 | Backoff exponentiel Wi‑Fi / MQTT | Non implémenté (délais fixes : 15 s Wi‑Fi, 8 s MQTT dans mqtt_bus.cpp) | — |
+| P1 | Backoff exponentiel Wi‑Fi / MQTT | **Implémenté** : `src/core/backoff.h` + intégration wifi_connect, mqtt_bus ; paramètres dans `app_config.h`. Simulation : env `esp32-wroom-32e-prod-backoff-sim`. | À valider terrain (mauvais mdp Wi‑Fi, broker down, Wi‑Fi down puis up). |
 | P1 | Reset reason au boot | **Partiel** : télémétrie MQTT OK (FW_BOOT : reset_reason, boot_count, brownout_flag ; FW_REBOOT_LOOP : lastResetReason). Log Serial au boot non fait. | Télémétrie OK |
 | P1 | État OTA unifié (otaIsInProgress partout, suppression variable globale otaInProgress) | Partiel : `otaIsInProgress()` utilisé dans sleep.h, main.cpp, mqtt_bus.cpp ; variable globale `g_otaInProgress` toujours dans ota.cpp | — |
 | P1 | Procédure factory + EOL exécutée et consignée | Doc présente (FACTORY_E2E_CHECKLIST) | À remplir |
@@ -281,6 +283,57 @@ Le script écrit dans `breezly-firmware-dist/...` et dans `back-end-breezly/publ
 | P2 | Logs par niveau (LOG_LEVEL), pas de Serial.println(payload) en prod | Non implémenté | — |
 | P2 | Timeout I2C + reset bus capteurs après N échecs | Non implémenté | — |
 | P2 | Sanity checks AQI/TVOC/eCO2 avant publish | Non implémenté | — |
+
+---
+
+## Backoff exponentiel (Wi‑Fi / MQTT)
+
+Module générique de backoff exponentiel avec jitter, utilisé pour les reconnexions Wi‑Fi et MQTT. Comportement non bloquant, overflow-safe pour `millis()`, configurable et réutilisable (ex. HTTP futur).
+
+### Architecture
+
+| Composant | Fichier | Rôle |
+|-----------|---------|------|
+| **Module backoff** | `src/core/backoff.h`, `src/core/backoff.cpp` | Classe `Backoff` : `reset()`, `onFailure(nowMs, effectiveMinMs)`, `shouldAttempt(nowMs)`, `getState()`. Policies `wifi_backoff` / `mqtt_backoff` (raisons → effectiveMin). |
+| **Configuration** | `src/app_config.h` | Paramètres `BACKOFF_WIFI_*` et `BACKOFF_MQTT_*` (min, max, facteur, jitter, auth_fail_min). |
+| **Intégration Wi‑Fi** | `src/net/wifi_connect.cpp`, `src/main.cpp` | Instance backoff Wi‑Fi ; sur échec `onFailure()` avec policy (auth_fail → min 30 s), sur succès `reset()`. Boucle retry dans `loop()` via `wifiBackoffShouldAttempt()` (si creds valides, pas provisioning, pas OTA). |
+| **Intégration MQTT** | `src/net/mqtt_bus.cpp` | Instance backoff MQTT ; sur échec connect `onFailure()`, sur session établie `reset()`. Condition de retry = `shouldAttempt(millis())`. Pas de retry actif si Wi‑Fi down ou OTA. |
+
+### Paramètres par défaut
+
+| Paramètre | Wi‑Fi | MQTT | Description |
+|-----------|--------|------|-------------|
+| **min** | 1 s | 2 s | Délai minimal après un échec. |
+| **max** | 5 min | 5 min | Plafond du délai (évite boucles agressives). |
+| **facteur** | 2,0 | 2,0 | Progression exponentielle (1s → 2s → 4s → …). |
+| **jitter** | ±10 % | ±10 % | Désynchronisation des devices (évite effet de meute). |
+| **auth_fail min** | 30 s | — | Premier délai en cas d’échec d’authentification Wi‑Fi (évite de marteler la box). |
+
+Modification : éditer les macros dans `src/app_config.h`, puis rebuild.
+
+### Comportement fonctionnel
+
+- **Wi‑Fi** : Retry dans `loop()` uniquement si creds valides (`!s_needProv`), pas d’OTA en cours. En cas d’auth_fail (raison ESP32), le premier délai est au moins 30 s. Reset du backoff à connexion stable (IP + internet OK). Pas de boucle de retry en mode provisioning (pas de creds).
+- **MQTT** : Retry uniquement si Wi‑Fi connecté ; si Wi‑Fi down, la tâche MQTT ne tente pas de connect (pas de spam). Pendant OTA (`otaIsInProgress()`), la tâche MQTT fait `vTaskDelay(100)` sans tentative. Reset du backoff à session MQTT établie (premier connect OK). LWT inchangé.
+- **Overflow** : Comparaisons basées sur `millis()` avec logique overflow-safe (`(now - nextAttemptMs) < 0x80000000u`).
+
+### Simulation (validation des délais)
+
+Pour vérifier la séquence des délais sans device (1s, 2s, 4s, … plafonnée à 5 min) :
+
+```bash
+cd esp32_wroom_32e
+pio run -e esp32-wroom-32e-prod-backoff-sim
+pio run -e esp32-wroom-32e-prod-backoff-sim -t upload
+pio device monitor -b 115200
+```
+
+Au boot, la fonction `backoff_run_simulation()` imprime une série de lignes `[BACKOFF_SIM] attempt N delay XXX ms`. Compilation avec le flag `BACKOFF_SIM_TEST` (env dédié ci-dessus).
+
+### Références
+
+- Spécification détaillée et checklist : [FIRMWARE_PRODUCTION_READINESS_AUDIT.md](FIRMWARE_PRODUCTION_READINESS_AUDIT.md) (§ 2 Réseau, § 5.1 Wi‑Fi/MQTT).
+- Paramètres release : [RELEASE_PLAYBOOK.md](RELEASE_PLAYBOOK.md) (§ 1).
 
 ---
 

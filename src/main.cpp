@@ -13,6 +13,7 @@
 #include <WiFi.h>
 #include "esp_wifi.h"
 #include "net/wifi_connect.h"
+#include "core/backoff.h"
 #include "esp_task_wdt.h"
 #include <ArduinoJson.h>
 #include "core/devkey_runtime.h"
@@ -84,7 +85,7 @@ static inline void twdtResetSafe(){
 
 static volatile bool s_otaBootTaskScheduled = false;
 static volatile bool s_otaTickTaskScheduled = false;
-static const unsigned long WIFI_RETRY_BACKOFF_MS = 15000; // 15s
+static bool s_needProv = false;  // besoin provisioning BLE (pas de creds valides) — set in setup
 static const uint8_t WIFI_FAILS_BEFORE_PROV = 1;          // dès le 1er échec, on ouvre BLE
 
 // --- Trampo pour init BLE sur core 0 ---
@@ -243,6 +244,10 @@ void setup(){
   delay(500);
   Serial.begin(115200);
 
+#if defined(BACKOFF_SIM_TEST)
+  backoff_run_simulation();
+#endif
+
 #if FACTORY_RESET_ON_FLASH
   resetWifiOnEveryFlash();
 #endif
@@ -308,6 +313,7 @@ void setup(){
   Serial.printf("SID : %s\n", sensorId.c_str());
   Serial.printf("UID : %s\n", userId.c_str());
   Serial.println("-----------------");
+  s_needProv = needProv;
   setupBLE(needProv);  // ← démarre BLE tout de suite si provisioning requis
 
   // (optionnel) attendre un peu:
@@ -412,6 +418,18 @@ void loop(){
     Serial.println("[WiFi] tentative suite à nouveaux identifiants (BLE)");
     twdtResetSafe();
     connectToWiFi(); // échec => restartBLEAdvertising() à l'intérieur comme avant
+    twdtResetSafe();
+    if (wifiConnected) {
+      mqtt_request_connect();
+    }
+  }
+
+  // Retry Wi‑Fi avec backoff exponentiel (si creds valides, pas en provisioning, pas OTA)
+  if (!wifiConnected && !s_needProv && !g_factoryResetPending && !otaIsInProgress()
+      && wifiBackoffShouldAttempt()) {
+    lastWifiAttemptMs = millis();
+    twdtResetSafe();
+    connectToWiFi();
     twdtResetSafe();
     if (wifiConnected) {
       mqtt_request_connect();
