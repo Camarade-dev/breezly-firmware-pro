@@ -253,9 +253,8 @@ void setup(){
     
 
   ledInit(LED_PIN, LED_COUNT);
-  
   updateLedState(LED_BOOT);
-  
+  ledOnBoot();
 
   WiFi.disconnect(true);
   prefs.begin("myApp", true);
@@ -309,7 +308,6 @@ void setup(){
   Serial.printf("SID : %s\n", sensorId.c_str());
   Serial.printf("UID : %s\n", userId.c_str());
   Serial.println("-----------------");
-  updateLedState(LED_PAIRING);
   setupBLE(needProv);  // ← démarre BLE tout de suite si provisioning requis
 
   // (optionnel) attendre un peu:
@@ -331,14 +329,12 @@ void setup(){
   // 2) Tenter la connexion Wi-Fi immédiate si on a des identifiants
   //    (en cas d’échec, connectToWiFi() s’occupe de relancer l’advertising BLE)
   if (!missingCreds) {
-    updateLedState(LED_PAIRING);
     Serial.println("Tentative de connexion avec les identifiants sauvegardés...");
     connectToWiFi();
   }
 
   // 3) Si provisioning nécessaire : LED pairing + attente jusqu’à connexion Wi-Fi
   if (needProv) {
-    updateLedState(LED_PAIRING);
     Serial.println("En attente provisioning BLE (non-bloquant)...");
     // NE PAS bloquer ici. loop() s'occupe d'appeler connectToWiFi()
   }
@@ -348,7 +344,6 @@ void setup(){
   // mqtt_request_connect();
 
   Serial.println("[BOOT] Setup terminé");
-  updateLedState(LED_BOOT);
   lastWifiAttemptMs = millis();
 }
 
@@ -419,10 +414,7 @@ void loop(){
     connectToWiFi(); // échec => restartBLEAdvertising() à l'intérieur comme avant
     twdtResetSafe();
     if (wifiConnected) {
-      updateLedState(LED_BOOT);
       mqtt_request_connect();
-    } else {
-      updateLedState(LED_PAIRING);
     }
   }
 
@@ -579,7 +571,6 @@ void loop(){
     if (!otaIsInProgress() && !g_factoryResetPending && mqtt_is_connected()){
       // Exemple : si nuit et rien à faire pendant 2 minutes -> deep sleep
         pmsSleep();
-        updateLedState(LED_BOOT); // fixe une couleur discrète avant dodo
         deepSleepForMs(120000);
     }
   #endif

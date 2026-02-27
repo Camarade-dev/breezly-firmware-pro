@@ -18,6 +18,18 @@ static float s_idlePhase = 0.0f;
 
 // Phase dédiée au dégradé BLE pairing (rotation de teinte)
 static float s_pairPhase = 0.0f;
+// Phase respiration lente pour BOOT (vague douce, pas bip)
+static float s_bootPhase = 0.0f;
+static const float BOOT_BREATHE_PERIOD_MS = 4000.0f;
+
+// --- Installation + priorité (minimal, non bloquant) ---
+static volatile bool s_installFinished = false;
+static volatile bool s_userActivitySeen = false;
+static volatile uint32_t s_silentDeadlineMs = 0;
+static volatile uint32_t s_highPriorityUntilMs = 0;
+static volatile bool s_connectedConfirmPending = false;
+static const uint32_t SILENT_TIMEOUT_MS = 120000;
+static const uint32_t CONNECTED_CONFIRM_MS = 3000;
 
 // ------------------------------------------------------------------
 // Init
@@ -45,6 +57,47 @@ void ledResume(){
 }
 
 // Pas de changement : tu peux toujours surcharger via ledOverride
+static bool isHighPriorityActive(){
+  uint32_t now = millis();
+  if (s_highPriorityUntilMs != 0 && now < s_highPriorityUntilMs) return true;
+  if (s_installFinished) return false;
+  LedMode m = currentLedMode;
+  return (m == LED_BOOT || m == LED_PAIRING || m == LED_BAD || m == LED_UPDATING);
+}
+
+static void enterHighPriority(LedMode mode, uint32_t durationMs){
+  if (!ledOverride) currentLedMode = mode;
+  if (durationMs > 0) {
+    s_highPriorityUntilMs = millis() + durationMs;
+    if (mode == LED_GOOD) s_connectedConfirmPending = true;
+  }
+}
+
+void ledOnBoot(){
+  s_installFinished = false;
+  s_userActivitySeen = false;
+  s_silentDeadlineMs = millis() + SILENT_TIMEOUT_MS;
+  s_highPriorityUntilMs = 0;
+  s_connectedConfirmPending = false;
+  if (!ledOverride) currentLedMode = LED_BOOT;
+}
+
+void ledOnProvisioningStart(){
+  s_userActivitySeen = true;
+  s_silentDeadlineMs = 0;
+  if (!ledOverride) currentLedMode = LED_PAIRING;
+}
+
+void ledOnProvisioningError(){
+  if (!ledOverride) currentLedMode = LED_BAD;
+}
+
+void ledOnConnectedOk(){
+  uint32_t now = millis();
+  if (s_highPriorityUntilMs != 0 && now < s_highPriorityUntilMs) return;
+  enterHighPriority(LED_GOOD, CONNECTED_CONFIRM_MS);
+}
+
 void updateLedState(LedMode mode){
   if (!ledOverride) currentLedMode = mode;
 }
@@ -52,6 +105,7 @@ void updateLedState(LedMode mode){
 // NEW : à appeler quand tu viens de publier les données capteur
 void ledNotifyPublish(){
   if (s_ledMuted) return;
+  if (isHighPriorityActive()) return;
   // simple flag : la tâche LED déclenche l’anim en temps réel
   s_pulseRequested = true;
 }
@@ -87,11 +141,8 @@ void ledSetAirQualityScore(float score01){
   if (score01 < 0.0f) score01 = 0.0f;
   if (score01 > 1.0f) score01 = 1.0f;
   s_airScore01 = score01;
-
-  // On réutilise LED_GOOD comme "mode affichage qualité air"
-  if (!ledOverride) {
-    currentLedMode = LED_GOOD;
-  }
+  if (isHighPriorityActive()) return;
+  if (!ledOverride) currentLedMode = LED_GOOD;
 }
 
 // HSV → RGB (h,s,v ∈ [0,1])
@@ -130,11 +181,11 @@ static void hsvToRgb(float h, float s, float v, uint8_t &r, uint8_t &g, uint8_t 
 // Donne la couleur de base (sans anim) pour chaque mode
 static void baseColorForMode(LedMode mode, uint8_t &r, uint8_t &g, uint8_t &b){
   switch (mode){
-    case LED_BOOT:      // bleu doux
-      r = 10;  g = 40;  b = 120;  break;
+    case LED_BOOT:      // bleu puissant (respiration)
+      r = 30;  g = 100; b = 255;  break;
 
-    case LED_PAIRING:   // sera overridé plus bas par le gradient BLE
-      r = 10;  g = 60;  b = 180;  break;
+    case LED_PAIRING:   // jaune 1 Hz (setup)
+      r = 220; g = 180; b = 0;    break;
 
     case LED_GOOD: {
       // Ici : "GOOD" = affichage continu de la qualité d’air
@@ -192,6 +243,21 @@ static void ledTask(void *){
     if (dt > 50) dt = 50;        // clamp pour éviter gros sauts si pause
     lastMs = now;
 
+    if (s_highPriorityUntilMs != 0 && now >= s_highPriorityUntilMs) {
+      s_highPriorityUntilMs = 0;
+      if (s_connectedConfirmPending) {
+        s_installFinished = true;
+        s_connectedConfirmPending = false;
+        if (!ledOverride) currentLedMode = LED_GOOD;
+      } else {
+        if (!ledOverride) currentLedMode = LED_OFF;
+      }
+    }
+    if (!s_installFinished && !s_userActivitySeen && s_silentDeadlineMs != 0 && now > s_silentDeadlineMs) {
+      s_silentDeadlineMs = 0;
+      if (!ledOverride) currentLedMode = LED_OFF;
+    }
+
     // 1) Gestion du temps d’anim
     const float idleSpeed = 2.0f * PI / 2600.0f;   // période ~2.6s
     s_idlePhase += idleSpeed * (float)dt;
@@ -201,6 +267,10 @@ static void ledTask(void *){
     const float pairSpeed = 2.0f * PI / 4500.0f;   // ~4.5s pour un cycle
     s_pairPhase += pairSpeed * (float)dt;
     if (s_pairPhase > 2.0f * PI) s_pairPhase -= 2.0f * PI;
+
+    const float bootSpeed = 2.0f * PI / BOOT_BREATHE_PERIOD_MS;
+    s_bootPhase += bootSpeed * (float)dt;
+    if (s_bootPhase > 2.0f * PI) s_bootPhase -= 2.0f * PI;
 
     // 2) Gestion de la pulse
     if (s_pulseRequested){
@@ -215,19 +285,11 @@ static void ledTask(void *){
     uint8_t baseR, baseG, baseB;
     LedMode mode = currentLedMode;
     baseColorForMode(mode, baseR, baseG, baseB);
-
-    // >>> Spécial LED_PAIRING : dégradé bleu/cyan/violet premium
-    if (mode == LED_PAIRING){
-      // hNorm centré sur ~0.58 (bleu) avec un petit range
-      // ça oscille grosso modo entre cyan-ish et violet-ish
-      float hNorm = 0.58f + 0.10f * sinf(s_pairPhase);   // [0.48 ; 0.68]
-      float sat   = 0.55f;  // saturation modérée
-      float val   = 1.00f;  // value max, on gère la luminosité avec baseFactor
-
-      hsvToRgb(hNorm, sat, val, baseR, baseG, baseB);
+    bool connectedConfirmActive = (s_highPriorityUntilMs != 0 && now < s_highPriorityUntilMs && mode == LED_GOOD);
+    if (connectedConfirmActive) {
+      baseR = 0; baseG = 200; baseB = 0;
     }
 
-    // === A) Intensité "respiration" de base ========================
     // === A) Intensité "respiration" de base ========================
     float baseFactor = 1.0f;
 
@@ -241,28 +303,28 @@ static void ledTask(void *){
       baseFactor = 0.30f + 0.20f * (0.5f * (1.0f - cosf(s_idlePhase)));
       // ~0.30 → 0.50
     } else if (mode == LED_PAIRING){
-      // Pairing un peu vivant mais quand même calmé
-      baseFactor = 0.30f + 0.18f * (0.5f * (1.0f - cosf(s_idlePhase)));
-      // ~0.30 → 0.48
+      float blink1Hz = (float)(now % 1000) / 1000.0f;
+      baseFactor = (blink1Hz < 0.5f) ? 0.45f : 0.12f;
     } else if (mode == LED_BOOT){
-      // Boot fixe mais plus doux
-      baseFactor = 0.30f;
+      baseFactor = 0.55f + 0.40f * (0.5f * (1.0f - cosf(s_bootPhase)));
     } else { // LED_OFF ou autres
       baseFactor = 0.0f;
     }
 
+    if (connectedConfirmActive) baseFactor = 0.65f;
 
-    // Petit jitter très léger pour BAD
     if (mode == LED_BAD && baseFactor > 0.0f){
-      float noise  = (float)(now % 157) / 157.0f;
-      float jitter = 0.97f + 0.03f * (noise - 0.5f);
-      baseFactor  *= jitter;
+      float blink4Hz = (float)(now % 250) / 250.0f;
+      baseFactor *= (blink4Hz < 0.5f) ? 0.85f : 0.25f;
     }
+
+    bool highPriority = (s_highPriorityUntilMs != 0 && now < s_highPriorityUntilMs)
+      || (!s_installFinished && (mode == LED_BOOT || mode == LED_PAIRING || mode == LED_BAD || mode == LED_UPDATING));
 
     // === B) Pulse : bump AU-DESSUS de la respiration ==============
     float factor = baseFactor;
 
-    if (mode == LED_GOOD || mode == LED_MODERATE || mode == LED_BAD){
+    if (!highPriority && (mode == LED_GOOD || mode == LED_MODERATE || mode == LED_BAD)){
       float env = 0.0f;
       if (s_pulseT < 1.0f){
         env = pulseEnvelope(s_pulseT);   // 0 → 1 → 0

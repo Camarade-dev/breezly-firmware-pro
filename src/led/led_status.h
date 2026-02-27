@@ -11,3 +11,9 @@ void ledResume();    // relance après OTA
 bool ledIsMuted();   // (optionnel)
 void ledNotifyPublish();
 void ledSetAirQualityScore(float score01);
+
+// Installation UX (priorité haute, non écrasée par pulse/air)
+void ledOnBoot();              // bleu + timer silent 2 min
+void ledOnProvisioningStart(); // annule silent, jaune 1 Hz
+void ledOnProvisioningError(); // rouge 4 Hz
+void ledOnConnectedOk();       // vert 3 s puis OFF, installFinished

@@ -1,18 +1,31 @@
 # Documentation globale — Breezly / Multiagent
 
 **Une seule page de vérité : statut firmware, preuves, tests, GO/NO-GO, manques.**  
-Dernière mise à jour : 2026-02
+Dernière mise à jour : 2026-02-27
+
+---
+
+## Où on en est (état actuel)
+
+| Élément | État |
+|--------|------|
+| **Version firmware** | `1.0.25` (définie dans `src/app_config.h`) |
+| **P0 (Commercial ready)** | **Validé** — Build prod, flash, boot, WiFi, BLE provisioning, MQTT, publish capteurs, OTA (manifest + fallback backend + download 3 streams), OTA rollback safe, secrets hors repo, recovery flash manuel. Tous les tests terrain du tableau ci-dessous sont OK. |
+| **Ensuite (P1)** | Backoff exponentiel Wi‑Fi/MQTT, APP_ENV_DEV (manifest dev/prod), état OTA unifié (suppression variable globale), procédure factory/EOL documentée et exécutée. Reset reason : déjà envoyé en télémétrie MQTT (FW_BOOT, FW_REBOOT_LOOP) ; log Serial au boot optionnel non fait. |
+| **P2** | Logs par niveau, timeout I2C/reset bus capteurs, sanity checks AQI/TVOC/eCO2 avant publish. |
+
+*Pour le détail des validations : tableau « Validation terrain » et section « GO/NO-GO shipping ».*
 
 ---
 
 ## Résumé exécutif
 
-1. **Firmware Breezly ESP32** (esp32_wroom_32e) : P0 implémentés dans le code (secrets hors repo, OTA sans setInsecure dans ota.cpp, release playbook).
-2. **Statut** : **Commercial ready (P0 complet).** Build prod, flash, boot, WiFi, OTA (manifest + fallback backend + download 3 streams), MQTT, publish capteurs et **OTA rollback safe** validés sur device réel (2026-02) ; logs Serial + post-upload en preuve. Provisioning BLE en amont. Rollback : 3 boots simulés → rollback → pas de ré-install à l’infini (`skip: version X was rolled back`).
+1. **Firmware Breezly ESP32** (esp32_wroom_32e) : P0 implémentés dans le code (secrets hors repo, OTA sans setInsecure dans ota.cpp, release playbook). Version actuelle : **1.0.25** (`src/app_config.h`).
+2. **Statut** : **Commercial ready (P0 complet).** Build prod, flash, boot, WiFi, OTA (manifest + fallback backend + download 3 streams), MQTT, publish capteurs et **OTA rollback safe** validés sur device réel (2026-02) ; logs Serial + post-upload en preuve. Provisioning BLE en amont. Rollback : 3 boots simulés → rollback → pas de ré-install à l’infini (`skip: version X was rolled back`). Voir section **« Où on en est »** pour le récapitulatif.
 3. **Grep** : aucune occurrence de patterns sensibles (échantillons internes non affichés) dans le repo. setInsecure présent uniquement dans sntp_utils.cpp (fallback HTTP Date, pas OTA). Pas de clé privée OTA dans le repo (uniquement clé publique dans ota.cpp).
 4. **Build prod** exige `secrets.ini` dans esp32_wroom_32e (ou variables d’env). Commande : `cd esp32_wroom_32e && pio run -e esp32-wroom-32e-prod`.
 5. **GO/NO-GO** et **Validation terrain** : tableaux ci-dessous ; à cocher après tests réels. Critères OK/KO et procédures sont définis pour reproductibilité.
-6. **Ce qui manque** (P1/P2) : backoff Wi‑Fi/MQTT, reset reason au boot, état OTA unifié, logs par niveau, APP_ENV_DEV non défini (risque opérationnel OTA : manifest URL toujours prod). Détail en section « Ce qui manque encore ».
+6. **Ce qui manque** (P1/P2) : backoff exponentiel Wi‑Fi/MQTT, APP_ENV_DEV (manifest dev/prod), état OTA unifié, procédure factory/EOL, logs par niveau. Reset reason : déjà en télémétrie MQTT (FW_BOOT, FW_REBOOT_LOOP). Détail en section « Ce qui manque encore ».
 7. **Docs détaillées** (audit, playbook, factory, preuves P0) en annexe uniquement.
 
 ---
@@ -83,7 +96,7 @@ Dernière mise à jour : 2026-02
 - [x] **Secrets** : secrets.ini / headers générés (esp32) et clés OTA (backend) dans .gitignore ; à vérifier en local avec `git status` qu’ils ne sont pas suivis.
 - [x] **Recovery** : flash manuel (esptool ou PIO) OK sur un device.
 
-*Statut actuel :* **P0 complet** (grep + preuves). Validation terrain : build, flash, boot, WiFi, OTA (manifest + download + rollback safe), MQTT et publish capteurs validés sur device (PROV_80BAD0215788) en 2026-02 ; BLE/provisioning en amont.
+*Statut actuel :* **P0 complet** (grep + preuves). Validation terrain : build, flash, boot, WiFi, OTA (manifest + download + rollback safe), MQTT et publish capteurs validés sur device (PROV_80BAD0215788) en 2026-02 ; BLE/provisioning en amont. **Ensuite** : voir section « Où on en est » et tableau « Ce qui manque encore » (P1/P2).
 
 ---
 
@@ -93,7 +106,8 @@ Pour qu’un device fasse vraiment une mise à jour OTA (téléchargement + flas
 
 ### Prérequis
 
-- Device déjà flashé avec une version connue (ex. `1.0.21` dans `src/app_config.h`).
+- **Version actuelle du firmware** : voir `src/app_config.h` → `CURRENT_FIRMWARE_VERSION` (ex. `1.0.25` au 2026-02-27).
+- Device déjà flashé avec une version connue (ex. `1.0.21` ou inférieure à la version cible pour tester l’OTA).
 - Serial ouvert (`pio device monitor -b 115200`) pour voir les logs `[OTA]`.
 - Manifest et .bin servis en HTTPS. Le device tente d’abord l’URL primaire (GitHub Pages), puis en **fallback le backend** (`breezly-backend.onrender.com/.../prod/latest.json`). **En pratique, GitHub Pages est souvent injoignable (connection refused)** ; le backend est la source fiable et sert l’OTA (manifest + .bin) correctement, avec téléchargement en 3 streams.
 
@@ -255,18 +269,32 @@ Le script écrit dans `breezly-firmware-dist/...` et dans `back-end-breezly/publ
 
 ## Ce qui manque encore (P1 / P2)
 
-*Basé sur l’état du code et les tests non encore validés.*
+*Basé sur l’état du code et les tests non encore validés. Aligné avec la section « Où on en est ».*
 
 | Priorité | Item | État code | Test validé |
 |----------|------|-----------|-------------|
-| P1 | Backoff exponentiel Wi‑Fi / MQTT | Non implémenté (délais fixes) | — |
-| P1 | Reset reason loggé au boot (+ optionnel status MQTT) | Non implémenté | — |
-| P1 | État OTA unifié (otaIsInProgress partout, suppression variable globale otaInProgress) | Partiel (sleep.h, main utilisent otaIsInProgress) | — |
+| P1 | Backoff exponentiel Wi‑Fi / MQTT | Non implémenté (délais fixes : 15 s Wi‑Fi, 8 s MQTT dans mqtt_bus.cpp) | — |
+| P1 | Reset reason au boot | **Partiel** : télémétrie MQTT OK (FW_BOOT : reset_reason, boot_count, brownout_flag ; FW_REBOOT_LOOP : lastResetReason). Log Serial au boot non fait. | Télémétrie OK |
+| P1 | État OTA unifié (otaIsInProgress partout, suppression variable globale otaInProgress) | Partiel : `otaIsInProgress()` utilisé dans sleep.h, main.cpp, mqtt_bus.cpp ; variable globale `g_otaInProgress` toujours dans ota.cpp | — |
 | P1 | Procédure factory + EOL exécutée et consignée | Doc présente (FACTORY_E2E_CHECKLIST) | À remplir |
-| P1 | APP_ENV_DEV aligné avec BREEZLY_DEV (manifest dev/prod selon build) | APP_ENV_DEV jamais défini → URL manifest toujours prod (risque opérationnel OTA) | — |
+| P1 | APP_ENV_DEV aligné avec BREEZLY_DEV (manifest dev/prod selon build) | APP_ENV_DEV jamais défini par PlatformIO → URL manifest toujours prod (risque OTA en dev) | — |
 | P2 | Logs par niveau (LOG_LEVEL), pas de Serial.println(payload) en prod | Non implémenté | — |
 | P2 | Timeout I2C + reset bus capteurs après N échecs | Non implémenté | — |
 | P2 | Sanity checks AQI/TVOC/eCO2 avant publish | Non implémenté | — |
+
+---
+
+## Gestion des LEDs (état des lieux)
+
+| Élément | Détail |
+|--------|--------|
+| **Matériel** | 1 NeoPixel (WS2812), broche **GPIO 13** (`LED_PIN` / `LED_COUNT` dans `src/app_config.h`). |
+| **Pilote** | `Adafruit_NeoPixel` ; instance globale `led` et enum `LedMode` dans `src/core/globals.h` / `globals.cpp`. |
+| **Modes** | `LED_BOOT`, `LED_PAIRING`, `LED_GOOD`, `LED_MODERATE`, `LED_BAD`, `LED_UPDATING`, `LED_OFF`. |
+| **Module** | `src/led/led_status.cpp` + `led_status.h` : init, mise à jour du mode, tâche d’animation. |
+| **Tâche** | FreeRTOS « LED » sur **core 1**, période ~16 ms : respiration (idle), dégradé pairing (bleu/cyan/violet), pulse à chaque publish capteur, couleur qualité d’air (vert → jaune → rouge selon `ledSetAirQualityScore(0..1)`). |
+| **API** | `ledInit`, `updateLedState(mode)`, `ledTaskStart`, `ledSuspend` / `ledResume` (OTA/BLE), `ledNotifyPublish`, `ledSetAirQualityScore(score01)`. Surcharge possible via `ledOverride` (globals). |
+| **Appels** | `main.cpp` (boot, pairing, qualité d’air, publish), `wifi_connect.cpp`, `ota.cpp`, `mqtt_bus.cpp` ; BLE provisioning suspend la tâche LED pendant OTA/TLS. |
 
 ---
 
@@ -294,4 +322,4 @@ Le script écrit dans `breezly-firmware-dist/...` et dans `back-end-breezly/publ
 
 ---
 
-*Mise à jour : après chaque campagne de tests terrain, remplir le tableau « Validation terrain » et les cases GO/NO-GO, puis mettre à jour la date en en-tête.*
+*Mise à jour : après chaque campagne de tests terrain, remplir le tableau « Validation terrain » et les cases GO/NO-GO, mettre à jour la date en en-tête et la version firmware dans la section « Où on en est » si elle a changé.*

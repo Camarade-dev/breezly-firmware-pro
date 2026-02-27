@@ -49,8 +49,7 @@ static bool connectToWiFiPSK() {
   }
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true, true);
-  provSet("status", "connecting");              // ← statut UX
-  updateLedState(LED_PAIRING); // ← statut LED
+  provSet("status", "connecting");
   WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
   Serial.printf("[WiFi] Connexion à '%s'...\n", wifiSSID.c_str());
 
@@ -121,6 +120,7 @@ static bool connectToWiFiPSK() {
     breezly_on_wifi_assoc_timeout();
   }
 
+  ledOnProvisioningError();
   if (bleInited) restartBLEAdvertising();
   return false;
 }
@@ -128,7 +128,10 @@ static bool connectToWiFiPSK() {
 bool connectToWiFi(){
   if (wifiAuthType == WIFI_CONN_EAP_PEAP_MSCHAPV2) {
     bool ok = connectToWiFiEnterprise();
-    if (!ok && bleInited) restartBLEAdvertising();
+    if (!ok) {
+      ledOnProvisioningError();
+      if (bleInited) restartBLEAdvertising();
+    }
     return ok;
   }
   bool ok = connectToWiFiPSK();

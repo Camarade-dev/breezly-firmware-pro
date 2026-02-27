@@ -196,6 +196,7 @@ void breezly_on_connected_final() {
   provisioningSetStatus("{\"status\":\"connected\"}");
   wd_enable(false);
   s_provisioningDone = true;
+  ledOnConnectedOk();
 
   Serial.println("[WD] provisioning complete -> WD disabled (prod mode)");
 
@@ -381,6 +382,7 @@ static void credWorker(void*){
       // Lance la connexion Wi-Fi côté loop/RTOS (ton code existant)
       setPhase(ProvPhase::CONNECTING);
       provisioningSetStatus("{\"status\":\"connecting\"}");
+      ledOnProvisioningStart();
 
       // >>> Ton code Wi-Fi doit appeler ces callbacks au bon moment :
       // breezly_on_wifi_ok();
@@ -409,6 +411,7 @@ public:
     setAppFg(true);
     setPhase(ProvPhase::STARTING);
     wd_enable(true);
+    ledOnProvisioningStart();
     provisioningSetStatus("{\"status\":\"ble_connected\"}");
     Serial.printf("[WD] onConnect: gatt=1, conn=%u\n", (unsigned)s_connHandle);
   }

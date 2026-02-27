@@ -604,6 +604,7 @@ static bool mqtt_do_connect() {
 
     breezly_on_mqtt_hello_ok();
     maybe_fire_connected_final();
+    ledOnConnectedOk();
 
   }
 
