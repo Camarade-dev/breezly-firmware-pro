@@ -14,6 +14,7 @@
 #include "esp_wifi.h"
 #include "net/wifi_connect.h"
 #include "core/backoff.h"
+#include "core/log.h"
 #include "esp_task_wdt.h"
 #include <ArduinoJson.h>
 #include "core/devkey_runtime.h"
@@ -31,7 +32,7 @@ volatile bool g_otaBootWindowDone = false;
 
 void doFactoryResetOnMainLoop(){
   updateLedState(LED_UPDATING);
-  Serial.println("[RESET] Arrêt propre avant reset...");
+  LOGI("RESET", "Arrêt propre avant reset...");
   // stoppe proprement tes tâches capteurs, BLE adv, etc.
 
   // annonce "erasing" pendant que MQTT est encore up
@@ -208,8 +209,7 @@ static void resetWifiOnEveryFlash() {
     return; // ✅ même firmware => pas de reset
   }
 
-  Serial.printf("[RESET] New flash detected. last=%s now=%s\n",
-                last.c_str(), now.c_str());
+  LOGI("RESET", "New flash detected. last=%s now=%s", last.c_str(), now.c_str());
 
   // IMPORTANT: écrire la signature AVANT de faire des trucs destructifs,
   // sinon tu peux boucler si reboot/power loss pendant le reset
@@ -288,31 +288,12 @@ void setup(){
   // pour l'AUTH courante ne sont pas tous présents
   const bool needProv = !validAuth;
 
-  Serial.println("----- PREFS -----");
-  Serial.printf("authType=%u (0=PSK,1=EAP)\n", (unsigned)wifiAuthType);
-  Serial.printf("SSID: %s\n", wifiSSID.c_str());
-  if (wifiAuthType == WIFI_CONN_PSK) {
-    Serial.printf("PWD : %s\n", wifiPassword.c_str());
-  } else {
-    Serial.print("EAP user: ");
-    Serial.println(eapUsername);
-    Serial.print("EAP mdp : ");
-    Serial.println(eapPassword);
-    Serial.print("EAP anon: ");
-    Serial.println(eapAnon);
-  }
-  Serial.printf("validAuth=%d manquePSK=%d manqueEAP=%d needProv=%d\n",
-                (int)validAuth, (int)manquePSK, (int)manqueEAP, (int)needProv);
-  Serial.println("-----------------");
+  LOGD("BOOT", "PREFS authType=%u (0=PSK,1=EAP)", (unsigned)wifiAuthType);
+  LOGD("BOOT", "PREFS SSID=%s validAuth=%d needProv=%d", wifiSSID.c_str(), (int)validAuth, (int)needProv);
 
-    loadOrInitDevKey();
-    Serial.printf("[DEVKEY] len=%d, head=%.6s\n", (int)g_deviceKeyB64.length(), g_deviceKeyB64.c_str());
-  Serial.println("----- PREFS -----");
-  Serial.printf("SSID: %s\n", wifiSSID.c_str());
-  Serial.printf("PWD : %s\n", wifiPassword.c_str());
-  Serial.printf("SID : %s\n", sensorId.c_str());
-  Serial.printf("UID : %s\n", userId.c_str());
-  Serial.println("-----------------");
+  loadOrInitDevKey();
+  LOGD("BOOT", "DEVKEY len=%d redacted", (int)g_deviceKeyB64.length());
+  LOGD("BOOT", "PREFS SID=%s UID=%s", sensorId.c_str(), userId.c_str());
   s_needProv = needProv;
   setupBLE(needProv);  // ← démarre BLE tout de suite si provisioning requis
 
@@ -335,13 +316,13 @@ void setup(){
   // 2) Tenter la connexion Wi-Fi immédiate si on a des identifiants
   //    (en cas d’échec, connectToWiFi() s’occupe de relancer l’advertising BLE)
   if (!missingCreds) {
-    Serial.println("Tentative de connexion avec les identifiants sauvegardés...");
+    LOGI("BOOT", "Tentative de connexion avec les identifiants sauvegardés...");
     connectToWiFi();
   }
 
   // 3) Si provisioning nécessaire : LED pairing + attente jusqu’à connexion Wi-Fi
   if (needProv) {
-    Serial.println("En attente provisioning BLE (non-bloquant)...");
+    LOGI("BOOT", "En attente provisioning BLE (non-bloquant)...");
     // NE PAS bloquer ici. loop() s'occupe d'appeler connectToWiFi()
   }
   twdtResetSafe(); delay(1);
@@ -349,7 +330,7 @@ void setup(){
   // mqtt_bus_start_task();
   // mqtt_request_connect();
 
-  Serial.println("[BOOT] Setup terminé");
+  LOGI("BOOT", "Setup terminé");
   lastWifiAttemptMs = millis();
 }
 
@@ -369,7 +350,7 @@ void loop(){
   else{
   // ★ Check OTA au premier boot Wi-Fi, 1 seule fois
   if (wifiConnected && !otaIsInProgress() && lastOtaCheck==0 && !s_otaBootTaskScheduled){
-    Serial.println("[OTA] Check au boot Wi-Fi");
+    LOGI("OTA", "Check au boot Wi-Fi");
     lastOtaCheck = millis();
     s_otaBootTaskScheduled = true;
     xTaskCreatePinnedToCore([](void*){
@@ -415,7 +396,7 @@ void loop(){
   // Provisioning → nouveaux identifiants reçus
   if (!wifiConnected && needToConnectWiFi &&  !g_factoryResetPending){
     needToConnectWiFi = false;   // évite plusieurs déclenchements
-    Serial.println("[WiFi] tentative suite à nouveaux identifiants (BLE)");
+    LOGI("WiFi", "tentative suite à nouveaux identifiants (BLE)");
     twdtResetSafe();
     connectToWiFi(); // échec => restartBLEAdvertising() à l'intérieur comme avant
     twdtResetSafe();
@@ -523,7 +504,7 @@ void loop(){
         j["sensorId"]=sensorId; j["userId"]=userId;
         String s; serializeJson(j,s);
         mqtt_enqueue("capteurs/qualite_air", s, 0, false);
-        Serial.println(s);
+        LOGD("MQTT", "qualite_air payload len=%u", (unsigned)s.length());
         mqtt_flush(200);
       } else {
         // cas sans PMS dispo : on envoie ENS uniquement
@@ -534,7 +515,7 @@ void loop(){
         j["sensorId"]=sensorId; j["userId"]=userId;
         String s; serializeJson(j,s);
         mqtt_enqueue("capteurs/qualite_air", s, 0, false);
-        Serial.println(s);
+        LOGD("MQTT", "qualite_air payload len=%u", (unsigned)s.length());
         mqtt_flush(200);
       }
 
@@ -561,7 +542,7 @@ void loop(){
       && !otaIsInProgress()
       && !g_factoryResetPending) {
 
-    Serial.println("[BOOT] Start sensors + MQTT after OTA window");
+    LOGI("BOOT", "Start sensors + MQTT after OTA window");
 
     // ======= CAPTEURS / PMS =======
     if (!gPmsMutex) {
