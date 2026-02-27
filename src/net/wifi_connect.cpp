@@ -1,4 +1,5 @@
 #include "wifi_connect.h"
+#include "../core/log.h"
 #include <WiFi.h>
 #include "esp_task_wdt.h"
 extern "C" {
@@ -46,20 +47,20 @@ static esp_event_handler_instance_t s_discInstPsk = nullptr;
 static void onStaDiscPsk(void*, esp_event_base_t, int32_t, void* data) {
   auto* ev = (wifi_event_sta_disconnected_t*)data;
   s_lastDiscReasonPsk = ev ? ev->reason : -1;
-  Serial.printf("[WiFi][PSK] STA_DISCONNECTED reason=%d\n", s_lastDiscReasonPsk);
+  LOGD("WiFi", "STA_DISCONNECTED reason=%d", s_lastDiscReasonPsk);
 }
 static void ensureDefaultEventLoop() {
   static bool ready = false;
   if (ready) return;
   esp_err_t e = esp_event_loop_create_default();
   if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
-    Serial.printf("[EVT] create_default failed: %d\n", e);
+    LOGE("EVT", "create_default failed: %d", e);
   }
   ready = true;
 }
 static bool connectToWiFiPSK() {
   if (wifiSSID.isEmpty() || wifiPassword.isEmpty()){
-    Serial.println("[WiFi] SSID/PWD manquants");
+    LOGW("WiFi", "SSID/PWD manquants");
     provSet("status", "missing_fields");
     return false;
   }
@@ -69,7 +70,7 @@ static bool connectToWiFiPSK() {
     esp_err_t e = esp_event_handler_instance_register(
         WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &onStaDiscPsk, nullptr, &s_discInstPsk);
     if (e != ESP_OK) {
-      Serial.printf("[EVT] register STA_DISCONNECTED failed: %d\n", e);
+      LOGE("EVT", "register STA_DISCONNECTED failed: %d", e);
       // ne surtout pas ESP_ERROR_CHECK ici → pas de reboot
     }
   }
@@ -77,7 +78,8 @@ static bool connectToWiFiPSK() {
   WiFi.disconnect(true, true);
   provSet("status", "connecting");
   WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
-  Serial.printf("[WiFi] Connexion à '%s'...\n", wifiSSID.c_str());
+  LOGD("WiFi", "Connexion à '%s'...", wifiSSID.c_str());
+  LOGI("WiFi", "connecting...");
 
   const uint32_t timeoutMs = 15000;  // timeout d'une seule tentative (pas le backoff)
   const uint32_t deadline  = millis() + timeoutMs;
@@ -91,8 +93,7 @@ static bool connectToWiFiPSK() {
   if (WiFi.status()==WL_CONNECTED){
   s_wifiBackoff.reset();
   wifiFailCount = 0;
-  Serial.printf("[WiFi] OK IP=%s RSSI=%d\n",
-                WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  LOGI("WiFi", "OK IP=%s RSSI=%d", WiFi.localIP().toString().c_str(), WiFi.RSSI());
   wifiAutoTxPower();
   wifiConnected = true;
   {
@@ -111,7 +112,7 @@ static bool connectToWiFiPSK() {
   // Étape 2 : Internet ? (time-agnostic)
   bool inet = checkInternetReachable();
   if (!inet) {
-    Serial.println("[WiFi] Internet unreachable");
+    LOGW("WiFi", "Internet unreachable");
     provisioningSetStatus("{\"status\":\"inet_unreachable\"}");
     // ne PAS appeler breezly_on_inet_ok() ici
   } else {
@@ -132,7 +133,7 @@ static bool connectToWiFiPSK() {
   wifi_backoff::Reason reason = mapDiscReasonToBackoffReason(s_lastDiscReasonPsk);
   uint32_t effectiveMin = wifi_backoff::effectiveMinForReason(reason, BACKOFF_WIFI_AUTH_FAIL_MIN_MS);
   s_wifiBackoff.onFailure(millis(), effectiveMin);
-  Serial.printf("[WiFi] fail reason=%d backoff next in %lu ms\n", s_lastDiscReasonPsk, (unsigned long)s_wifiBackoff.lastDelayMs());
+  LOGW("WiFi", "fail reason=%d backoff next in %lu ms", s_lastDiscReasonPsk, (unsigned long)s_wifiBackoff.lastDelayMs());
   char ctx[80];
   snprintf(ctx, sizeof(ctx), "{\"reason\":%d,\"retryCount\":%u}", s_lastDiscReasonPsk, (unsigned)wifiFailCount);
   mqtt_telemetry_emit("WIFI_CONNECT_FAIL", ctx);

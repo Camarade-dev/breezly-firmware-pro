@@ -1,4 +1,5 @@
 #include "mqtt_bus.h"
+#include "../core/log.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -167,8 +168,8 @@ bool mqtt_enqueue(const String& t, const String& p, uint8_t qos, bool retain) {
     qos,
     retain
   };
-  Serial.printf("[MQTT] Enqueue vers topic: %s\n", topicFull.c_str());
-  Serial.printf("[MQTT] sub ctrl=%s\n", mqtt_topic_ctrl().c_str());
+  LOGD("MQTT", "Enqueue topic: %s", topicFull.c_str());
+  LOGD("MQTT", "sub ctrl=%s", mqtt_topic_ctrl().c_str());
   if (!m.topic || !m.payload) {
     if (m.topic) free(m.topic);
     if (m.payload) free(m.payload);
@@ -313,7 +314,7 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int len) {
     
     StaticJsonDocument<512> j;  
     auto err = deserializeJson(j, msg);
-    if (err) { Serial.printf("[MQTT] JSON parse error: %s\n", err.c_str()); return; }
+    if (err) { LOGD("MQTT", "JSON parse error: %s", err.c_str()); return; }
     const char* action = j["action"] | "";
     
     if (!action[0]) return;
@@ -321,7 +322,7 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int len) {
     if (strcmp(action, "set_wifi")==0) { handleSetWifi(j); return; }
 
     if (strcmp(action, "update")==0) {
-        Serial.println("[OTA] Trigger via MQTT");
+        LOGI("OTA", "Trigger via MQTT");
         otaSetInProgress(true); // ← pause immédiate de la tâche MQTT
         xTaskCreatePinnedToCore([](void*){
         vTaskDelay(100/portTICK_PERIOD_MS);
@@ -417,7 +418,7 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int len) {
     }
 
     if (strcmp(action, "factory_reset")==0) {
-      Serial.println("[RESET] Factory reset demandé via MQTT");
+      LOGI("RESET", "Factory reset via MQTT");
       DynamicJsonDocument ack(128);
       ack["ack"]="factory_reset";
       ack["ok"]=true;
@@ -471,8 +472,8 @@ static bool mqtt_do_connect() {
   String envSuffix = String(MQTT_PREFIX).startsWith("prod/") ? "prod" : "dev";
   String clientId = "breezly-sensor-" + envSuffix + "-" + sensorId;
 
-  Serial.printf("[MQTT] trying clientId=%s host=%s port=%d\n",
-                clientId.c_str(), MQTT_HOST, MQTT_PORT);
+  LOGD("MQTT", "connect clientId=%s host=%s port=%d", clientId.c_str(), MQTT_HOST, MQTT_PORT);
+  LOGI("MQTT", "connecting broker port=%d", MQTT_PORT);
   bool ok = s_mqtt.connect(
     clientId.c_str(),
     MQTT_USER, MQTT_PASS,
@@ -482,7 +483,7 @@ static bool mqtt_do_connect() {
   );
   if (!ok) {
     int state = s_mqtt.state();
-    Serial.printf("[MQTT] connect FAIL state=%d time=%ld\n", state, time(nullptr));
+    LOGW("MQTT", "connect FAIL state=%d", state);
     char ctx[80];
     snprintf(ctx, sizeof(ctx), "{\"reason\":%d}", state);
     mqtt_telemetry_emit("MQTT_CONNECT_FAIL", ctx);
@@ -504,7 +505,8 @@ static bool mqtt_do_connect() {
   String s; serializeJson(j, s);
   s_mqtt.publish((String(MQTT_PREFIX) + "capteurs/boot").c_str(), s.c_str(), false);
 
-  // Telemetry: boot_count + reboot loop detection (NVS window 10 min)
+  // Telemetry: boot_count + reboot loop detection (NVS window 1 min, threshold 5 boots)
+  // Real loop = many reboots in a short time; 1–2 reboots (unplug, PC sleep) are not a loop.
   {
     Preferences bootPrefs;
     bootPrefs.begin("boot", false);
@@ -512,7 +514,8 @@ static bool mqtt_do_connect() {
     bootPrefs.putUInt("count", bootCount);
     String tsList = bootPrefs.getString("ts", "");
     const uint32_t nowSec = (uint32_t)time(nullptr);
-    const uint32_t windowSec = 10 * 60;
+    const uint32_t windowSec = 60;  // 1 minute
+    const int minBootsForLoop = 5;
     int bootsInWindow = 0;
     if (tsList.length()) {
       int idx = 0;
@@ -531,7 +534,7 @@ static bool mqtt_do_connect() {
     int cut = -1;
     for (int i = 0; i < (int)newTs.length(); i++) {
       if (newTs[i] == ',') count++;
-      if (count >= 5) { cut = i; break; }
+      if (count >= 10) { cut = i; break; }  // keep last 10 timestamps for 1 min window
     }
     if (cut > 0) {
       int comma = newTs.lastIndexOf(',', cut - 1);
@@ -539,7 +542,7 @@ static bool mqtt_do_connect() {
     }
     bootPrefs.putString("ts", newTs);
     bootPrefs.end();
-    if (bootsInWindow >= 3) {
+    if (bootsInWindow >= minBootsForLoop) {
       const char* rr = "unknown";
       switch (esp_reset_reason()) {
         case ESP_RST_BROWNOUT: rr = "brownout"; break;
@@ -549,8 +552,8 @@ static bool mqtt_do_connect() {
         case ESP_RST_WDT:      rr = "wdt";      break;
         default:               rr = "other";   break;
       }
-      char loopCtx[120];
-      snprintf(loopCtx, sizeof(loopCtx), "{\"boots10min\":%d,\"lastResetReason\":\"%s\"}", bootsInWindow, rr);
+      char loopCtx[128];
+      snprintf(loopCtx, sizeof(loopCtx), "{\"boots1min\":%d,\"lastResetReason\":\"%s\"}", bootsInWindow, rr);
       mqtt_telemetry_emit("FW_REBOOT_LOOP", loopCtx);
     }
   }
@@ -642,7 +645,7 @@ static void mqttTask(void*) {
   s_queue = xQueueCreate(24, sizeof(PubMsg));
   s_ev    = xEventGroupCreate();
   s_ready = true;
-    Serial.println("[MQTT] mqtttask " + String(millis()));
+  LOGD("MQTT", "mqtttask start %lu ms", (unsigned long)millis());
   for (;;) {
     if (g_netBusyForOta || otaIsInProgress()) {
       if (s_connected) { s_mqtt.disconnect(); s_connected = false; }
@@ -661,13 +664,13 @@ static void mqttTask(void*) {
         s_lastConnAttemptMs = millis();
         ensureTlsClockReady(20000);
         time_t now = time(nullptr);
-        Serial.printf("[MQTT] pre-connect, unix=%ld sane=%d\n", (long)now, (int)timeIsSaneHard());
+        LOGD("MQTT", "pre-connect unix=%ld sane=%d", (long)now, (int)timeIsSaneHard());
         if (!timeIsSaneHard()) { vTaskDelay(250/portTICK_PERIOD_MS); continue; }
         if (mqtt_do_connect()) {
           s_connected = true;
         } else {
           s_mqttBackoff.onFailure(millis(), 0);
-          Serial.printf("[MQTT] backoff next in %lu ms\n", (unsigned long)s_mqttBackoff.lastDelayMs());
+          LOGI("MQTT", "backoff next in %lu ms", (unsigned long)s_mqttBackoff.lastDelayMs());
         }
       }
       vTaskDelay(50 / portTICK_PERIOD_MS);

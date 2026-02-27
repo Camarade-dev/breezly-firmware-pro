@@ -1,4 +1,5 @@
 #include "provisioning.h"
+#include "../core/log.h"
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
@@ -216,13 +217,12 @@ static void credWorker(void*){
     json = g_acc; g_acc = "";
     xSemaphoreGive(sAccMutex);
 
-    Serial.printf("[BLE][WORKER] JSON total len=%u\n", (unsigned)json.length());
-    Serial.printf("[BLE][WORKER] JSON payload: %s\n", json.c_str());
+    LOGD("BLE", "WORKER JSON len=%u (payload not logged in prod)", (unsigned)json.length());
 
     DynamicJsonDocument doc(1536);
     DeserializationError err = deserializeJson(doc, json);
     if (err){
-      Serial.printf("[BLE][WORKER][ERROR] JSON deserialization: %s\n", err.f_str());
+      LOGD("BLE", "WORKER JSON deserialization error: %s", err.f_str());
       provisioningSetStatus("{\"status\":\"json_error\"}");
       continue;
     }
