@@ -9,8 +9,8 @@
 # 0. Executive Summary
 
 - **Statut global:** **Almost ready** — Fonctionnel mais plusieurs points bloquants sécurité et un bug structurel corrigé (voir §1).
-- **5 risques majeurs:** (1) Secrets en dur (MQTT user/pass, device key/factory token en `platformio.ini`); (2) OTA GitHub Pages en `setInsecure()`; (3) Pas de backoff exponentiel Wi‑Fi; (4) Variable `otaInProgress` dupliquée / condition OTA périodique incorrecte; (5) Bloc « Start sensors + MQTT after OTA window » était hors de `loop()` (corrigé dans ce repo).
-- **5 actions les plus rentables avant prod:** (1) Sortir tous les secrets du firmware (env / secrets.ini non versionné); (2) Supprimer `setInsecure()` OTA et utiliser CA ou pinning; (3) Implémenter backoff exponentiel + jitter Wi‑Fi/MQTT; (4) Unifier OTA state (`otaIsInProgress()` partout); (5) Checklist factory + EOL documentée et un script de flash reproductible.
+- **5 risques majeurs (historique):** (1) Secrets en dur — mitigé (secrets.ini); (2) OTA setInsecure — supprimé; (3) Backoff Wi‑Fi/MQTT — **implémenté** (core/backoff, app_config.h); (4) Variable `otaInProgress` dupliquée — unifier avec `otaIsInProgress()`; (5) Bloc sensors+MQTT après OTA — corrigé dans loop().
+- **Actions restantes avant prod:** Unifier état OTA (`otaIsInProgress()` partout); checklist factory + EOL; logs niveau.
 
 ---
 
@@ -24,16 +24,17 @@
 | `src/core/globals.cpp`, `globals.h` | État global: WiFi, prefs, MQTT client, AHT/ENS160/PMS, LED, `otaInProgress` (doublon avec `ota.cpp`). |
 | `src/core/devkey_runtime.cpp`, `devkey.h` | Clé device (NVS ou `DEVICE_KEY_B64` build); `loadOrInitDevKey()` appelé en `setup()`. |
 | `src/ble/provisioning.cpp` | NimBLE, GATT (credentials + status), claim HMAC, watchdog session, phases provisioning. |
-| `src/net/wifi_connect.cpp` | PSK + EAP (délégation à `wifi_enterprise.cpp`), timeout 15 s, pas de backoff exponentiel. |
+| `src/net/wifi_connect.cpp` | PSK + EAP; timeout 15 s par tentative; backoff exponentiel (core/backoff), retry dans loop si creds valides. |
 | `src/net/wifi_enterprise.cpp` | WPA2-Enterprise PEAP/MSCHAPv2, CA Rezoleo embarqué. |
-| `src/net/mqtt_bus.cpp` | Tâche FreeRTOS MQTT (queue 24 msgs), TLS (CA_BUNDLE_PEM), reconnect 8 s fixe, LWT, commandes set_wifi / forget_wifi / factory_reset / update. |
+| `src/net/mqtt_bus.cpp` | Tâche FreeRTOS MQTT (queue 24 msgs), TLS, backoff exponentiel (core/backoff), LWT, commandes set_wifi / forget_wifi / factory_reset / update. |
 | `src/net/sntp_utils.cpp` | SNTP + fallback HTTP Date pour horloge TLS. |
 | `src/ota/ota.cpp` | Manifest signé ECDSA P-256, rollback après 3 boots en pending, GitHub Pages + fallback backend; TLS vérifié (CA_BUNDLE_PEM, P0-2). |
 | `src/sensors/sensors.cpp` | AHT21, ENS160, PMS (UART), fusion/lissage PM, `safeSensorRead`, `pmsSampleBlocking`. |
 | `src/sensors/calibration.cpp` | NVS namespace `cal`, temp/hum, `calCompose`/`calInit`. |
 | `src/led/led_status.cpp` | Tâche LED (modes, score qualité d’air, pulse). |
 | `src/power/sleep.h`, `power_config.h` | Modem sleep, `lightNapMs`, `deepSleepForMs` (si `USE_DEEP_SLEEP`). |
-| `src/app_config.h` | Version, URLs manifest (APP_ENV_DEV non défini par le build → toujours prod URL), LED, OTA interval. |
+| `src/app_config.h` | Version, URLs manifest, LED, OTA interval, **paramètres backoff** (Wi‑Fi: min/max/factor/jitter/auth_fail_min; MQTT: min/max/factor/jitter). |
+| `src/core/backoff.h`, `backoff.cpp` | Module backoff exponentiel générique (reset, onFailure, shouldAttempt, getState); policies Wi‑Fi (auth_fail 30s) et MQTT; simulation sous `BACKOFF_SIM_TEST`. |
 
 ## 1.2 Flux principaux
 
@@ -61,8 +62,8 @@
 | | Pas de secrets MQTT en dur | OK | P0-1: `mqtt_bus.cpp` L31-32 utilise `MQTT_SECRET_USER`/`MQTT_SECRET_PASS`; `pre_build_mqtt_secrets.py` → `mqtt_secrets.h` (gitignore) | — | — |
 | **Provisioning & UX** | BLE provisioning opérationnel | OK | `provisioning.cpp`: NimBLE, claim HMAC, phases, watchdog session | — | — |
 | | Reconnexion après nouveaux creds | OK | `needToConnectWiFi` → `connectToWiFi()` dans loop | — | — |
-| **Réseau** | Backoff exponentiel Wi‑Fi | MISSING | `wifi_connect.cpp`: timeout 15 s fixe, pas de backoff | Reconnexions agressives, possible blacklist AP | Backoff exponentiel + jitter, max 5–10 min |
-| | Backoff MQTT | PARTIAL | `mqtt_bus.cpp` L45: `RECONNECT_BACKOFF_MS = 8000` fixe | Même risque | Backoff exponentiel avec plafond (ex. 5 min) |
+| **Réseau** | Backoff exponentiel Wi‑Fi | OK | `core/backoff.h` + `wifi_connect.cpp`: min 1s, max 5 min, facteur 2, jitter ±10%; auth_fail min 30s; reset à la connexion stable | — | — |
+| | Backoff MQTT | OK | `mqtt_bus.cpp`: même module Backoff, min 2s, max 5 min; reset à session établie; suspendu si Wi‑Fi down / OTA | — | — |
 | | Offline / queue | PARTIAL | Queue 24 messages, `mqtt_flush(timeout)`; pas de politique "last known good" documentée | Perte de trames si déco longue | Conserver last payload status; doc perte acceptable |
 | **Capteurs** | Timeouts / erreurs | PARTIAL | `safeSensorRead` retourne false si NaN; `pmsSampleBlocking(warmup)` avec timeout implicite; pas de timeout I2C explicite | Bus I2C bloqué possible | Timeout I2C (ex. 500 ms), reset bus après N échecs |
 | | Valeurs aberrantes | PARTIAL | Calibration temp/hum; PMS checksum trame; pas de plafond explicite AQI/TVOC/eCO2 | Valeurs extrêmes publiées | Sanity checks (min/max) avant publish |
@@ -155,9 +156,8 @@
 
 ## 5.1 Wi‑Fi / MQTT
 
-- **Wi‑Fi:** `connectToWiFi()` timeout 15 s; en échec, `restartBLEAdvertising()`. Pas de backoff exponentiel ni jitter.  
-- **Recommandation:** Dans `main.cpp` / `wifi_connect.cpp`: `lastWifiAttemptMs`, `wifiFailCount`; délai = min(CAP, BASE * 2^failCount) + jitter; plafond 5–10 min; après succès, remettre failCount à 0.  
-- **MQTT:** `RECONNECT_BACKOFF_MS = 8000` (mqtt_bus.cpp L45); même idée: backoff exponentiel avec plafond.
+- **Wi‑Fi:** `connectToWiFi()` timeout 15 s par tentative; en échec, backoff exponentiel (min 1s, max 5 min, facteur 2, jitter ±10%). Auth fail → min 30s pour éviter de marteler la box. Reset du backoff à connexion stable (IP + internet OK). Retry dans `loop()` via `wifiBackoffShouldAttempt()`; pas de retry si provisioning (pas de creds). Pendant OTA on ne lance pas de reconnect agressif.
+- **MQTT:** Module `Backoff` partagé (min 2s, max 5 min); reset à session établie (premier connect OK). Si Wi‑Fi down, la tâche MQTT ne tente pas (pas de retries actifs). Pendant OTA la tâche fait `vTaskDelay(100)` sans tenter connect. Paramètres dans `app_config.h` (BACKOFF_WIFI_*, BACKOFF_MQTT_*).
 
 ## 5.2 Offline
 

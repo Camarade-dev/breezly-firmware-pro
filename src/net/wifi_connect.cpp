@@ -6,12 +6,38 @@ extern "C" {
 }
 #include "../power/wifi_txpower.h"
 #include "../core/globals.h"
+#include "../core/backoff.h"
+#include "../app_config.h"
 #include "../net/sntp_utils.h"
 #include "../net/mqtt_bus.h"
 #include "../ble/provisioning.h"
 #include "../led/led_status.h"
 #include "wifi_enterprise.h"   // connectToWiFiEnterprise()
 #include "wifi_status_helpers.h"
+
+static const BackoffConfig s_wifiBackoffConfig = {
+  BACKOFF_WIFI_MIN_MS,
+  BACKOFF_WIFI_MAX_MS,
+  BACKOFF_WIFI_FACTOR,
+  BACKOFF_WIFI_JITTER_PERCENT
+};
+static Backoff s_wifiBackoff(s_wifiBackoffConfig);
+
+static wifi_backoff::Reason mapDiscReasonToBackoffReason(int reason) {
+  if (reason == WIFI_REASON_AUTH_EXPIRE || reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT ||
+      reason == WIFI_REASON_802_1X_AUTH_FAILED || reason == WIFI_REASON_MIC_FAILURE ||
+      reason == WIFI_REASON_AUTH_FAIL)
+    return wifi_backoff::AuthFail;
+  if (reason == WIFI_REASON_NO_AP_FOUND || reason == WIFI_REASON_ASSOC_LEAVE ||
+      reason == WIFI_REASON_ASSOC_EXPIRE || reason == WIFI_REASON_ASSOC_TOOMANY)
+    return wifi_backoff::NoSsid;
+  if (reason == WIFI_REASON_HANDSHAKE_TIMEOUT)
+    return wifi_backoff::Timeout;
+  return wifi_backoff::Other;
+}
+
+void wifiBackoffReset() { s_wifiBackoff.reset(); }
+bool wifiBackoffShouldAttempt() { return s_wifiBackoff.shouldAttempt(millis()); }
 
 // === Version PSK (copiée de ton ancien code) ===
 static volatile int s_lastDiscReasonPsk = -1;
@@ -53,7 +79,7 @@ static bool connectToWiFiPSK() {
   WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
   Serial.printf("[WiFi] Connexion à '%s'...\n", wifiSSID.c_str());
 
-  const uint32_t timeoutMs = 15000;
+  const uint32_t timeoutMs = 15000;  // timeout d'une seule tentative (pas le backoff)
   const uint32_t deadline  = millis() + timeoutMs;
   while (WiFi.status() != WL_CONNECTED && (int32_t)(deadline - millis()) > 0) {
     esp_task_wdt_reset();
@@ -63,6 +89,8 @@ static bool connectToWiFiPSK() {
   Serial.println();
 
   if (WiFi.status()==WL_CONNECTED){
+  s_wifiBackoff.reset();
+  wifiFailCount = 0;
   Serial.printf("[WiFi] OK IP=%s RSSI=%d\n",
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
   wifiAutoTxPower();
@@ -100,6 +128,11 @@ static bool connectToWiFiPSK() {
 
   // ÉCHEC: on tente d’éclairer la cause
   wifiConnected = false;
+  wifiFailCount++;
+  wifi_backoff::Reason reason = mapDiscReasonToBackoffReason(s_lastDiscReasonPsk);
+  uint32_t effectiveMin = wifi_backoff::effectiveMinForReason(reason, BACKOFF_WIFI_AUTH_FAIL_MIN_MS);
+  s_wifiBackoff.onFailure(millis(), effectiveMin);
+  Serial.printf("[WiFi] fail reason=%d backoff next in %lu ms\n", s_lastDiscReasonPsk, (unsigned long)s_wifiBackoff.lastDelayMs());
   char ctx[80];
   snprintf(ctx, sizeof(ctx), "{\"reason\":%d,\"retryCount\":%u}", s_lastDiscReasonPsk, (unsigned)wifiFailCount);
   mqtt_telemetry_emit("WIFI_CONNECT_FAIL", ctx);
@@ -128,7 +161,12 @@ static bool connectToWiFiPSK() {
 bool connectToWiFi(){
   if (wifiAuthType == WIFI_CONN_EAP_PEAP_MSCHAPV2) {
     bool ok = connectToWiFiEnterprise();
-    if (!ok) {
+    if (ok) {
+      s_wifiBackoff.reset();
+      wifiFailCount = 0;
+    } else {
+      wifiFailCount++;
+      s_wifiBackoff.onFailure(millis(), 0);  // EAP: pas de policy auth spécifique ici
       ledOnProvisioningError();
       if (bleInited) restartBLEAdvertising();
     }

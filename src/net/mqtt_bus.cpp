@@ -10,6 +10,7 @@
 #include <freertos/event_groups.h>
 #include <Preferences.h>
 #include "../core/globals.h"     // wifiConnected, sensorId, userId, prefs, CURRENT_FIRMWARE_VERSION
+#include "../core/backoff.h"
 #include "../led/led_status.h"
 #include "../ota/ota.h"
 #include "../net/sntp_utils.h"
@@ -44,7 +45,15 @@ static volatile bool s_ready     = false;
 
 static const int EV_REQ_CONNECT_BIT = (1 << 0);
 static uint32_t s_lastConnAttemptMs = 0;
-static const uint32_t RECONNECT_BACKOFF_MS = 8000; // 8s
+
+static const BackoffConfig s_mqttBackoffConfig = {
+  BACKOFF_MQTT_MIN_MS,
+  BACKOFF_MQTT_MAX_MS,
+  BACKOFF_MQTT_FACTOR,
+  BACKOFF_MQTT_JITTER_PERCENT
+};
+static Backoff s_mqttBackoff(s_mqttBackoffConfig);
+
 static String withPrefix(const String& t) {
   if (t.startsWith("dev/") || t.startsWith("prod/")) return t;
   return String(MQTT_PREFIX) + t;
@@ -322,6 +331,15 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int len) {
       }, "OTA_TASK", 8192, NULL, 1, NULL, 0);
       return;
     }
+    if (strcmp(action, "set_night_mode")==0) {
+      const char* mode = j["mode"] | "auto";
+      int v = 0;
+      if (strcmp(mode, "on")==0) v = 1;
+      else if (strcmp(mode, "off")==0) v = 2;
+      ledSetNightModeOverride(v);
+      publish_control_ack("set_night_mode", true);
+      return;
+    }
     if (strcmp(action, "forget_wifi")==0) {
       // —— Idempotence guard
       uint64_t cmdTs = j["ts"] | 0ULL;
@@ -470,6 +488,7 @@ static bool mqtt_do_connect() {
     mqtt_telemetry_emit("MQTT_CONNECT_FAIL", ctx);
     return false;
   }
+  s_mqttBackoff.reset();  // session établie → reset backoff
   mqtt_telemetry_emit("MQTT_CONNECT_OK", "{}");
 
   // Subscriptions
@@ -630,23 +649,26 @@ static void mqttTask(void*) {
       vTaskDelay(100 / portTICK_PERIOD_MS);
       continue;
     }
-    // (Re)connexion
+    // (Re)connexion avec backoff exponentiel (Wi‑Fi down → pas de retry actif, juste delay)
     if (!s_connected) {
       bool shouldTry = false;
       EventBits_t bits = xEventGroupClearBits(s_ev, EV_REQ_CONNECT_BIT);
       if (bits & EV_REQ_CONNECT_BIT) shouldTry = true;
-      if (!shouldTry && wifiConnected && (millis() - s_lastConnAttemptMs) >= RECONNECT_BACKOFF_MS) {
+      if (!shouldTry && wifiConnected && s_mqttBackoff.shouldAttempt(millis())) {
         shouldTry = true;
       }
       if (shouldTry) {
         s_lastConnAttemptMs = millis();
-        // <<<< AJOUT
         ensureTlsClockReady(20000);
         time_t now = time(nullptr);
         Serial.printf("[MQTT] pre-connect, unix=%ld sane=%d\n", (long)now, (int)timeIsSaneHard());
         if (!timeIsSaneHard()) { vTaskDelay(250/portTICK_PERIOD_MS); continue; }
-        // >>>>
-        if (mqtt_do_connect()) s_connected = true;
+        if (mqtt_do_connect()) {
+          s_connected = true;
+        } else {
+          s_mqttBackoff.onFailure(millis(), 0);
+          Serial.printf("[MQTT] backoff next in %lu ms\n", (unsigned long)s_mqttBackoff.lastDelayMs());
+        }
       }
       vTaskDelay(50 / portTICK_PERIOD_MS);
       continue;
@@ -680,11 +702,11 @@ static void mqttTask(void*) {
       s_lastHeartbeatMs = now;
       uint32_t freeHeap = (uint32_t)esp_get_free_heap_size();
       if (freeHeap < s_minFreeHeap) s_minFreeHeap = freeHeap;
-      char ctx[220];
+      char ctx[260];
       snprintf(ctx, sizeof(ctx),
-               "{\"uptime_ms\":%lu,\"wifi_rssi\":%d,\"free_heap\":%lu,\"min_free_heap\":%lu,\"mqtt_connected\":%s}",
+               "{\"uptime_ms\":%lu,\"wifi_rssi\":%d,\"free_heap\":%lu,\"min_free_heap\":%lu,\"mqtt_connected\":%s,\"night_mode\":%s}",
                (unsigned long)now, WiFi.RSSI(), (unsigned long)freeHeap, (unsigned long)s_minFreeHeap,
-               s_connected ? "true" : "false");
+               s_connected ? "true" : "false", ledGetNightMode() ? "true" : "false");
       mqtt_telemetry_emit("FW_HEARTBEAT", ctx);
     }
 
