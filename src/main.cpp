@@ -371,7 +371,7 @@ void loop(){
   }
 
   // ★ Check OTA périodique
-  if (!otaInProgress && wifiConnected && !g_factoryResetPending){
+  if (!otaIsInProgress() && wifiConnected && !g_factoryResetPending){
     unsigned long now = millis();
     if ((long)(now - lastOtaCheck) >= (long)OTA_CHECK_INTERVAL_MS && !s_otaTickTaskScheduled){
       lastOtaCheck = now;

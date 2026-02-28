@@ -30,7 +30,6 @@ static volatile bool g_factoryResetPending = false;
 // ==== GLOBAUX (définis dans globals.cpp) ====
 extern bool wifiConnected;
 extern bool needToConnectWiFi;
-extern volatile bool otaInProgress;
 extern unsigned long lastOtaCheck;
 extern uint8_t      wifiFailCount;
 extern unsigned long lastWifiAttemptMs;

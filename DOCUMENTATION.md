@@ -11,7 +11,7 @@ Dernière mise à jour : 2026-02-27
 |--------|------|
 | **Version firmware** | `1.0.25` (définie dans `src/app_config.h`) |
 | **P0 (Commercial ready)** | **Validé** — Build prod, flash, boot, WiFi, BLE provisioning, MQTT, publish capteurs, OTA (manifest + fallback backend + download 3 streams), OTA rollback safe, secrets hors repo, recovery flash manuel. Tous les tests terrain du tableau ci-dessous sont OK. |
-| **P1 (en cours)** | **Backoff exponentiel Wi‑Fi/MQTT : implémenté** (voir § Backoff). Reste : APP_ENV_DEV (manifest dev/prod), état OTA unifié (suppression variable globale), procédure factory/EOL documentée et exécutée. Reset reason : déjà en télémétrie MQTT (FW_BOOT, FW_REBOOT_LOOP). |
+| **P1 (en cours)** | **Backoff exponentiel Wi‑Fi/MQTT : implémenté** (voir § Backoff). **État OTA unifié : implémenté** (otaIsInProgress() partout, variable globale supprimée). Reste : APP_ENV_DEV (manifest dev/prod), procédure factory/EOL documentée et exécutée. Reset reason : déjà en télémétrie MQTT (FW_BOOT, FW_REBOOT_LOOP). |
 | **P2** | Logs par niveau (LOG_LEVEL) : **implémenté** (voir PRODUCTION_READINESS.md). Reste : timeout I2C/reset bus capteurs, sanity checks AQI/TVOC/eCO2 avant publish. |
 
 *Pour le détail des validations : tableau « Validation terrain » et section « GO/NO-GO shipping ».*
@@ -25,7 +25,7 @@ Dernière mise à jour : 2026-02-27
 3. **Grep** : aucune occurrence de patterns sensibles (échantillons internes non affichés) dans le repo. setInsecure présent uniquement dans sntp_utils.cpp (fallback HTTP Date, pas OTA). Pas de clé privée OTA dans le repo (uniquement clé publique dans ota.cpp).
 4. **Build prod** exige `secrets.ini` dans esp32_wroom_32e (ou variables d’env). Commande : `cd esp32_wroom_32e && pio run -e esp32-wroom-32e-prod`.
 5. **GO/NO-GO** et **Validation terrain** : tableaux ci-dessous ; à cocher après tests réels. Critères OK/KO et procédures sont définis pour reproductibilité.
-6. **Ce qui manque** (P1/P2) : APP_ENV_DEV (manifest dev/prod), état OTA unifié, procédure factory/EOL. **Logs par niveau : implémenté** (prod = INFO, dev = DEBUG ; voir PRODUCTION_READINESS.md). **Backoff exponentiel Wi‑Fi/MQTT : implémenté** (voir § Backoff). Reset reason : déjà en télémétrie MQTT (FW_BOOT, FW_REBOOT_LOOP). Détail en section « Ce qui manque encore ».
+6. **Ce qui manque** (P1/P2) : APP_ENV_DEV (manifest dev/prod), procédure factory/EOL. **Logs par niveau : implémenté** (prod = INFO, dev = DEBUG ; voir PRODUCTION_READINESS.md). **Backoff exponentiel Wi‑Fi/MQTT : implémenté** (voir § Backoff). Reset reason : déjà en télémétrie MQTT (FW_BOOT, FW_REBOOT_LOOP). Détail en section « Ce qui manque encore ».
 7. **Docs détaillées** (audit, playbook, factory, preuves P0) en annexe uniquement.
 
 ---
@@ -277,7 +277,7 @@ Le script écrit dans `breezly-firmware-dist/...` et dans `back-end-breezly/publ
 |----------|------|-----------|-------------|
 | P1 | Backoff exponentiel Wi‑Fi / MQTT | **Implémenté** : `src/core/backoff.h` + intégration wifi_connect, mqtt_bus ; paramètres dans `app_config.h`. Simulation : env `esp32-wroom-32e-prod-backoff-sim`. | À valider terrain (mauvais mdp Wi‑Fi, broker down, Wi‑Fi down puis up). |
 | P1 | Reset reason au boot | **Partiel** : télémétrie MQTT OK (FW_BOOT : reset_reason, boot_count, brownout_flag ; FW_REBOOT_LOOP : fenêtre 1 min, seuil 5 boots, lastResetReason). Log Serial au boot non fait. | Télémétrie OK |
-| P1 | État OTA unifié (otaIsInProgress partout, suppression variable globale otaInProgress) | Partiel : `otaIsInProgress()` utilisé dans sleep.h, main.cpp, mqtt_bus.cpp ; variable globale `g_otaInProgress` toujours dans ota.cpp | — |
+| P1 | État OTA unifié (otaIsInProgress partout, suppression variable globale otaInProgress) | **Implémenté** : `otaIsInProgress()` utilisé partout (sleep.h, main.cpp, mqtt_bus.cpp, mqtt_ctrl.cpp) ; variable globale `otaInProgress` supprimée de globals.h/globals.cpp ; état interne `g_otaInProgress` (static) uniquement dans ota.cpp. | — |
 | P1 | Procédure factory + EOL exécutée et consignée | Doc présente (FACTORY_E2E_CHECKLIST) | À remplir |
 | P1 | APP_ENV_DEV aligné avec BREEZLY_DEV (manifest dev/prod selon build) | APP_ENV_DEV jamais défini par PlatformIO → URL manifest toujours prod (risque OTA en dev) | — |
 | P2 | Logs par niveau (LOG_LEVEL), pas de payload/secrets en prod | **Implémenté** | `src/core/log.h`, PRODUCTION_READINESS.md |
