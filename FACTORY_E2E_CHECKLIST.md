@@ -28,8 +28,10 @@ Depuis le répertoire **`esp32_wroom_32e`** (ou depuis la racine du repo si le s
 
 ```bash
 cd esp32_wroom_32e
-python scripts/flash_fleet.py --env esp32-wroom-32e-prod --jobs 5 --operator "Nom Opérateur"
+python scripts/flash_fleet.py --env esp32-wroom-32e-prod --jobs 5 --variant STD --operator "Nom Opérateur"
 ```
+
+*(Remplacer `STD` par `PREMIUM` si besoin ; `--variant` est recommandé pour remplir la colonne Variant du journal EOL.)*
 
 Sous Windows, si `python` pointe vers le bon interpréteur :
 
@@ -60,7 +62,7 @@ python scripts\flash_fleet.py --env esp32-wroom-32e-prod --jobs 5 --operator "No
 | `--no-build` | Pas de build (upload uniquement, après un build précédent) | — |
 | `--include` | Filtre ports (ex. `cp210 ch340`) | `cp210` |
 | `--ports` | Liste explicite de ports (ex. `COM3 COM4 COM5`) | auto-détection |
-| `--variant` | Variant matériel pour le backend : `STD` ou `PREMIUM` | — |
+| `--variant` | **Recommandé.** Variant matériel : `STD` ou `PREMIUM` (écrit dans la colonne Variant du journal EOL + transmis au backend). | — |
 | `--pio-exe` | Chemin vers `platformio.exe` (Windows) | chemin par défaut dans le script |
 
 ### 2.4 Format du journal EOL (auto-rempli)
@@ -74,6 +76,8 @@ Le fichier `docs/EOL_LOG.csv` (ou celui donné par `--eol-log`) est créé avec 
 | MAC | Adresse MAC avec deux-points (ex. 80:BA:D0:21:57:88) |
 | external_id | PROV_{MAC 12 hex} (ex. PROV_80BAD0215788) |
 | Version_FW | Version lue depuis `src/app_config.h` (ex. 1.0.25) |
+| **Variant** | **STD ou PREMIUM** (valeur de `--variant` ; obligatoire en prod pour traçabilité) |
+| **Port** | Port utilisé pour le flash (ex. COM8, /dev/ttyUSB0) — traçabilité hub USB |
 | EOL_resultat | OK (upload + enregistrement API OK) ou KO (upload_failed / register_failed_or_no_external_id) |
 | Operateur | Valeur de `--operator` ou `EOL_OPERATOR` |
 | Remarques | Vide si OK ; sinon court motif d’échec |
