@@ -32,9 +32,9 @@ Actions à fort impact, réalisables en moins d’une journée de travail.
    Remplacer les `Serial.println(s)` (payload JSON) par un log conditionnel sur un niveau (ex. `#if LOG_LEVEL >= 2` ou macro `LOG_VERBOSE`) pour ne pas afficher les données en build prod.  
    **Fichiers:** `src/main.cpp` (L412, 424 et al.), évent. macro dans `app_config.h`.
 
-8. **Documenter APP_ENV_DEV vs BREEZLY_DEV**  
-   `app_config.h` utilise `APP_ENV_DEV` pour l’URL du manifest OTA, alors que le build définit `BREEZLY_DEV` / `BREEZLY_PROD`. Soit définir `APP_ENV_DEV` quand `BREEZLY_DEV` est défini (dans platformio.ini: `-DAPP_ENV_DEV` pour l’env dev), soit utiliser `BREEZLY_DEV` dans `app_config.h` pour choisir l’URL.  
-   **Fichiers:** `platformio.ini`, `src/app_config.h`.
+8. **Manifest OTA dev/prod selon build (BREEZLY_DEV / BREEZLY_PROD)** — **Fait**  
+   `app_config.h` et `ota.cpp` utilisent désormais `BREEZLY_DEV` (env dev) pour l’URL manifest dev, sinon prod. Plus de macro APP_ENV_DEV.  
+   **Fichiers:** `src/app_config.h`, `src/ota/ota.cpp`.
 
 9. **Backoff MQTT: premier pas**  
    Remplacer le délai fixe 8 s par un backoff simple: 8 s, 16 s, 32 s, plafond 120 s (et remise à 8 s après connexion réussie).  

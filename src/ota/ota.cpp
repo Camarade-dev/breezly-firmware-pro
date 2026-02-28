@@ -666,7 +666,7 @@ void checkAndPerformCloudOTA(){
   LOGD("OTA", "Allocating manifest buffer...");
   body.reserve(1500);
   if (!fetchWithRetry(url, body)) {
-    #ifdef APP_ENV_DEV
+    #if defined(BREEZLY_DEV)
       String direct = "https://breezly-backendweb.onrender.com/firmware/esp32/wroom32e/dev/latest.json";
     #else
       String direct = "https://breezly-backend.onrender.com/firmware/esp32/wroom32e/prod/latest.json";
