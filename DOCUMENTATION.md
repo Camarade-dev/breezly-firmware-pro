@@ -12,7 +12,7 @@ Dernière mise à jour : 2026-02-28
 | **Version firmware** | `1.0.25` (définie dans `src/app_config.h`) |
 | **P0 (Commercial ready)** | **Validé** — Build prod, flash, boot, WiFi, BLE provisioning, MQTT, publish capteurs, OTA (manifest + fallback backend + download 3 streams), OTA rollback safe, backoff exponentiel Wi‑Fi/MQTT, secrets hors repo, recovery flash manuel. Tous les tests terrain du tableau ci-dessous sont OK. |
 | **P1 (terminé)** | État OTA unifié, manifest dev/prod selon build, reset reason au boot (télémétrie + log Serial), procédure factory + EOL industrielle ([flash_fleet.py](scripts/flash_fleet.py) : une commande, hub USB, journal EOL auto). |
-| **P2** | Logs par niveau (LOG_LEVEL) : **implémenté**. Timeout I2C + reset bus après N échecs : **implémenté** (app_config.h : I2C_BUS_TIMEOUT_MS, I2C_BUS_RESET_AFTER_FAILURES ; sensors.cpp : Wire.setTimeOut, compteur échecs, Wire.end/begin + re-init AHT/ENS160). Reste : sanity checks AQI/TVOC/eCO2 avant publish. |
+| **P2** | Logs par niveau (LOG_LEVEL) : **implémenté**. Timeout I2C + reset bus après N échecs : **implémenté**. Sanity checks AQI/TVOC/eCO2 : **implémenté** (payload toujours envoyé ; `sanity_ok` + `sanity_fail` pour le backend). |
 
 *Pour le détail des validations : tableau « Validation terrain » et section « GO/NO-GO shipping ».*
 
@@ -25,7 +25,7 @@ Dernière mise à jour : 2026-02-28
 3. **Grep** : aucune occurrence de patterns sensibles (échantillons internes non affichés) dans le repo. setInsecure présent uniquement dans sntp_utils.cpp (fallback HTTP Date, pas OTA). Pas de clé privée OTA dans le repo (uniquement clé publique dans ota.cpp).
 4. **Build prod** exige `secrets.ini` dans esp32_wroom_32e (ou variables d’env). Commande : `cd esp32_wroom_32e && pio run -e esp32-wroom-32e-prod`.
 5. **GO/NO-GO** et **Validation terrain** : tableaux ci-dessous ; à cocher après tests réels. Critères OK/KO et procédures sont définis pour reproductibilité.
-6. **Ce qui manque** (P2) : P1 terminé. Logs par niveau et timeout I2C + reset bus : implémentés. Reste P2 : sanity checks AQI/TVOC/eCO2 avant publish. Détail en section « Ce qui manque encore ».
+6. **Ce qui manque** (P2) : P1 terminé. P2 : logs par niveau, timeout I2C + reset bus, sanity checks AQI/TVOC/eCO2 — tous implémentés. Détail en section « Ce qui manque encore ».
 7. **Docs détaillées** (audit, playbook, factory, preuves P0) en annexe uniquement.
 
 ---
@@ -100,7 +100,7 @@ Dernière mise à jour : 2026-02-28
 - [x] **Recovery** : flash manuel (esptool ou PIO) OK sur un device.
 - [x] **Backoff Wi‑Fi/MQTT** : implémenté (core/backoff) ; test terrain optionnel (mauvais mdp Wi‑Fi / broker down → délais croissants).
 
-*Statut actuel :* **P0 complet, P1 terminé.** Validation terrain : build, flash, boot, WiFi, backoff, OTA, MQTT et publish capteurs validés ; **flash flotte (flash_fleet) validé** : 7 devices en ~1 min (build + upload parallèle), journal EOL auto (Variant, Port). **Ensuite** : P2 (sanity checks AQI/TVOC/eCO2) — voir tableau « Ce qui manque encore ».
+*Statut actuel :* **P0 complet, P1 terminé, P2 terminé.** Validation terrain : build, flash, boot, WiFi, backoff, OTA, MQTT et publish capteurs validés ; **flash flotte (flash_fleet) validé** : 7 devices en ~1 min (build + upload parallèle), journal EOL auto (Variant, Port). Sanity checks AQI/TVOC/eCO2 : payload toujours envoyé, flag `sanity_ok`/`sanity_fail` pour le backend.
 
 ---
 
@@ -273,7 +273,7 @@ Le script écrit dans `breezly-firmware-dist/...` et dans `back-end-breezly/publ
 
 ## Ce qui manque encore (P2)
 
-*P1 terminé (tous les items implémentés). Reste P2 et validation terrain optionnelle (backoff). Aligné avec la section « Où on en est ».*
+*P1 et P2 terminés (tous les items implémentés). Validation terrain optionnelle (backoff) possible. Aligné avec la section « Où on en est ».*
 
 | Priorité | Item | État code | Test validé |
 |----------|------|-----------|-------------|
@@ -284,7 +284,7 @@ Le script écrit dans `breezly-firmware-dist/...` et dans `back-end-breezly/publ
 | P1 | Manifest dev/prod selon build (BREEZLY_DEV / BREEZLY_PROD) | **Implémenté** : `app_config.h` et `ota.cpp` utilisent `BREEZLY_DEV` pour URL manifest dev (fallback backendweb), sinon prod. Env dev = canal dev ; env prod = canal prod. | — |
 | P2 | Logs par niveau (LOG_LEVEL), pas de payload/secrets en prod | **Implémenté** | `src/core/log.h`, PRODUCTION_READINESS.md |
 | P2 | Timeout I2C + reset bus capteurs après N échecs | **Implémenté** : `app_config.h` (I2C_BUS_TIMEOUT_MS=500, I2C_BUS_RESET_AFTER_FAILURES=3) ; `sensors.cpp` : Wire.setTimeOut(ESP32), compteur d’échecs consécutifs dans `safeSensorRead`, après N échecs → Wire.end/begin + re-init AHT21/ENS160, log `[I2C] bus reset after N failures`. | — |
-| P2 | Sanity checks AQI/TVOC/eCO2 avant publish | Non implémenté | — |
+| P2 | Sanity checks AQI/TVOC/eCO2 avant publish | **Implémenté** : seuils dans `app_config.h` (AQI 1–5, TVOC ≤20k ppb, eCO2 300–10k ppm). `sensorSanityCheck()` dans `sensors.cpp` ; payload **toujours envoyé** ; champs `sanity_ok` (bool) et `sanity_fail` (liste "aqi,tvoc,eco2") pour le backend. | — |
 
 ---
 
