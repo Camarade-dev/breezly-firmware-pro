@@ -15,6 +15,14 @@ static const char* FW_MANIFEST_URL =
 #define LED_PIN   13
 #define LED_COUNT 1
 #define PMS_ALWAYS_ON   false
+
+// ---------- I2C bus (capteurs AHT21 / ENS160) — robustesse ----------
+#ifndef I2C_BUS_TIMEOUT_MS
+#define I2C_BUS_TIMEOUT_MS         (500UL)   // Timeout par transaction Wire (évite blocage)
+#endif
+#ifndef I2C_BUS_RESET_AFTER_FAILURES
+#define I2C_BUS_RESET_AFTER_FAILURES  (3)    // Après N échecs consécutifs de lecture → Wire.end/begin + re-init capteurs
+#endif
 #define OTA_CHECK_INTERVAL_MS (12UL*60UL*60UL*1000UL)
 
 // ---------- Backoff exponentiel (Wi-Fi / MQTT) ----------

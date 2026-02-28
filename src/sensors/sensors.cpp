@@ -2,6 +2,7 @@
 #include "sensors.h"
 #include <Wire.h>
 #include "../app_config.h"
+#include "../core/log.h"
 #include "calibration.h"
 #include <math.h>
 #ifndef PMS_LOG_BURST
@@ -254,19 +255,39 @@ bool pmsSampleBlocking(uint32_t warmupMs, PmsData& out){
 }
 
 // =======================================================================
-// ======================= AHT21 / ENS160 (inchangé) =====================
+// ======================= AHT21 / ENS160 + I2C robustesse ================
 // =======================================================================
+
+static uint8_t s_i2cConsecutiveFailures = 0;
+
+static void i2cBusReset(){
+  Wire.end();
+  delay(50);
+  Wire.begin();
+  Wire.setClock(100000);
+#if defined(ARDUINO_ARCH_ESP32)
+  Wire.setTimeOut((uint16_t)I2C_BUS_TIMEOUT_MS);
+#endif
+  (void)aht.begin();
+  (void)ens160.begin();
+  ens160.setMode(ENS160_OPMODE_STD);
+  LOGI("I2C", "bus reset after %d failures, sensors re-init", (int)I2C_BUS_RESET_AFTER_FAILURES);
+}
 
 bool sensorsInit(){
   Wire.begin();
   delay(100);
   Wire.setClock(100000);
+#if defined(ARDUINO_ARCH_ESP32)
+  Wire.setTimeOut((uint16_t)I2C_BUS_TIMEOUT_MS);
+#endif
   if (!aht.begin())  Serial.println("AHT21 initialization failed!");
   else               Serial.println("AHT21 initialisé avec succès.");
 
   if (!ens160.begin()) Serial.println("Échec ENS160 !");
   else { Serial.println("ENS160 initialisé avec succès."); ens160.setMode(ENS160_OPMODE_STD); }
 
+  s_i2cConsecutiveFailures = 0;
   if (!gPmsMutex) gPmsMutex = xSemaphoreCreateMutex();
   return true;
 }
@@ -290,9 +311,14 @@ bool safeSensorRead(float& tempC, float& humidity){
   sensors_event_t eventHum, eventTemp;
   aht.getEvent(&eventHum, &eventTemp);
   if (isnan(eventTemp.temperature) || isnan(eventHum.relative_humidity)){
-    Serial.println("Erreur de lecture capteur : données invalides");
+    s_i2cConsecutiveFailures++;
+    if (s_i2cConsecutiveFailures >= I2C_BUS_RESET_AFTER_FAILURES){
+      i2cBusReset();
+      s_i2cConsecutiveFailures = 0;
+    }
     return false;
   }
+  s_i2cConsecutiveFailures = 0;
 
   const float T_raw = eventTemp.temperature;
   const float RH_raw = eventHum.relative_humidity;

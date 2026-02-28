@@ -50,23 +50,38 @@ def parse_external_id_from_upload_output(out):
     external_id = f"PROV_{hex12}"
     return mac_colons, external_id
 
+EOL_HEADER = ["Date", "Heure", "MAC", "external_id", "Version_FW", "Variant", "Port", "EOL_resultat", "Operateur", "Remarques"]
+
 def ensure_eol_log_header(eol_log_path):
-    """Crée le fichier EOL avec en-tête CSV si absent (compatible specs traçabilité)."""
+    """Crée le fichier EOL avec en-tête CSV si absent ; migre l'ancien format (sans Variant/Port) vers le nouveau."""
     path = Path(eol_log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            all_rows = list(csv.reader(f))
+        if all_rows and "Variant" in all_rows[0]:
+            return  # déjà nouveau format
+        # Ancien format (8 colonnes) : migrer en réécrivant avec colonnes Variant et Port vides
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(EOL_HEADER)
+            for r in all_rows[1:]:
+                if len(r) >= 8:
+                    w.writerow([r[0], r[1], r[2], r[3], r[4], "", "", r[5], r[6], r[7]])
+                elif len(r) >= 6:
+                    w.writerow([r[0], r[1], r[2], r[3], r[4], "", "", r[5], r[6] if len(r) > 6 else "", ""])
         return
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["Date", "Heure", "MAC", "external_id", "Version_FW", "EOL_resultat", "Operateur", "Remarques"])
+        w.writerow(EOL_HEADER)
 
-def append_eol_row(eol_log_path, date, time, mac, external_id, version_fw, result, operator, remarks):
+def append_eol_row(eol_log_path, date, time, mac, external_id, version_fw, variant, port, result, operator, remarks):
     """Ajoute une ligne au journal EOL (append, thread-safe depuis le thread principal)."""
     path = Path(eol_log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow([date, time, mac or "", external_id or "", version_fw, result, operator or "", remarks or ""])
+        w.writerow([date, time, mac or "", external_id or "", version_fw, variant or "", port or "", result, operator or "", remarks or ""])
 
 def run_cmd(cmd, cwd=None, env=None, capture=True):
     """
@@ -297,6 +312,7 @@ def main():
             date_str = dt.strftime("%Y-%m-%d")
             time_str = dt.strftime("%H:%M:%S")
 
+            variant_str = (args.variant or "").strip()
             if code == 0:
                 print(f"[{now()}] ✅ {port} OK")
                 if not args.no_eol:
@@ -309,6 +325,8 @@ def main():
                             mac_colons or "",
                             external_id,
                             fw_version,
+                            variant_str,
+                            port,
                             "OK",
                             args.operator,
                             "",
@@ -321,6 +339,8 @@ def main():
                             "",
                             "",
                             fw_version,
+                            variant_str,
+                            port,
                             "KO",
                             args.operator,
                             "register_failed_or_no_external_id",
@@ -336,6 +356,8 @@ def main():
                         "",
                         "",
                         fw_version,
+                        variant_str,
+                        port,
                         "KO",
                         args.operator,
                         "upload_failed",

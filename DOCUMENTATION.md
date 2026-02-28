@@ -12,7 +12,7 @@ Dernière mise à jour : 2026-02-28
 | **Version firmware** | `1.0.25` (définie dans `src/app_config.h`) |
 | **P0 (Commercial ready)** | **Validé** — Build prod, flash, boot, WiFi, BLE provisioning, MQTT, publish capteurs, OTA (manifest + fallback backend + download 3 streams), OTA rollback safe, backoff exponentiel Wi‑Fi/MQTT, secrets hors repo, recovery flash manuel. Tous les tests terrain du tableau ci-dessous sont OK. |
 | **P1 (terminé)** | État OTA unifié, manifest dev/prod selon build, reset reason au boot (télémétrie + log Serial), procédure factory + EOL industrielle ([flash_fleet.py](scripts/flash_fleet.py) : une commande, hub USB, journal EOL auto). |
-| **P2** | Logs par niveau (LOG_LEVEL) : **implémenté** (voir PRODUCTION_READINESS.md). Reste : timeout I2C/reset bus capteurs, sanity checks AQI/TVOC/eCO2 avant publish. |
+| **P2** | Logs par niveau (LOG_LEVEL) : **implémenté**. Timeout I2C + reset bus après N échecs : **implémenté** (app_config.h : I2C_BUS_TIMEOUT_MS, I2C_BUS_RESET_AFTER_FAILURES ; sensors.cpp : Wire.setTimeOut, compteur échecs, Wire.end/begin + re-init AHT/ENS160). Reste : sanity checks AQI/TVOC/eCO2 avant publish. |
 
 *Pour le détail des validations : tableau « Validation terrain » et section « GO/NO-GO shipping ».*
 
@@ -21,11 +21,11 @@ Dernière mise à jour : 2026-02-28
 ## Résumé exécutif
 
 1. **Firmware Breezly ESP32** (esp32_wroom_32e) : P0 implémentés dans le code (secrets hors repo, OTA sans setInsecure dans ota.cpp, release playbook). Version actuelle : **1.0.25** (`src/app_config.h`).
-2. **Statut** : **Commercial ready (P0 complet).** Build prod, flash, boot, WiFi, OTA (manifest + fallback backend + download 3 streams), MQTT, publish capteurs et **OTA rollback safe** validés sur device réel (2026-02) ; logs Serial + post-upload en preuve. Provisioning BLE en amont. Rollback : 3 boots simulés → rollback → pas de ré-install à l’infini (`skip: version X was rolled back`). Voir section **« Où on en est »** pour le récapitulatif.
+2. **Statut** : **Commercial ready (P0 complet, P1 terminé).** Build prod, flash, boot, WiFi, backoff Wi‑Fi/MQTT, OTA (manifest + fallback backend + download 3 streams), MQTT, publish capteurs et **OTA rollback safe** validés sur device réel (2026-02) ; logs Serial + post-upload en preuve. Provisioning BLE en amont. Rollback : 3 boots simulés → rollback → pas de ré-install à l’infini (`skip: version X was rolled back`). P1 : état OTA unifié, manifest dev/prod, reset reason au boot, procédure factory/EOL (flash_fleet). Voir section **« Où on en est »** pour le récapitulatif.
 3. **Grep** : aucune occurrence de patterns sensibles (échantillons internes non affichés) dans le repo. setInsecure présent uniquement dans sntp_utils.cpp (fallback HTTP Date, pas OTA). Pas de clé privée OTA dans le repo (uniquement clé publique dans ota.cpp).
 4. **Build prod** exige `secrets.ini` dans esp32_wroom_32e (ou variables d’env). Commande : `cd esp32_wroom_32e && pio run -e esp32-wroom-32e-prod`.
 5. **GO/NO-GO** et **Validation terrain** : tableaux ci-dessous ; à cocher après tests réels. Critères OK/KO et procédures sont définis pour reproductibilité.
-6. **Ce qui manque** (P2) : P1 terminé (backoff, OTA unifié, manifest dev/prod, reset reason, factory/EOL). Logs par niveau : implémenté. Reste P2 : timeout I2C/reset bus capteurs, sanity checks AQI/TVOC/eCO2. Détail en section « Ce qui manque encore ».
+6. **Ce qui manque** (P2) : P1 terminé. Logs par niveau et timeout I2C + reset bus : implémentés. Reste P2 : sanity checks AQI/TVOC/eCO2 avant publish. Détail en section « Ce qui manque encore ».
 7. **Docs détaillées** (audit, playbook, factory, preuves P0) en annexe uniquement.
 
 ---
@@ -63,6 +63,7 @@ Dernière mise à jour : 2026-02-28
 | Secrets : build sans repo | Vérifier .gitignore (esp32 + backend) et `git status` : aucun fichier secret suivi | secrets.ini, devkey.h, mqtt_secrets.h (esp32) et ec_private.pem / ec_public.pem (backend) dans .gitignore | Secrets commités | OK | esp32_wroom_32e/.gitignore : secrets.ini, src/core/devkey.h, src/net/mqtt_secrets.h, .last_build_sig ; back-end-breezly/.gitignore : tools/ec_private.pem, tools/ec_public.pem. Vérifier en local : `git status` ne doit pas lister ces fichiers. | — | — | 2026-02 |
 | Recovery : flash manuel | `pio run -e esp32-wroom-32e-prod -t upload --upload-port COMx` ou esptool `write_flash 0x10000 firmware.bin` | Flash OK ; device boot sur image flashée | Échec write_flash ou boot | OK | Upload SUCCESS ; Wrote 1446256 bytes at 0x00010000 ; Hash verified ; post-upload register OK | PROV_80BAD0215788 | — | 2026-02 |
 | Backoff Wi‑Fi / MQTT | Mauvais mdp Wi‑Fi : observer Serial `[WiFi] fail reason=... backoff next in XXX ms` (délais croissants, auth_fail ≥ 30 s). Broker down : observer `[MQTT] backoff next in XXX ms`. Wi‑Fi down puis up : retries Wi‑Fi en backoff ; MQTT reprend après Wi‑Fi OK. | Délais non fixes ; pas de spam ; reset après succès | Délais fixes ou boucle agressive | À remplir | — | — | — | — |
+| Flash flotte + journal EOL | `python scripts/flash_fleet.py --env esp32-wroom-32e-prod --jobs 10 --variant STD` (ou PREMIUM) ; 7 ports branchés | Build SUCCESS (~60 s) ; 7/7 upload OK ; journal EOL mis à jour (Variant, Port, external_id par appareil) | Échec build ou upload, journal non rempli | OK | Build 00:01:00 ; 7 ports (COM8, COM11, COM17, COM18, COM21, COM22, COM23) ; OK=7 FAIL=0 ; journal EOL mis à jour avec colonnes Variant/Port | 7 devices | — | 2026-02 |
 
 *Post-upload (provisioning)* : le script `post_upload_register.py` attend après le flash que le device boot et envoie sur la série la ligne `BREEZLY_EXTERNAL_ID=PROV_xxxx` (même valeur que le nom BLE). Ainsi l’external_id utilisé pour le provisioning est toujours celui du device flashé, y compris en téléversement parallèle ou si le port esptool lit un autre device. Si cette ligne n’est pas reçue (timeout ou `pyserial` absent), fallback sur `esptool read_mac` (avec risque de décalage port/device). Optionnel : `pip install pyserial` pour activer la lecture série.
 
@@ -99,7 +100,7 @@ Dernière mise à jour : 2026-02-28
 - [x] **Recovery** : flash manuel (esptool ou PIO) OK sur un device.
 - [x] **Backoff Wi‑Fi/MQTT** : implémenté (core/backoff) ; test terrain optionnel (mauvais mdp Wi‑Fi / broker down → délais croissants).
 
-*Statut actuel :* **P0 complet, P1 terminé.** Validation terrain : build, flash, boot, WiFi, backoff, OTA (manifest + download + rollback safe), MQTT et publish capteurs validés sur device (PROV_80BAD0215788) ; BLE/provisioning en amont ; manifest dev/prod, reset reason, factory/EOL (flash_fleet) implémentés. **Ensuite** : P2 (timeout I2C, sanity checks) — voir tableau « Ce qui manque encore ».
+*Statut actuel :* **P0 complet, P1 terminé.** Validation terrain : build, flash, boot, WiFi, backoff, OTA, MQTT et publish capteurs validés ; **flash flotte (flash_fleet) validé** : 7 devices en ~1 min (build + upload parallèle), journal EOL auto (Variant, Port). **Ensuite** : P2 (sanity checks AQI/TVOC/eCO2) — voir tableau « Ce qui manque encore ».
 
 ---
 
@@ -279,10 +280,10 @@ Le script écrit dans `breezly-firmware-dist/...` et dans `back-end-breezly/publ
 | P1 | Backoff exponentiel Wi‑Fi / MQTT | **Implémenté** : `src/core/backoff.h` + intégration wifi_connect, mqtt_bus ; paramètres dans `app_config.h`. Simulation : env `esp32-wroom-32e-prod-backoff-sim`. | À valider terrain (mauvais mdp Wi‑Fi, broker down, Wi‑Fi down puis up). |
 | P1 | Reset reason au boot | **Implémenté** : télémétrie MQTT (FW_BOOT : reset_reason, boot_count, brownout_flag ; FW_REBOOT_LOOP : fenêtre 1 min, seuil 5 boots). Log Serial au boot dans `main.cpp` setup() : `[BOOT] reset_reason=... boot_count=... brownout=...`. | Télémétrie + Serial OK |
 | P1 | État OTA unifié (otaIsInProgress partout, suppression variable globale otaInProgress) | **Implémenté** : `otaIsInProgress()` utilisé partout (sleep.h, main.cpp, mqtt_bus.cpp, mqtt_ctrl.cpp) ; variable globale `otaInProgress` supprimée de globals.h/globals.cpp ; état interne `g_otaInProgress` (static) uniquement dans ota.cpp. | — |
-| P1 | Procédure factory + EOL exécutée et consignée | **Implémenté** : [scripts/flash_fleet.py](scripts/flash_fleet.py) (flash flotte en parallèle + journal EOL auto) ; [FACTORY_E2E_CHECKLIST.md](FACTORY_E2E_CHECKLIST.md) (procédure industrielle une commande + manuelle + recovery). Journal EOL : `docs/EOL_LOG.csv` rempli automatiquement à chaque run. | À exécuter par lot (connecter USB, lancer flash_fleet) |
+| P1 | Procédure factory + EOL exécutée et consignée | **Implémenté** : [scripts/flash_fleet.py](scripts/flash_fleet.py) (flash flotte + journal EOL auto, colonnes Variant/Port). **Test validé** : 7 devices, jobs=10, build ~60 s, OK=7/7, journal EOL mis à jour. | Validé 2026-02 |
 | P1 | Manifest dev/prod selon build (BREEZLY_DEV / BREEZLY_PROD) | **Implémenté** : `app_config.h` et `ota.cpp` utilisent `BREEZLY_DEV` pour URL manifest dev (fallback backendweb), sinon prod. Env dev = canal dev ; env prod = canal prod. | — |
 | P2 | Logs par niveau (LOG_LEVEL), pas de payload/secrets en prod | **Implémenté** | `src/core/log.h`, PRODUCTION_READINESS.md |
-| P2 | Timeout I2C + reset bus capteurs après N échecs | Non implémenté | — |
+| P2 | Timeout I2C + reset bus capteurs après N échecs | **Implémenté** : `app_config.h` (I2C_BUS_TIMEOUT_MS=500, I2C_BUS_RESET_AFTER_FAILURES=3) ; `sensors.cpp` : Wire.setTimeOut(ESP32), compteur d’échecs consécutifs dans `safeSensorRead`, après N échecs → Wire.end/begin + re-init AHT21/ENS160, log `[I2C] bus reset after N failures`. | — |
 | P2 | Sanity checks AQI/TVOC/eCO2 avant publish | Non implémenté | — |
 
 ---
