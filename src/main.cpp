@@ -16,6 +16,7 @@
 #include "core/backoff.h"
 #include "core/log.h"
 #include "esp_task_wdt.h"
+#include <esp_system.h>
 #include <ArduinoJson.h>
 #include "core/devkey_runtime.h"
 #include "power/cpu_pm.h"
@@ -243,6 +244,32 @@ if (p.begin("myApp", false)) {
 void setup(){
   delay(500);
   Serial.begin(115200);
+  delay(100);
+
+  // Log reset reason et boot_count au boot (aligné télémétrie MQTT FW_BOOT)
+  {
+    const char* rr = "unknown";
+    switch (esp_reset_reason()) {
+      case ESP_RST_POWERON:  rr = "power_on";     break;
+      case ESP_RST_EXT:      rr = "external";     break;
+      case ESP_RST_SW:       rr = "software";     break;
+      case ESP_RST_PANIC:    rr = "panic";        break;
+      case ESP_RST_INT_WDT:  rr = "int_wdt";      break;
+      case ESP_RST_TASK_WDT: rr = "task_wdt";    break;
+      case ESP_RST_WDT:      rr = "wdt";          break;
+      case ESP_RST_DEEPSLEEP:rr = "deep_sleep";   break;
+      case ESP_RST_BROWNOUT: rr = "brownout";     break;
+      case ESP_RST_SDIO:     rr = "sdio";         break;
+      default:               rr = "unknown";      break;
+    }
+    bool brownout = (esp_reset_reason() == ESP_RST_BROWNOUT);
+    Preferences bootPrefs;
+    bootPrefs.begin("boot", true);
+    uint32_t nvsCount = bootPrefs.getUInt("count", 0);
+    bootPrefs.end();
+    uint32_t bootCount = nvsCount + 1;  // valeur qui sera envoyée en FW_BOOT
+    LOGI("BOOT", "reset_reason=%s boot_count=%lu brownout=%d", rr, (unsigned long)bootCount, (int)brownout);
+  }
 
 #if defined(BACKOFF_SIM_TEST)
   backoff_run_simulation();

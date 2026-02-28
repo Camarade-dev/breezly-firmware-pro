@@ -3,12 +3,11 @@
 #define CURRENT_FIRMWARE_VERSION "1.0.25"
 #define BUILD_ID __DATE__ " " __TIME__
 
-#ifdef APP_ENV_DEV
-// Canal DEV → manifest dev
+// Canal manifest OTA selon build : BREEZLY_DEV (env dev) → dev ; BREEZLY_PROD (env prod) → prod.
+#if defined(BREEZLY_DEV)
 static const char* FW_MANIFEST_URL =
   "https://Camarade-dev.github.io/breezly-firmware-dist/firmware/esp32/wroom32e/dev/latest.json";
 #else
-// Canal PROD → manifest prod
 static const char* FW_MANIFEST_URL =
   "https://Camarade-dev.github.io/breezly-firmware-dist/firmware/esp32/wroom32e/prod/latest.json";
 #endif

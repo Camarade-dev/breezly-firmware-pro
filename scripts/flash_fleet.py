@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Flash en parallèle une flotte d'ESP32 (hub USB multi-ports) et remplit automatiquement
+le journal EOL (traçabilité commerciale). Une seule commande : brancher les PCBs, lancer le script.
+"""
 
 import argparse
+import csv
 import json
 import os
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,9 +17,56 @@ from datetime import datetime
 from pathlib import Path
 
 DEFAULT_PIO_EXE = r"C:\Users\stris\.platformio\penv\Scripts\platformio.exe"
+EOL_LOG_DEFAULT = "docs/EOL_LOG.csv"
+APP_CONFIG_PATH = "src/app_config.h"
 
 def now():
     return datetime.now().strftime("%H:%M:%S")
+
+def get_fw_version(cwd):
+    """Lit CURRENT_FIRMWARE_VERSION depuis src/app_config.h."""
+    path = Path(cwd) / APP_CONFIG_PATH
+    if not path.exists():
+        return "unknown"
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        m = re.search(r'#define\s+CURRENT_FIRMWARE_VERSION\s+"([^"]+)"', text)
+        return m.group(1) if m else "unknown"
+    except Exception:
+        return "unknown"
+
+def parse_external_id_from_upload_output(out):
+    """
+    Extrait MAC (12 hex) et external_id (PROV_XXXXXXXXXXXX) de la sortie du post_upload_register.
+    Retourne (mac_with_colons, external_id) ou (None, None).
+    """
+    if not out:
+        return None, None
+    m = re.search(r"external_id pour provision:\s*PROV_([0-9A-Fa-f]{12})", out)
+    if not m:
+        return None, None
+    hex12 = m.group(1).upper()
+    mac_colons = ":".join(hex12[i : i + 2] for i in range(0, 12, 2))
+    external_id = f"PROV_{hex12}"
+    return mac_colons, external_id
+
+def ensure_eol_log_header(eol_log_path):
+    """Crée le fichier EOL avec en-tête CSV si absent (compatible specs traçabilité)."""
+    path = Path(eol_log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        return
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["Date", "Heure", "MAC", "external_id", "Version_FW", "EOL_resultat", "Operateur", "Remarques"])
+
+def append_eol_row(eol_log_path, date, time, mac, external_id, version_fw, result, operator, remarks):
+    """Ajoute une ligne au journal EOL (append, thread-safe depuis le thread principal)."""
+    path = Path(eol_log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([date, time, mac or "", external_id or "", version_fw, result, operator or "", remarks or ""])
 
 def run_cmd(cmd, cwd=None, env=None, capture=True):
     """
@@ -176,6 +229,21 @@ def main():
         action="store_true",
         help="Ne compile pas (upload direct). Utile si tu as déjà build.",
     )
+    parser.add_argument(
+        "--eol-log",
+        default=EOL_LOG_DEFAULT,
+        help=f"Fichier journal EOL (CSV) à remplir automatiquement. Défaut: {EOL_LOG_DEFAULT}",
+    )
+    parser.add_argument(
+        "--no-eol",
+        action="store_true",
+        help="Désactive l'écriture du journal EOL (flash uniquement).",
+    )
+    parser.add_argument(
+        "--operator",
+        default=os.environ.get("EOL_OPERATOR", ""),
+        help="Nom de l'opérateur pour la traçabilité EOL (ou variable EOL_OPERATOR).",
+    )
     args = parser.parse_args()
 
     cwd = os.getcwd()
@@ -200,8 +268,16 @@ def main():
             "→ Option: --include CP210 CH340\n"
         )
 
+    fw_version = get_fw_version(cwd)
+    eol_log_path = Path(args.eol_log) if not Path(args.eol_log).is_absolute() else Path(args.eol_log)
+    if not eol_log_path.is_absolute():
+        eol_log_path = Path(cwd) / eol_log_path
+    if not args.no_eol:
+        ensure_eol_log_header(str(eol_log_path))
+        print(f"[{now()}] Journal EOL: {eol_log_path}")
+
     print(f"[{now()}] Ports détectés ({len(ports)}): {', '.join(ports)}")
-    print(f"[{now()}] Upload parallèle: jobs={args.jobs}")
+    print(f"[{now()}] Upload parallèle: jobs={args.jobs} (FW {fw_version})")
 
     results = {}
     failed = []
@@ -217,12 +293,53 @@ def main():
                 code, out, err = 1, "", f"Exception: {e}"
 
             results[port] = (code, out, err)
+            dt = datetime.now()
+            date_str = dt.strftime("%Y-%m-%d")
+            time_str = dt.strftime("%H:%M:%S")
 
             if code == 0:
                 print(f"[{now()}] ✅ {port} OK")
+                if not args.no_eol:
+                    mac_colons, external_id = parse_external_id_from_upload_output(out)
+                    if external_id:
+                        append_eol_row(
+                            str(eol_log_path),
+                            date_str,
+                            time_str,
+                            mac_colons or "",
+                            external_id,
+                            fw_version,
+                            "OK",
+                            args.operator,
+                            "",
+                        )
+                    else:
+                        append_eol_row(
+                            str(eol_log_path),
+                            date_str,
+                            time_str,
+                            "",
+                            "",
+                            fw_version,
+                            "KO",
+                            args.operator,
+                            "register_failed_or_no_external_id",
+                        )
             else:
                 print(f"[{now()}] ❌ {port} FAIL ({code})", file=sys.stderr)
                 failed.append(port)
+                if not args.no_eol:
+                    append_eol_row(
+                        str(eol_log_path),
+                        date_str,
+                        time_str,
+                        "",
+                        "",
+                        fw_version,
+                        "KO",
+                        args.operator,
+                        "upload_failed",
+                    )
 
             # Optionnel: afficher un extrait utile si fail
             if code != 0:
@@ -232,6 +349,8 @@ def main():
                     print(err.rstrip(), file=sys.stderr)
 
     print(f"\n[{now()}] Terminé. OK={len(ports)-len(failed)} / FAIL={len(failed)}")
+    if not args.no_eol:
+        print(f"[{now()}] Journal EOL mis à jour: {eol_log_path}")
     if failed:
         print(f"Ports en échec: {', '.join(failed)}", file=sys.stderr)
         sys.exit(2)

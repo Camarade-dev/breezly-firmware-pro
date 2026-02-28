@@ -1,7 +1,7 @@
 # Documentation globale — Breezly / Multiagent
 
 **Une seule page de vérité : statut firmware, preuves, tests, GO/NO-GO, manques.**  
-Dernière mise à jour : 2026-02-27
+Dernière mise à jour : 2026-02-28
 
 ---
 
@@ -10,8 +10,8 @@ Dernière mise à jour : 2026-02-27
 | Élément | État |
 |--------|------|
 | **Version firmware** | `1.0.25` (définie dans `src/app_config.h`) |
-| **P0 (Commercial ready)** | **Validé** — Build prod, flash, boot, WiFi, BLE provisioning, MQTT, publish capteurs, OTA (manifest + fallback backend + download 3 streams), OTA rollback safe, secrets hors repo, recovery flash manuel. Tous les tests terrain du tableau ci-dessous sont OK. |
-| **P1 (en cours)** | **Backoff exponentiel Wi‑Fi/MQTT : implémenté** (voir § Backoff). **État OTA unifié : implémenté** (otaIsInProgress() partout, variable globale supprimée). Reste : APP_ENV_DEV (manifest dev/prod), procédure factory/EOL documentée et exécutée. Reset reason : déjà en télémétrie MQTT (FW_BOOT, FW_REBOOT_LOOP). |
+| **P0 (Commercial ready)** | **Validé** — Build prod, flash, boot, WiFi, BLE provisioning, MQTT, publish capteurs, OTA (manifest + fallback backend + download 3 streams), OTA rollback safe, backoff exponentiel Wi‑Fi/MQTT, secrets hors repo, recovery flash manuel. Tous les tests terrain du tableau ci-dessous sont OK. |
+| **P1 (terminé)** | État OTA unifié, manifest dev/prod selon build, reset reason au boot (télémétrie + log Serial), procédure factory + EOL industrielle ([flash_fleet.py](scripts/flash_fleet.py) : une commande, hub USB, journal EOL auto). |
 | **P2** | Logs par niveau (LOG_LEVEL) : **implémenté** (voir PRODUCTION_READINESS.md). Reste : timeout I2C/reset bus capteurs, sanity checks AQI/TVOC/eCO2 avant publish. |
 
 *Pour le détail des validations : tableau « Validation terrain » et section « GO/NO-GO shipping ».*
@@ -25,7 +25,7 @@ Dernière mise à jour : 2026-02-27
 3. **Grep** : aucune occurrence de patterns sensibles (échantillons internes non affichés) dans le repo. setInsecure présent uniquement dans sntp_utils.cpp (fallback HTTP Date, pas OTA). Pas de clé privée OTA dans le repo (uniquement clé publique dans ota.cpp).
 4. **Build prod** exige `secrets.ini` dans esp32_wroom_32e (ou variables d’env). Commande : `cd esp32_wroom_32e && pio run -e esp32-wroom-32e-prod`.
 5. **GO/NO-GO** et **Validation terrain** : tableaux ci-dessous ; à cocher après tests réels. Critères OK/KO et procédures sont définis pour reproductibilité.
-6. **Ce qui manque** (P1/P2) : APP_ENV_DEV (manifest dev/prod), procédure factory/EOL. **Logs par niveau : implémenté** (prod = INFO, dev = DEBUG ; voir PRODUCTION_READINESS.md). **Backoff exponentiel Wi‑Fi/MQTT : implémenté** (voir § Backoff). Reset reason : déjà en télémétrie MQTT (FW_BOOT, FW_REBOOT_LOOP). Détail en section « Ce qui manque encore ».
+6. **Ce qui manque** (P2) : P1 terminé (backoff, OTA unifié, manifest dev/prod, reset reason, factory/EOL). Logs par niveau : implémenté. Reste P2 : timeout I2C/reset bus capteurs, sanity checks AQI/TVOC/eCO2. Détail en section « Ce qui manque encore ».
 7. **Docs détaillées** (audit, playbook, factory, preuves P0) en annexe uniquement.
 
 ---
@@ -40,7 +40,7 @@ Dernière mise à jour : 2026-02-27
 | **Littéraux secrets** (patterns sensibles) | esp32_wroom_32e (repo versionné) | — | Aucune occurrence (échantillons internes non affichés). |
 | **Clé privée OTA** | esp32_wroom_32e | — | Aucune. ota.cpp contient OTA_PUBKEY_PEM (publique). Signer le manifest se fait hors repo (clé privée côté CI/outil). |
 | **URLs prod** | esp32_wroom_32e/platformio.ini | 67 (dev), 83 (prod) | Dev = backendweb ; prod = backend. Séparation par env. ota.cpp 644-646 : backendweb (dev) / backend (prod) selon BREEZLY_DEV/PROD. Pas de mélange. |
-| **APP_ENV_DEV** | esp32_wroom_32e/src/app_config.h | 5 | Utilisé pour URL manifest ; jamais défini par le build (platformio ne définit que BREEZLY_DEV / BREEZLY_PROD). Donc URL manifest OTA = toujours prod. |
+| **Manifest dev/prod** | esp32_wroom_32e/src/app_config.h, ota.cpp | — | Aligné sur le build : `BREEZLY_DEV` (env dev) → URL manifest dev ; `BREEZLY_PROD` (env prod) → URL manifest prod. Plus de macro APP_ENV_DEV. |
 
 ---
 
@@ -58,7 +58,7 @@ Dernière mise à jour : 2026-02-27
 | Wi‑Fi EAP (si supporté) | Même scénario avec EAP (PEAP/MSCHAPv2) | Connexion établie | Échec ou non testé | Non exécuté | — | — | — | — |
 | MQTT connect + LWT + status | Après WiFi : vérifier broker (HiveMQ) ; topic status device | Connect ; LWT configuré ; message status (ex. online) reçu | Pas de connect, pas de status | OK | Serial : [MQTT] trying clientId=... host=...s1.eu.hivemq.cloud ; sub ctrl=prod/breezly/devices/... ; [ESP->APP][NOTIFY] hello_ok | PROV_80BAD0215788 | — | 2026-02 |
 | Publish capteurs | Attendre au moins une période ENS (config) ou 1–2 min | Au moins 1 trame sur topic qualite_air (ou équivalent) reçue côté backend/broker | Aucune trame capteur | OK | Serial : Enqueue prod/capteurs/qualite_air ; JSON temperature, humidity, AQI, TVOC, eCO2, sensorId, userId | PROV_80BAD0215788 | — | 2026-02 |
-| OTA : manifest + download + reboot | Mettre à jour manifest (version supérieure), déclencher OTA (MQTT ou attente check) | Device télécharge, reboot, nouvelle version visible (Serial ou status) | Échec download, pas de reboot, mauvaise version | OK | Primary URL (GitHub Pages) connection refused ; fallback backend OK ; manifest 1.0.22 ; signature OK ; download en 3 streams ; reboot ; version 1.0.22 ; « déjà à jour (skip) » au boot suivant | PROV_80BAD0215788 | — | 2026-02 |
+| OTA : manifest + download + reboot | Mettre à jour manifest (version supérieure), déclencher OTA (MQTT ou attente check) | Device télécharge, reboot, nouvelle version visible (Serial ou status) | Échec download, pas de reboot, mauvaise version | OK | **Test validé.** Retest 2026-02 : OTA fonctionne parfaitement. Primary URL (GitHub Pages) → fallback backend ; manifest + signature OK ; download 3 streams ; reboot ; version à jour. | PROV_80BAD0215788 | — | 2026-02 |
 | OTA : rollback safe (staging) | Env `esp32-wroom-32e-prod-rollback-test` : OTA vers firmware qui simule 3 boots en échec | Rollback vers partition précédente ; 4ᵉ boot = ancienne app ; pas de ré-install à l’infini | Brick ou boucle sans recovery | OK | Serial : 3× simulate failed boot → Too many failed boots → rollback ; Rollback target: clear pending ; au check OTA suivant : « skip: version 1.0.23 was rolled back (reject re-install) » | PROV_80BAD0215788 | — | 2026-02 |
 | Secrets : build sans repo | Vérifier .gitignore (esp32 + backend) et `git status` : aucun fichier secret suivi | secrets.ini, devkey.h, mqtt_secrets.h (esp32) et ec_private.pem / ec_public.pem (backend) dans .gitignore | Secrets commités | OK | esp32_wroom_32e/.gitignore : secrets.ini, src/core/devkey.h, src/net/mqtt_secrets.h, .last_build_sig ; back-end-breezly/.gitignore : tools/ec_private.pem, tools/ec_public.pem. Vérifier en local : `git status` ne doit pas lister ces fichiers. | — | — | 2026-02 |
 | Recovery : flash manuel | `pio run -e esp32-wroom-32e-prod -t upload --upload-port COMx` ou esptool `write_flash 0x10000 firmware.bin` | Flash OK ; device boot sur image flashée | Échec write_flash ou boot | OK | Upload SUCCESS ; Wrote 1446256 bytes at 0x00010000 ; Hash verified ; post-upload register OK | PROV_80BAD0215788 | — | 2026-02 |
@@ -76,7 +76,7 @@ Dernière mise à jour : 2026-02-27
 4. **Provisioning** — App : écriture credentials ; device ack, WiFi tenté. *Fait en amont ; status connected visible en Serial.*
 5. **Wi‑Fi OK** — Connexion établie (Serial : [WiFi] OK IP=...). *Validé 2026-02.*
 6. **MQTT status + 1 trame capteur** — Connect, LWT, au moins un message status et une trame qualite_air. *Validé 2026-02 (HiveMQ, topic prod/capteurs/qualite_air).*
-7. **(Option) OTA staging** — Bump version, manifest à jour ; déclencher OTA ; reboot ; version visible. *OTA validé : backend sert manifest + .bin (3 streams). Rollback safe validé : env rollback-test → 3 reboots → rollback → « skip: version X was rolled back » au check suivant.*
+7. **(Option) OTA staging** — Bump version, manifest à jour ; déclencher OTA ; reboot ; version visible. *Test validé : OTA (manifest + .bin 3 streams) ; rollback safe validé (env rollback-test).*
 8. **(Option) Backoff** — Mauvais mdp Wi‑Fi ou broker MQTT down : vérifier en Serial que les délais de retry augmentent (backoff) et ne restent pas fixes. *Voir § Backoff et tableau Validation terrain.*
 
 ---
@@ -94,11 +94,12 @@ Dernière mise à jour : 2026-02-27
 - [x] **Capteurs** : au moins une trame qualite_air reçue.
 - [x] **OTA** : check manifest + download + reboot + version visible — validé (backend sert manifest + .bin ; téléchargement en 3 streams, reboot OK).
 - [x] **OTA rollback safe** : 3 boots en échec → rollback vers partition précédente ; version rejetée non réinstallée à l’infini (`rolled_back_ver` + skip).
-- [ ] **OTA env** : manifest URL dev/prod correctement sélectionnée (pas « toujours prod »).
+- [x] **OTA env** : manifest URL dev/prod selon build (BREEZLY_DEV → dev, BREEZLY_PROD → prod).
 - [x] **Secrets** : secrets.ini / headers générés (esp32) et clés OTA (backend) dans .gitignore ; à vérifier en local avec `git status` qu’ils ne sont pas suivis.
 - [x] **Recovery** : flash manuel (esptool ou PIO) OK sur un device.
+- [x] **Backoff Wi‑Fi/MQTT** : implémenté (core/backoff) ; test terrain optionnel (mauvais mdp Wi‑Fi / broker down → délais croissants).
 
-*Statut actuel :* **P0 complet** (grep + preuves). Validation terrain : build, flash, boot, WiFi, OTA (manifest + download + rollback safe), MQTT et publish capteurs validés sur device (PROV_80BAD0215788) en 2026-02 ; BLE/provisioning en amont. **Ensuite** : voir section « Où on en est » et tableau « Ce qui manque encore » (P1/P2).
+*Statut actuel :* **P0 complet, P1 terminé.** Validation terrain : build, flash, boot, WiFi, backoff, OTA (manifest + download + rollback safe), MQTT et publish capteurs validés sur device (PROV_80BAD0215788) ; BLE/provisioning en amont ; manifest dev/prod, reset reason, factory/EOL (flash_fleet) implémentés. **Ensuite** : P2 (timeout I2C, sanity checks) — voir tableau « Ce qui manque encore ».
 
 ---
 
@@ -269,17 +270,17 @@ Le script écrit dans `breezly-firmware-dist/...` et dans `back-end-breezly/publ
 
 ---
 
-## Ce qui manque encore (P1 / P2)
+## Ce qui manque encore (P2)
 
-*Basé sur l’état du code et les tests non encore validés. Aligné avec la section « Où on en est ».*
+*P1 terminé (tous les items implémentés). Reste P2 et validation terrain optionnelle (backoff). Aligné avec la section « Où on en est ».*
 
 | Priorité | Item | État code | Test validé |
 |----------|------|-----------|-------------|
 | P1 | Backoff exponentiel Wi‑Fi / MQTT | **Implémenté** : `src/core/backoff.h` + intégration wifi_connect, mqtt_bus ; paramètres dans `app_config.h`. Simulation : env `esp32-wroom-32e-prod-backoff-sim`. | À valider terrain (mauvais mdp Wi‑Fi, broker down, Wi‑Fi down puis up). |
-| P1 | Reset reason au boot | **Partiel** : télémétrie MQTT OK (FW_BOOT : reset_reason, boot_count, brownout_flag ; FW_REBOOT_LOOP : fenêtre 1 min, seuil 5 boots, lastResetReason). Log Serial au boot non fait. | Télémétrie OK |
+| P1 | Reset reason au boot | **Implémenté** : télémétrie MQTT (FW_BOOT : reset_reason, boot_count, brownout_flag ; FW_REBOOT_LOOP : fenêtre 1 min, seuil 5 boots). Log Serial au boot dans `main.cpp` setup() : `[BOOT] reset_reason=... boot_count=... brownout=...`. | Télémétrie + Serial OK |
 | P1 | État OTA unifié (otaIsInProgress partout, suppression variable globale otaInProgress) | **Implémenté** : `otaIsInProgress()` utilisé partout (sleep.h, main.cpp, mqtt_bus.cpp, mqtt_ctrl.cpp) ; variable globale `otaInProgress` supprimée de globals.h/globals.cpp ; état interne `g_otaInProgress` (static) uniquement dans ota.cpp. | — |
-| P1 | Procédure factory + EOL exécutée et consignée | Doc présente (FACTORY_E2E_CHECKLIST) | À remplir |
-| P1 | APP_ENV_DEV aligné avec BREEZLY_DEV (manifest dev/prod selon build) | APP_ENV_DEV jamais défini par PlatformIO → URL manifest toujours prod (risque OTA en dev) | — |
+| P1 | Procédure factory + EOL exécutée et consignée | **Implémenté** : [scripts/flash_fleet.py](scripts/flash_fleet.py) (flash flotte en parallèle + journal EOL auto) ; [FACTORY_E2E_CHECKLIST.md](FACTORY_E2E_CHECKLIST.md) (procédure industrielle une commande + manuelle + recovery). Journal EOL : `docs/EOL_LOG.csv` rempli automatiquement à chaque run. | À exécuter par lot (connecter USB, lancer flash_fleet) |
+| P1 | Manifest dev/prod selon build (BREEZLY_DEV / BREEZLY_PROD) | **Implémenté** : `app_config.h` et `ota.cpp` utilisent `BREEZLY_DEV` pour URL manifest dev (fallback backendweb), sinon prod. Env dev = canal dev ; env prod = canal prod. | — |
 | P2 | Logs par niveau (LOG_LEVEL), pas de payload/secrets en prod | **Implémenté** | `src/core/log.h`, PRODUCTION_READINESS.md |
 | P2 | Timeout I2C + reset bus capteurs après N échecs | Non implémenté | — |
 | P2 | Sanity checks AQI/TVOC/eCO2 avant publish | Non implémenté | — |
@@ -358,7 +359,7 @@ Au boot, la fonction `backoff_run_simulation()` imprime une série de lignes `[B
 | [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) | Build, téléversement, GO/NO-GO, résultats grep, liens. |
 | [esp32_wroom_32e/FIRMWARE_PRODUCTION_READINESS_AUDIT.md](esp32_wroom_32e/FIRMWARE_PRODUCTION_READINESS_AUDIT.md) | Audit complet (architecture, checklist, sécurité, OTA, robustesse, factory, plan P0/P1/P2). |
 | [esp32_wroom_32e/RELEASE_PLAYBOOK.md](esp32_wroom_32e/RELEASE_PLAYBOOK.md) | Bump version, build prod, manifest (version, url, size, sha256, sig ECDSA), test 1 device, DoD. Clé privée OTA : hors repo (CI/outil de signature). |
-| [esp32_wroom_32e/FACTORY_E2E_CHECKLIST.md](esp32_wroom_32e/FACTORY_E2E_CHECKLIST.md) | Flash usine, EOL, recovery, traçabilité. |
+| [esp32_wroom_32e/FACTORY_E2E_CHECKLIST.md](esp32_wroom_32e/FACTORY_E2E_CHECKLIST.md) | Procédure **industrielle** : [flash_fleet.py](esp32_wroom_32e/scripts/flash_fleet.py) (une commande, hub USB, EOL auto) ; manuelle ; recovery ; journal EOL `docs/EOL_LOG.csv` (auto) ou template `docs/FACTORY_EOL_LOG_TEMPLATE.csv`. |
 | [esp32_wroom_32e/QUICK_WINS.md](esp32_wroom_32e/QUICK_WINS.md) | Actions < 1 j (dont déjà faites P0). |
 | [esp32_wroom_32e/AUDIT_P0_PREUVES.md](esp32_wroom_32e/AUDIT_P0_PREUVES.md) | Preuves P0 (fichier + ligne) alignement code/doc. |
 | [BREEZLY_DA_BRANDING.md](BREEZLY_DA_BRANDING.md) | Charte design / branding. |
