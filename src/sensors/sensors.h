@@ -6,6 +6,11 @@ bool sensorsInit();
 bool safeSensorRead(float& tempC, float& humidity);
 void sensorsReadEns160(int& aqi, int& tvoc, int& eco2, float tempC, float humidity);
 
+/** Sanity check AQI/TVOC/eCO2 (seuils dans app_config.h). Ne bloque jamais l'envoi.
+ *  Retourne true si toutes les valeurs sont dans les plages considérées "sanes".
+ *  Si failOut != nullptr et failOutSize > 0, écrit en cas d'échec la liste des champs hors plage ("aqi", "tvoc", "eco2", séparés par des virgules). */
+bool sensorSanityCheck(int aqi, int tvoc, int eco2, char* failOut, size_t failOutSize);
+
 void pmsTaskStart(int rx, int tx);
 void  pmsInitPins(int setPin);
 void  pmsSleep();                 // SET=LOW

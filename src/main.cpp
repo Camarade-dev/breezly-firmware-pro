@@ -489,6 +489,11 @@ void loop(){
 
     if (doEns || doPms){
       float pm1f = NAN, pm25f = NAN, pm10f = NAN;
+      bool sanityOk = true;
+      char sanityFailBuf[32] = {};
+      if (doEns){
+        sanityOk = sensorSanityCheck(aqi, tvoc, eco2, sanityFailBuf, sizeof(sanityFailBuf));
+      }
 
       if (havePms){
         // 1) FUSION + LISSSAGE → valeurs UX au dixième
@@ -498,10 +503,12 @@ void loop(){
           return floorf(v * 10.0f + 0.5f) / 10.0f; // arrondi au 0.1
         };
 
-        // 2) Publis structurées
+        // 2) Publis structurées (toujours envoyées ; sanity_ok pour le backend)
         StaticJsonDocument<512> j;
         if (doEns){
           j["temperature"]=t; j["humidity"]=h; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
+          j["sanity_ok"] = sanityOk;
+          if (!sanityOk && sanityFailBuf[0]) j["sanity_fail"] = sanityFailBuf;
         }
 
         // --- ux : valeurs fusionnées/lissées (pour l’app & le backend)
@@ -534,10 +541,12 @@ void loop(){
         LOGD("MQTT", "qualite_air payload len=%u", (unsigned)s.length());
         mqtt_flush(200);
       } else {
-        // cas sans PMS dispo : on envoie ENS uniquement
+        // cas sans PMS dispo : on envoie ENS uniquement (toujours envoyé ; sanity_ok pour le backend)
         StaticJsonDocument<512> j;
         if (doEns){
           j["temperature"]=t; j["humidity"]=h; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
+          j["sanity_ok"] = sanityOk;
+          if (!sanityOk && sanityFailBuf[0]) j["sanity_fail"] = sanityFailBuf;
         }
         j["sensorId"]=sensorId; j["userId"]=userId;
         String s; serializeJson(j,s);

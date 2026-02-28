@@ -1,6 +1,7 @@
 // src/sensors/sensors.cpp
 #include "sensors.h"
 #include <Wire.h>
+#include <cstring>
 #include "../app_config.h"
 #include "../core/log.h"
 #include "calibration.h"
@@ -344,4 +345,27 @@ void sensorsReadEns160(int& aqi, int& tvoc, int& eco2, float tempC, float humidi
     tvoc = ens160.getTVOC();
     eco2 = ens160.geteCO2();
   } else { aqi=tvoc=eco2=0; }
+}
+
+bool sensorSanityCheck(int aqi, int tvoc, int eco2, char* failOut, size_t failOutSize){
+  bool okAqi  = (aqi >= SANITY_AQI_MIN && aqi <= SANITY_AQI_MAX);
+  bool okTvoc = (tvoc >= 0 && (unsigned long)tvoc <= SANITY_TVOC_MAX_PPB);
+  bool okEco2 = (eco2 >= SANITY_ECO2_MIN_PPM && eco2 <= SANITY_ECO2_MAX_PPM);
+  if (failOut && failOutSize > 0) failOut[0] = '\0';
+  if (okAqi && okTvoc && okEco2) return true;
+  if (!failOut || failOutSize == 0) return false;
+  char* p = failOut;
+  size_t remain = failOutSize;
+  auto append = [&](const char* s) {
+    size_t len = std::strlen(s);
+    if (len + 2 > remain) return;
+    if (p != failOut) { *p++ = ','; remain--; }
+    std::memcpy(p, s, len + 1);
+    p += len;
+    remain -= len;
+  };
+  if (!okAqi)  append("aqi");
+  if (!okTvoc) append("tvoc");
+  if (!okEco2) append("eco2");
+  return false;
 }

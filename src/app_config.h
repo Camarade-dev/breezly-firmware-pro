@@ -23,6 +23,24 @@ static const char* FW_MANIFEST_URL =
 #ifndef I2C_BUS_RESET_AFTER_FAILURES
 #define I2C_BUS_RESET_AFTER_FAILURES  (3)    // Après N échecs consécutifs de lecture → Wire.end/begin + re-init capteurs
 #endif
+
+// ---------- Sanity checks AQI/TVOC/eCO2 (payload toujours envoyé ; flag pour le backend) ----------
+#ifndef SANITY_AQI_MIN
+#define SANITY_AQI_MIN   (1)       // ENS160 AQI index 1–5
+#endif
+#ifndef SANITY_AQI_MAX
+#define SANITY_AQI_MAX   (5)
+#endif
+#ifndef SANITY_TVOC_MAX_PPB
+#define SANITY_TVOC_MAX_PPB  (20000UL)  // TVOC ppb : au-delà = possible erreur / environnement extrême
+#endif
+#ifndef SANITY_ECO2_MIN_PPM
+#define SANITY_ECO2_MIN_PPM  (300)   // eCO2 ppm : en dessous = warmup ou erreur
+#endif
+#ifndef SANITY_ECO2_MAX_PPM
+#define SANITY_ECO2_MAX_PPM  (10000) // eCO2 ppm : au-delà = possible erreur
+#endif
+
 #define OTA_CHECK_INTERVAL_MS (12UL*60UL*60UL*1000UL)
 
 // ---------- Backoff exponentiel (Wi-Fi / MQTT) ----------
