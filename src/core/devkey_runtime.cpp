@@ -1,6 +1,7 @@
 #include <Preferences.h>
 #include "devkey_runtime.h"
 #include "devkey.h"   // <- généré par le pre-build (#define DEVICE_KEY_B64 "...")
+#include "log.h"
 #ifdef DEVICE_KEY_B64
 #warning [DEVKEY] macro DEVICE_KEY_B64 is PRESENT at compile time
 static const char* kDevConstProbe = DEVICE_KEY_B64;
@@ -29,21 +30,21 @@ void loadOrInitDevKey() {
   // En mode factory: toujours imposer la clé du build dans la NVS
   g_deviceKeyB64 = buildKey;
   if (p.begin("myApp", false)) { p.putString("devKey", g_deviceKeyB64); p.end(); }
-  Serial.printf("[DEVKEY] FORCED from build, len=%d\n", (int)g_deviceKeyB64.length());
+  LOGD("DEVKEY", "FORCED from build, len=%d", (int)g_deviceKeyB64.length());
   return;
 #endif
 
   // Mode normal: si NVS a une clé, on l'utilise, sinon on injecte celle du build.
-  if (nvsKey.length() > 2) { g_deviceKeyB64 = nvsKey; Serial.println("[DEVKEY] loaded from NVS"); return; }
+  if (nvsKey.length() > 2) { g_deviceKeyB64 = nvsKey; LOGD("DEVKEY", "loaded from NVS"); return; }
 
 #ifdef DEVICE_KEY_B64
   g_deviceKeyB64 = buildKey;
   if (g_deviceKeyB64.length() > 0) {
     if (p.begin("myApp", false)) { p.putString("devKey", g_deviceKeyB64); p.end(); }
-    Serial.println("[DEVKEY] stored build key into NVS");
+    LOGD("DEVKEY", "stored build key into NVS");
   }
 #else
-  Serial.println("[DEVKEY] no key available (no NVS, no build macro)");
+  LOGW("DEVKEY", "no key available (no NVS, no build macro)");
 #endif
 }
 

@@ -246,8 +246,7 @@ static bool verifyManifestSignature(const String& canonical, const String& sigB6
 // ===================== Download & flash (HTTPClient only) =====================
 static bool downloadAndFlashWithHTTPClientInner(const String& binUrl,
                                                 uint32_t expectedSize,
-                                                const String& expectedSha256Hex,
-                                                bool allowGithubFallback)
+                                                const String& expectedSha256Hex)
 {
   LOGI("OTA", "Download start (HTTPClient+SNI)");
   LOGD("OTA", "before http heap=%u", (unsigned)esp_get_free_heap_size());
@@ -388,30 +387,6 @@ static bool downloadAndFlashWithHTTPClientInner(const String& binUrl,
   }
 
   http.end();
-
-    // 🔁 Fallback GitHub -> backend si blocage réseau (EAP etc.)
-    if (isGithub && allowGithubFallback) {
-      String fallback = binUrl;
-
-      // ⚠️ même chemin relatif, juste host différent
-      // GitHub: https://Camarade-dev.github.io/breezly-firmware-dist/firmware/...
-      // Backend: https://breezly-backend.onrender.com/firmware/...
-      fallback.replace(
-        "https://Camarade-dev.github.io/breezly-firmware-dist",
-        "https://breezly-backend.onrender.com"
-      );
-
-      LOGI("OTA", "GitHub .bin blocked (code=%d) → trying backend: %s",
-              code, fallback.c_str());
-
-      g_otaInProgress = false;   // reset propre
-      updateLedState(LED_BOOT);  // on revient à un état neutre
-
-      // Appel récursif sans 2e fallback pour éviter boucle infinie
-      return downloadAndFlashWithHTTPClientInner(
-        fallback, expectedSize, expectedSha256Hex, false
-      );
-    }
 
     g_otaInProgress = false;
     updateLedState(LED_BAD);
@@ -631,7 +606,7 @@ static bool downloadAndFlashWithHTTPClient(const String& binUrl,
                                            uint32_t expectedSize,
                                            const String& expectedSha256Hex)
 {
-  return downloadAndFlashWithHTTPClientInner(binUrl, expectedSize, expectedSha256Hex, true);
+  return downloadAndFlashWithHTTPClientInner(binUrl, expectedSize, expectedSha256Hex);
 }
 
 
@@ -666,17 +641,8 @@ void checkAndPerformCloudOTA(){
   LOGD("OTA", "Allocating manifest buffer...");
   body.reserve(1500);
   if (!fetchWithRetry(url, body)) {
-    #if defined(BREEZLY_DEV)
-      String direct = "https://breezly-backendweb.onrender.com/firmware/esp32/wroom32e/dev/latest.json";
-    #else
-      String direct = "https://breezly-backend.onrender.com/firmware/esp32/wroom32e/prod/latest.json";
-    #endif
-
-    LOGI("OTA", "primary failed → try direct: %s", direct.c_str());
-    if (!fetchWithRetry(direct, body)) {
-      LOGI("OTA", "manifest fetch failed (both)");
-      return;
-    }
+    LOGI("OTA", "manifest fetch failed");
+    return;
   }
   LOGI("OTA", "manifest OK, %u bytes", (unsigned)body.length());
   LOGD("OTA", " Manifest head:\n%s", body.substring(0, 300).c_str());
