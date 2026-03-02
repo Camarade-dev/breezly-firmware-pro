@@ -90,9 +90,13 @@ static bool connectToWiFiPSK() {
   while (WiFi.status() != WL_CONNECTED && (int32_t)(deadline - millis()) > 0) {
     esp_task_wdt_reset();
     vTaskDelay(120 / portTICK_PERIOD_MS);
+#if BREEZLY_LOG_LEVEL >= BREEZLY_LOG_LEVEL_DEBUG
     if (((millis()/600) % 2) == 0) Serial.print(".");
+#endif
   }
+#if BREEZLY_LOG_LEVEL >= BREEZLY_LOG_LEVEL_DEBUG
   Serial.println();
+#endif
 
   if (WiFi.status()==WL_CONNECTED){
   s_wifiBackoff.reset();

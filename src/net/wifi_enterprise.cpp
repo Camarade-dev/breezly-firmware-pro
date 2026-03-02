@@ -1,4 +1,5 @@
 #include "wifi_enterprise.h"
+#include "../core/log.h"
 #include "../core/globals.h"
 #include "../net/sntp_utils.h"
 #include "mqtt_bus.h"
@@ -22,7 +23,7 @@ static esp_event_handler_instance_t s_discInstEap = nullptr;
 static void onStaDiscEap(void*, esp_event_base_t, int32_t, void* data) {
   auto* ev = (wifi_event_sta_disconnected_t*)data;
   s_lastDiscReasonEap = ev ? ev->reason : -1;
-  Serial.printf("[EAP] STA_DISCONNECTED reason=%d\n", s_lastDiscReasonEap);
+  LOGD("EAP", "STA_DISCONNECTED reason=%d", s_lastDiscReasonEap);
   wifiConnected = false;
   mqtt_bus_reset_backoff_on_wifi_lost();
   updateLedState(LED_BAD);  // rouge clignotant dès la perte de lien
@@ -35,7 +36,7 @@ static inline void resumeOtherNetWork() {}
 // ─────────────────────────── Log de déconnexion (diag)
 static void onStaDisc(void*, esp_event_base_t, int32_t, void* data) {
   auto* ev = (wifi_event_sta_disconnected_t*)data;
-  Serial.printf("[EAP] STA_DISCONNECTED reason=%d\n", ev->reason);
+  LOGD("EAP", "STA_DISCONNECTED reason=%d", ev->reason);
 }
 static esp_event_handler_instance_t s_discInst = nullptr;
 
@@ -49,7 +50,7 @@ extern const uint8_t _binary_src_certs_ca_rezoleo_pem_end[];
 // ─────────────────────────── Connexion WPA2-Enterprise (PEAP/MSCHAPv2)
 bool connectToWiFiEnterprise() {
   if (wifiSSID.isEmpty() || eapUsername.isEmpty() || eapPassword.isEmpty()) {
-    Serial.println("[EAP] champs manquants (ssid/user/pass)");
+    LOGW("EAP", "champs manquants (ssid/user/pass)");
     provSet("status", "missing_fields");
     return false;
   }
@@ -106,7 +107,7 @@ bool connectToWiFiEnterprise() {
   }
   ESP_ERROR_CHECK(er);
 
-  Serial.printf("[EAP] Connexion à '%s'…\n", wifiSSID.c_str());
+  LOGI("EAP", "Connexion à '%s'…", wifiSSID.c_str());
   provSet("status", "connecting");
 
   WiFi.begin(wifiSSID.c_str());
@@ -117,15 +118,18 @@ bool connectToWiFiEnterprise() {
     if (WiFi.status() == WL_CONNECTED) { ok = true; break; }
     esp_task_wdt_reset();
     vTaskDelay(250 / portTICK_PERIOD_MS);
+#if BREEZLY_LOG_LEVEL >= BREEZLY_LOG_LEVEL_DEBUG
     if ((i % 2) == 0) Serial.print(".");
+#endif
   }
+#if BREEZLY_LOG_LEVEL >= BREEZLY_LOG_LEVEL_DEBUG
   Serial.println();
+#endif
 
       if (ok) {
     wifiConnected = true;
     breezly_on_wifi_ok();
-    Serial.printf("[EAP] OK IP=%s  RSSI=%d\n",
-                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    LOGI("EAP", "OK IP=%s RSSI=%d", WiFi.localIP().toString().c_str(), WiFi.RSSI());
 
     // 1) Wi-Fi OK
     provSet("status", "wifi_ok");
@@ -133,7 +137,7 @@ bool connectToWiFiEnterprise() {
     // 2) Internet ?
     bool inet = checkInternetReachable();
     if (!inet) {
-      Serial.println("[EAP] Internet unreachable");
+      LOGW("EAP", "Internet unreachable");
       provSet("status", "inet_unreachable");
       return false;
     }

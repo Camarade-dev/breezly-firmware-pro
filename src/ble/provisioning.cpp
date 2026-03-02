@@ -76,7 +76,7 @@ static inline void setAppFg(bool fg){ s_appForeground = fg; wd_kick(); }
 static inline void wd_enable(bool on){
   s_wdEnabled = on;
   if (on) wd_kick();
-  Serial.printf("[WD] enable=%d\n", (int)on);
+  LOGD("WD", "enable=%d", (int)on);
 }
 
 static uint32_t computePhaseTimeoutMs(){
@@ -130,12 +130,17 @@ static String base64Encode(const uint8_t* buf, size_t len){
 }
 
 static void printHex(const uint8_t* buf, size_t len, const char* tag = "HEX") {
+#if BREEZLY_LOG_LEVEL >= BREEZLY_LOG_LEVEL_DEBUG
   Serial.printf("[BLE][%s] len=%u : ", tag, (unsigned)len);
   for (size_t i = 0; i < len; ++i) Serial.printf("%02X", buf[i]);
   Serial.println();
+#else
+  (void)buf; (void)len; (void)tag;
+#endif
 }
 
 static void printAsciiPreview(const uint8_t* buf, size_t len, size_t maxShow = 80) {
+#if BREEZLY_LOG_LEVEL >= BREEZLY_LOG_LEVEL_DEBUG
   Serial.print("[BLE][ASCII] ");
   size_t show = len < maxShow ? len : maxShow;
   for (size_t i = 0; i < show; ++i) {
@@ -144,17 +149,19 @@ static void printAsciiPreview(const uint8_t* buf, size_t len, size_t maxShow = 8
   }
   if (len > show) Serial.print("…");
   Serial.println();
+#else
+  (void)buf; (void)len; (void)maxShow;
+#endif
 }
 
 // ------------------- notify helpers -------------------
 void provisioningSetStatus(const char* json){
   if (statusCharacteristic){
-    Serial.printf("[ESP->APP][NOTIFY] JSON len=%u\n", (unsigned)strlen(json));
-    Serial.printf("[ESP->APP][NOTIFY] %s\n", json);
+    LOGD("BLE", "ESP->APP NOTIFY len=%u %s", (unsigned)strlen(json), json);
     statusCharacteristic->setValue(json);
     statusCharacteristic->notify();
   } else {
-    Serial.println("[ESP->APP][NOTIFY] statusCharacteristic NULL");
+    LOGD("BLE", "ESP->APP NOTIFY statusCharacteristic NULL");
   }
 }
 
@@ -162,7 +169,7 @@ void provisioningNotifyConnected(){
   provisioningSetStatus("{\"status\":\"connected\"}");
   wd_enable(false);
   s_gattConnected = false;
-  Serial.println("[WD] provisioning complete -> WD disabled, gatt=0");
+  LOGD("WD", "provisioning complete -> WD disabled, gatt=0");
 }
 
 // ------------------- advertising -------------------
@@ -199,7 +206,7 @@ void breezly_on_connected_final() {
   s_provisioningDone = true;
   ledOnConnectedOk();
 
-  Serial.println("[WD] provisioning complete -> WD disabled (prod mode)");
+  LOGD("WD", "provisioning complete -> WD disabled (prod mode)");
 
   // Optionnel : couper aussi directement la pub BLE ici
   NimBLEDevice::getAdvertising()->stop();
@@ -210,7 +217,7 @@ void breezly_on_connected_final() {
 static void credWorker(void*){
   for(;;){
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    Serial.println("[BLE][WORKER] wake: processing accumulated credentials/ops…");
+    LOGD("BLE", "WORKER wake: processing accumulated credentials/ops");
 
     String json;
     xSemaphoreTake(sAccMutex, portMAX_DELAY);
@@ -423,12 +430,12 @@ public:
     wd_enable(true);
     ledOnProvisioningStart();
     provisioningSetStatus("{\"status\":\"ble_connected\"}");
-    Serial.printf("[WD] onConnect: gatt=1, conn=%u\n", (unsigned)s_connHandle);
+    LOGD("WD", "onConnect: gatt=1, conn=%u", (unsigned)s_connHandle);
   }
 
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& ci, int reason) override {
     (void)ci;
-    Serial.printf("[WD] onDisconnect: reason=%d\n", reason);
+    LOGD("WD", "onDisconnect: reason=%d", reason);
     s_gattConnected = false;
     s_connHandle = BLE_HS_CONN_HANDLE_NONE;
     setPhase(ProvPhase::IDLE);
@@ -438,11 +445,12 @@ public:
     wd_enable(false);
 
     if (!s_provisioningDone) {
-      // En mode provisioning → prêt pour un nouvel essai
+      // Retour au setup BLE (advertising) → LED bleue (boot), pas jaune
+      ledOnBoot();
       restartBLEAdvertising();
     } else {
       // En mode prod → on ne relance PAS l'advertising
-      Serial.println("[BLE] disconnect after provisioning -> keep BLE OFF");
+      LOGD("BLE", "disconnect after provisioning -> keep BLE OFF");
     }
   }
 
@@ -452,7 +460,7 @@ class CredentialsCallback : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo&) override {
     wd_kick();
     const std::string raw = c->getValue();
-    Serial.printf("[APP->ESP][WRITE] chunk bytes=%u\n", (unsigned)raw.length());
+    LOGD("BLE", "APP->ESP WRITE chunk bytes=%u", (unsigned)raw.length());
     if (!raw.empty()) {
       printHex((const uint8_t*)raw.data(), raw.size(), "APP->ESP");
       printAsciiPreview((const uint8_t*)raw.data(), raw.size());
@@ -464,11 +472,10 @@ class CredentialsCallback : public NimBLECharacteristicCallbacks {
     g_acc.reserve(g_acc.length() + raw.length());
     for (size_t i = 0; i < raw.length(); ++i) g_acc += (char)raw[i];
 
-    Serial.printf("[BLE][onWrite] accLen=%u\n", (unsigned)g_acc.length());
+    LOGD("BLE", "onWrite accLen=%u", (unsigned)g_acc.length());
     if (g_acc.length() >= 1) {
       char last = g_acc[g_acc.length()-1];
-      Serial.printf("[BLE][onWrite] acc.last='%c' (0x%02X)\n",
-        (last>=32 && last<127)?last:'.', (unsigned char)last);
+      LOGD("BLE", "onWrite acc.last='%c' (0x%02X)", (last>=32 && last<127)?last:'.', (unsigned char)last);
     }
 
     const bool done = g_acc.endsWith("}");
@@ -485,7 +492,7 @@ class CredentialsCallback : public NimBLECharacteristicCallbacks {
 
 // ------------------- watchdog task -------------------
 static void sessionWatchdog(void*){
-  Serial.println("[WD] task started");
+  LOGD("WD", "task started");
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(500));
     if (!s_wdEnabled)     continue;
@@ -496,7 +503,7 @@ static void sessionWatchdog(void*){
 
     static uint32_t lastLog = 0;
     if (now - lastLog > 5000) {
-      Serial.printf("[WD] enabled=1, gatt=1, idle=%lu / phaseTO=%lu ms (phase=%u, fg=%u)\n",
+      LOGD("WD", "enabled=1, gatt=1, idle=%lu / phaseTO=%lu ms (phase=%u, fg=%u)",
         (unsigned long)idle, (unsigned long)computePhaseTimeoutMs(),
         (unsigned)s_phase, (unsigned)s_appForeground);
       lastLog = now;
@@ -512,9 +519,11 @@ static void sessionWatchdog(void*){
     }
 
     if (idle > to) {
-      Serial.println("[WD] TIMEOUT -> notify + DISCONNECT");
+      LOGD("WD", "TIMEOUT -> notify + DISCONNECT");
       provisioningSetStatus("{\"status\":\"timeout\"}");
       g_acc = "";
+      // Retour au setup BLE → LED bleue tout de suite (évite LED jaune coincée)
+      ledOnBoot();
       if (pServer && s_connHandle != BLE_HS_CONN_HANDLE_NONE) {
         pServer->disconnect(s_connHandle);
       } else {
@@ -529,14 +538,14 @@ static void sessionWatchdog(void*){
 // ------------------- API -------------------
 void setupBLE(bool startAdvertising){
   wd_kick();
-  Serial.printf("[WD] init: baseTO=%lu ms\n", (unsigned long)PROV_IDLE_TIMEOUT_MS);
+  LOGD("WD", "init: baseTO=%lu ms", (unsigned long)PROV_IDLE_TIMEOUT_MS);
 
   if (s_bleInitDone) {
     if (startAdvertising && !s_advertising) {
       configureAdvertising();
       NimBLEDevice::startAdvertising();
       s_advertising = NimBLEDevice::getAdvertising()->isAdvertising();
-      Serial.printf("[BLE] re-entry startAdvertising -> %d\n", (int)s_advertising);
+      LOGD("BLE", "re-entry startAdvertising -> %d", (int)s_advertising);
     }
     return;
   }
@@ -551,7 +560,7 @@ void setupBLE(bool startAdvertising){
   String storedBleName = prefs.getString("bleName", "");
   if (storedBleName != String(bleName)) {
     if (!storedBleName.isEmpty()) {
-      Serial.printf("[BLE] bleName migrate: stored=%s -> efuse=%s\n", storedBleName.c_str(), bleName);
+      LOGD("BLE", "bleName migrate: stored=%s -> efuse=%s", storedBleName.c_str(), bleName);
     }
     prefs.putString("bleName", bleName);
   }
@@ -559,9 +568,9 @@ void setupBLE(bool startAdvertising){
   gBleName = String(bleName);
 
   // Init NimBLE
-  Serial.printf("[BLE] INIT NimBLE (%s)\n", bleName);
-  // Ligne lue par le script post-upload pour provisionner avec le même external_id que le nom BLE (évite décalage port / device en téléversement parallèle)
-  Serial.printf("BREEZLY_EXTERNAL_ID=%s\n", bleName);
+  LOGD("BLE", "INIT NimBLE (%s)", bleName);
+  // Ligne lue par le script post-upload pour provisionner (dev uniquement, LOGD)
+  LOGD("BLE", "BREEZLY_EXTERNAL_ID=%s", bleName);
   NimBLEDevice::init(bleName);
   NimBLEDevice::setMTU(185);
   NimBLEDevice::setDeviceName(bleName);
@@ -593,9 +602,9 @@ void setupBLE(bool startAdvertising){
   if (startAdvertising) {
     NimBLEDevice::startAdvertising();
     s_advertising = NimBLEDevice::getAdvertising()->isAdvertising();
-    Serial.printf("[BLE] advertising=%d\n", (int)s_advertising);
+    LOGD("BLE", "advertising=%d", (int)s_advertising);
   } else {
-    Serial.println("[BLE] Ready (no advertising)");
+    LOGD("BLE", "Ready (no advertising)");
   }
 
   s_bleInitDone = true;
@@ -610,7 +619,7 @@ void restartBLEAdvertising(){
   if (!s_bleInitDone) return;
 
   if (s_provisioningDone) {
-    Serial.println("[BLE] restart requested but provisioningDone=1 -> ignoring");
+    LOGD("BLE", "restart requested but provisioningDone=1 -> ignoring");
     return;
   }
 
@@ -622,5 +631,5 @@ void restartBLEAdvertising(){
   delay(80);
   NimBLEDevice::startAdvertising();
   s_advertising = a->isAdvertising();
-  Serial.printf("[BLE] restart -> advertising=%d\n", (int)s_advertising);
+  LOGD("BLE", "restart -> advertising=%d", (int)s_advertising);
 }

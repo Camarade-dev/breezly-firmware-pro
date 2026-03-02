@@ -6,8 +6,9 @@
 #include "../core/log.h"
 #include "calibration.h"
 #include <math.h>
+// 1 = affiche les rafales PMS (dev only, désactivé en prod via BREEZLY_LOG_LEVEL)
 #ifndef PMS_LOG_BURST
-#define PMS_LOG_BURST 1   // 1 = affiche les rafales PMS dans le Serial
+#define PMS_LOG_BURST (BREEZLY_LOG_LEVEL >= BREEZLY_LOG_LEVEL_DEBUG)
 #endif
 // ==== extern définis dans core/globals.h (NE PAS changer les types) ====
 extern HardwareSerial& PMS;   // <- référence, pas un objet
@@ -206,10 +207,10 @@ static bool readPmsFrame(HardwareSerial &ser, PmsData &out) {
     out.gt03     = be16(&payload[14]); out.gt05     = be16(&payload[16]); out.gt10     = be16(&payload[18]);
     out.gt25     = be16(&payload[20]); out.gt50     = be16(&payload[22]); out.gt100    = be16(&payload[24]);
     #if PMS_LOG_BURST
-        Serial.printf("PMS: CF1 PM1=%u PM2.5=%u PM10=%u | ATM PM1=%u PM2.5=%u PM10=%u | CNT 0.3=%u 0.5=%u 1.0=%u 2.5=%u 5.0=%u 10=%u\n",
-                      out.pm1_cf1, out.pm25_cf1, out.pm10_cf1,
-                      out.pm1_atm, out.pm25_atm, out.pm10_atm,
-                      out.gt03, out.gt05, out.gt10, out.gt25, out.gt50, out.gt100);
+        LOGD("PMS", "CF1 PM1=%u PM2.5=%u PM10=%u | ATM PM1=%u PM2.5=%u PM10=%u | CNT 0.3=%u 0.5=%u 1.0=%u 2.5=%u 5.0=%u 10=%u",
+             out.pm1_cf1, out.pm25_cf1, out.pm10_cf1,
+             out.pm1_atm, out.pm25_atm, out.pm10_atm,
+             out.gt03, out.gt05, out.gt10, out.gt25, out.gt50, out.gt100);
     #endif
     out.valid=true; out.lastMs=millis(); return true;
   }
@@ -282,11 +283,11 @@ bool sensorsInit(){
 #if defined(ARDUINO_ARCH_ESP32)
   Wire.setTimeOut((uint16_t)I2C_BUS_TIMEOUT_MS);
 #endif
-  if (!aht.begin())  Serial.println("AHT21 initialization failed!");
-  else               Serial.println("AHT21 initialisé avec succès.");
+  if (!aht.begin())  LOGW("I2C", "AHT21 initialization failed");
+  else               LOGD("I2C", "AHT21 initialisé avec succès");
 
-  if (!ens160.begin()) Serial.println("Échec ENS160 !");
-  else { Serial.println("ENS160 initialisé avec succès."); ens160.setMode(ENS160_OPMODE_STD); }
+  if (!ens160.begin()) LOGW("I2C", "ENS160 init failed");
+  else { LOGD("I2C", "ENS160 initialisé avec succès"); ens160.setMode(ENS160_OPMODE_STD); }
 
   s_i2cConsecutiveFailures = 0;
   if (!gPmsMutex) gPmsMutex = xSemaphoreCreateMutex();
