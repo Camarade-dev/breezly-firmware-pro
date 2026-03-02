@@ -28,6 +28,7 @@
 static bool s_twdtReady = false;
 static bool s_mqttStarted = false;   // NEW : MQTT pas encore démarré
 static bool s_firstPublishDone = false;
+static bool s_otaValidFallbackDone = false;
 // Indique que la fenêtre OTA de boot est terminée (succès, échec ou skip)
 volatile bool g_otaBootWindowDone = false;
 
@@ -438,6 +439,12 @@ void loop(){
       updateLedState(LED_BAD);
     else
       updateLedState(LED_GOOD);  // reconnexion → vert tout de suite (score mis à jour au prochain publish)
+  }
+
+  // Fallback : marquer app VALID après 60 s si WiFi OK (au cas où MQTT ne connecte pas)
+  if (!s_otaValidFallbackDone && millis() >= 60000 && wifiConnected && !otaIsInProgress()) {
+    s_otaValidFallbackDone = true;
+    otaMarkAppValidIfPending();
   }
 
   // Retry Wi‑Fi avec backoff exponentiel (si creds valides, pas en provisioning, pas OTA)
