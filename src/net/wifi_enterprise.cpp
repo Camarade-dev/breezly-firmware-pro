@@ -1,6 +1,8 @@
 #include "wifi_enterprise.h"
 #include "../core/globals.h"
 #include "../net/sntp_utils.h"
+#include "mqtt_bus.h"
+#include "../led/led_status.h"
 #include "../ble/provisioning.h"
 #include <WiFi.h>
 #include "esp_task_wdt.h"
@@ -21,6 +23,9 @@ static void onStaDiscEap(void*, esp_event_base_t, int32_t, void* data) {
   auto* ev = (wifi_event_sta_disconnected_t*)data;
   s_lastDiscReasonEap = ev ? ev->reason : -1;
   Serial.printf("[EAP] STA_DISCONNECTED reason=%d\n", s_lastDiscReasonEap);
+  wifiConnected = false;
+  mqtt_bus_reset_backoff_on_wifi_lost();
+  updateLedState(LED_BAD);  // rouge clignotant dès la perte de lien
 }
 
 // ─────────────────────────── Hooks no-op (si tu veux pauser d’autres stacks)

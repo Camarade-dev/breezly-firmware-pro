@@ -52,7 +52,8 @@ static const BackoffConfig s_mqttBackoffConfig = {
   BACKOFF_MQTT_MIN_MS,
   BACKOFF_MQTT_MAX_MS,
   BACKOFF_MQTT_FACTOR,
-  BACKOFF_MQTT_JITTER_PERCENT
+  BACKOFF_MQTT_JITTER_PERCENT,
+  BACKOFF_MQTT_INTERMEDIATE_MAX_MS
 };
 static Backoff s_mqttBackoff(s_mqttBackoffConfig);
 
@@ -152,6 +153,10 @@ static void gracefulUnpairAndReboot(const char* reason){
 
 // ======= API =======
 bool mqtt_is_connected() { return s_connected; }
+
+void mqtt_bus_reset_backoff_on_wifi_lost(void) {
+  s_mqttBackoff.reset();
+}
 
 bool mqtt_enqueue(const String& t, const String& p, uint8_t qos, bool retain) {
   

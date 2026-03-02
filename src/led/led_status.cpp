@@ -382,9 +382,10 @@ static void ledTask(void *){
       || (!s_installFinished && (mode == LED_BOOT || mode == LED_PAIRING || mode == LED_BAD || mode == LED_UPDATING));
 
     // === B) Pulse : bump AU-DESSUS de la respiration (désactivée la nuit) ==============
+    // En erreur (LED_BAD) on n'applique pas la pulse qualité d'air → clignotement rouge uniquement
     float factor = baseFactor;
 
-    if (!highPriority && (mode == LED_GOOD || mode == LED_MODERATE || mode == LED_BAD) && !nightMode){
+    if (!highPriority && (mode == LED_GOOD || mode == LED_MODERATE) && !nightMode){
       float env = 0.0f;
       if (s_pulseT < 1.0f){
         env = pulseEnvelope(s_pulseT);   // 0 → 1 → 0

@@ -432,6 +432,14 @@ void loop(){
     }
   }
 
+  // État LED : rouge clignotant si déconnecté, vert (qualité d’air) si connecté
+  if (s_mqttStarted && !g_factoryResetPending && !otaIsInProgress()) {
+    if (!wifiConnected || !mqtt_is_connected())
+      updateLedState(LED_BAD);
+    else
+      updateLedState(LED_GOOD);  // reconnexion → vert tout de suite (score mis à jour au prochain publish)
+  }
+
   // Retry Wi‑Fi avec backoff exponentiel (si creds valides, pas en provisioning, pas OTA)
   if (!wifiConnected && !s_needProv && !g_factoryResetPending && !otaIsInProgress()
       && wifiBackoffShouldAttempt()) {

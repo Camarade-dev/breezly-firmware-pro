@@ -20,7 +20,8 @@ static const BackoffConfig s_wifiBackoffConfig = {
   BACKOFF_WIFI_MIN_MS,
   BACKOFF_WIFI_MAX_MS,
   BACKOFF_WIFI_FACTOR,
-  BACKOFF_WIFI_JITTER_PERCENT
+  BACKOFF_WIFI_JITTER_PERCENT,
+  BACKOFF_WIFI_INTERMEDIATE_MAX_MS
 };
 static Backoff s_wifiBackoff(s_wifiBackoffConfig);
 
@@ -48,6 +49,9 @@ static void onStaDiscPsk(void*, esp_event_base_t, int32_t, void* data) {
   auto* ev = (wifi_event_sta_disconnected_t*)data;
   s_lastDiscReasonPsk = ev ? ev->reason : -1;
   LOGD("WiFi", "STA_DISCONNECTED reason=%d", s_lastDiscReasonPsk);
+  wifiConnected = false;  // lien perdu (ex. partage de connexion coupé)
+  mqtt_bus_reset_backoff_on_wifi_lost();  // reconnexion rapide au retour du Wi‑Fi
+  updateLedState(LED_BAD);  // rouge clignotant tout de suite, sans attendre la loop
 }
 static void ensureDefaultEventLoop() {
   static bool ready = false;
