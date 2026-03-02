@@ -32,12 +32,26 @@ void Backoff::reset() {
 uint32_t Backoff::computeDelay(uint32_t effectiveMinMs) const {
   uint32_t base = (effectiveMinMs > 0) ? effectiveMinMs : _config.minDelayMs;
   if (base > _config.maxDelayMs) base = _config.maxDelayMs;
+  if (base == 0) base = 1;
 
   double powVal = 1.0;
   if (_attemptCount > 0) {
     powVal = pow((double)_config.factor, (double)_attemptCount);
   }
   uint64_t next = (uint64_t)((double)base * powVal);
+
+  // Palier intermédiaire (ex: 1 min) : d'abord plafonner à intermediateMaxMs, puis progresser vers maxDelayMs
+  if (_config.intermediateMaxMs > 0 && next >= (uint64_t)_config.intermediateMaxMs) {
+    int firstExceed = (int)ceil(log((double)_config.intermediateMaxMs / (double)base) / log((double)_config.factor));
+    if (firstExceed < 0) firstExceed = 0;
+    if (_attemptCount >= (uint32_t)firstExceed) {
+      next = (uint64_t)_config.intermediateMaxMs * (uint64_t)pow((double)_config.factor, (double)(_attemptCount - firstExceed));
+    } else {
+      next = (uint64_t)_config.intermediateMaxMs;
+    }
+  } else if (_config.intermediateMaxMs > 0 && next > (uint64_t)_config.intermediateMaxMs) {
+    next = (uint64_t)_config.intermediateMaxMs;
+  }
   if (next > _config.maxDelayMs) next = _config.maxDelayMs;
   if (next < base) next = base;
 
@@ -93,7 +107,8 @@ void backoff_run_simulation(void) {
     1000,    // min 1s
     300000,  // max 5 min
     2.0f,
-    10       // jitter ±10%
+    10,      // jitter ±10%
+    60000    // palier 1 min
   };
   Backoff b(cfg);
   uint32_t now = 0;

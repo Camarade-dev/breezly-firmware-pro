@@ -44,18 +44,20 @@ static const char* FW_MANIFEST_URL =
 #define OTA_CHECK_INTERVAL_MS (12UL*60UL*60UL*1000UL)
 
 // ---------- Backoff exponentiel (Wi-Fi / MQTT) ----------
-// Wi-Fi: min 1s, max 5 min, facteur 2, jitter ±10%. Auth fail: min 30s pour éviter marteler la box.
-#define BACKOFF_WIFI_MIN_MS           (1000UL)
-#define BACKOFF_WIFI_MAX_MS           (5UL * 60UL * 1000UL)
-#define BACKOFF_WIFI_FACTOR           2.0f
-#define BACKOFF_WIFI_JITTER_PERCENT   10
-#define BACKOFF_WIFI_AUTH_FAIL_MIN_MS (30UL * 1000UL)
+// Wi-Fi: min 1s, palier 1 min, max 5 min, facteur 2, jitter ±10%. Auth fail: min 30s pour éviter marteler la box.
+#define BACKOFF_WIFI_MIN_MS                 (1000UL)
+#define BACKOFF_WIFI_INTERMEDIATE_MAX_MS    (60UL * 1000UL)   // 1 min avant d'aller vers 5 min
+#define BACKOFF_WIFI_MAX_MS                 (5UL * 60UL * 1000UL)
+#define BACKOFF_WIFI_FACTOR                 2.0f
+#define BACKOFF_WIFI_JITTER_PERCENT         10
+#define BACKOFF_WIFI_AUTH_FAIL_MIN_MS      (30UL * 1000UL)
 
-// MQTT: min 2s, max 5 min, facteur 2, jitter ±10%.
-#define BACKOFF_MQTT_MIN_MS           (2000UL)
-#define BACKOFF_MQTT_MAX_MS           (5UL * 60UL * 1000UL)
-#define BACKOFF_MQTT_FACTOR           2.0f
-#define BACKOFF_MQTT_JITTER_PERCENT   10
+// MQTT: min 2s, palier 1 min, max 5 min, facteur 2, jitter ±10%.
+#define BACKOFF_MQTT_MIN_MS                 (2000UL)
+#define BACKOFF_MQTT_INTERMEDIATE_MAX_MS    (60UL * 1000UL)   // 1 min
+#define BACKOFF_MQTT_MAX_MS                 (5UL * 60UL * 1000UL)
+#define BACKOFF_MQTT_FACTOR                 2.0f
+#define BACKOFF_MQTT_JITTER_PERCENT         10
 
 // ---------- Control payload v1 (anti-replay + HMAC) ----------
 #if defined(BREEZLY_PROD)

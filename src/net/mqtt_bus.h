@@ -43,3 +43,7 @@ void mqtt_bus_handle_update();
 void mqtt_bus_handle_set_night_mode(const JsonDocument& j);
 void mqtt_bus_handle_forget_wifi(const JsonDocument& j);
 void mqtt_bus_handle_factory_reset(const JsonDocument& j);
+
+/** À appeler quand le Wi‑Fi est perdu (STA_DISCONNECTED) : reset du backoff MQTT
+ *  pour que la reconnexion réessaie rapidement (2s, 4s, … 1 min) au retour du Wi‑Fi. */
+void mqtt_bus_reset_backoff_on_wifi_lost(void);

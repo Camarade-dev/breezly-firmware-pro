@@ -12,6 +12,9 @@ struct BackoffConfig {
   uint32_t maxDelayMs;
   float factor;
   uint8_t jitterPercent;  // ±N% (ex: 10 = ±10%)
+  /** Palier intermédiaire (ms). 0 = désactivé. Si > 0, les délais sont plafonnés à cette valeur
+   * jusqu'à l'atteindre, puis progressent d'ici jusqu'à maxDelayMs (ex: 60000 = 1 min). */
+  uint32_t intermediateMaxMs;
 };
 
 struct BackoffState {
