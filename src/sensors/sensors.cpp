@@ -10,6 +10,28 @@
 #ifndef PMS_LOG_BURST
 #define PMS_LOG_BURST (BREEZLY_LOG_LEVEL >= BREEZLY_LOG_LEVEL_DEBUG)
 #endif
+
+// --- Constantes PMS sampling "optimal produit" (discard + burst + aggregate) ---
+#ifndef PMS_WARMUP_MS_DEFAULT
+#define PMS_WARMUP_MS_DEFAULT        (25000UL)
+#endif
+#ifndef PMS_DISCARD_FRAMES_DEFAULT
+#define PMS_DISCARD_FRAMES_DEFAULT   (2)
+#endif
+#ifndef PMS_BURST_FRAMES_DEFAULT
+#define PMS_BURST_FRAMES_DEFAULT     (6)
+#endif
+// Age max d'une frame "fraiche" (~1 Hz PMS -> 2500 ms evite faux timeouts)
+#ifndef PMS_FRESH_AGE_MAX_MS
+#define PMS_FRESH_AGE_MAX_MS         (2500UL)
+#endif
+#ifndef PMS_WAIT_FRAME_TIMEOUT_MS
+#define PMS_WAIT_FRAME_TIMEOUT_MS    (4000UL)
+#endif
+#ifndef PMS_BURST_MAX
+#define PMS_BURST_MAX                (10)
+#endif
+
 // ==== extern définis dans core/globals.h (NE PAS changer les types) ====
 extern HardwareSerial& PMS;   // <- référence, pas un objet
 extern PmsData gPms;
@@ -239,21 +261,130 @@ void pmsTaskStart(int rx, int tx){
   pmsStarted = true;
 }
 
-// Spot blocking : wake → warmup → lit dernière trame récente → sleep
-bool pmsSampleBlocking(uint32_t warmupMs, PmsData& out){
-  pmsWake();
-  uint32_t t0 = millis();
-  while ((millis() - t0) < warmupMs){
-    vTaskDelay(100/portTICK_PERIOD_MS);
+// --- Utilitaires internes : attente frame fraîche + médiane ---
+
+/** Attend qu'une frame valide avec seq > minSeq et (now - lastMs) <= freshAgeMaxMs soit disponible dans gPms.
+ *  Copie dans out et retourne true, ou false après timeoutMs. */
+static bool waitForFreshFrame(uint32_t minSeq, uint32_t freshAgeMaxMs, uint32_t timeoutMs, PmsData& out) {
+  const uint32_t t0 = millis();
+  const uint32_t pollMs = 50u;
+  while ((millis() - t0) < timeoutMs) {
+    if (gPmsMutex && xSemaphoreTake(gPmsMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      const uint32_t now = millis();
+      const bool ok = gPms.valid && (gPms.seq > minSeq) && ((now - gPms.lastMs) <= freshAgeMaxMs);
+      if (ok) {
+        out = gPms;
+        xSemaphoreGive(gPmsMutex);
+        return true;
+      }
+      xSemaphoreGive(gPmsMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(pollMs));
+  }
+  return false;
+}
+
+static void insertionSortU16(uint16_t* a, int n) {
+  for (int i = 1; i < n; i++) {
+    uint16_t v = a[i];
+    int j = i - 1;
+    while (j >= 0 && a[j] > v) {
+      a[j + 1] = a[j];
+      j--;
+    }
+    a[j + 1] = v;
+  }
+}
+
+/** Médiane d'un tableau uint16_t (tri sur place, n <= PMS_BURST_MAX). */
+static uint16_t medianU16(uint16_t* arr, int n) {
+  if (n <= 0) return 0;
+  insertionSortU16(arr, n);
+  return arr[n / 2];
+}
+
+/** Agrège les n premières entrées de burst[] dans outAgg (médianes PM + counts). */
+static void pmsAggregateBurst(const PmsData* burst, int n, PmsData& outAgg) {
+  if (n <= 0) return;
+  uint16_t arr[PMS_BURST_MAX];
+
+#define FILL_AND_MEDIAN(field) do { \
+    for (int i = 0; i < n; i++) arr[i] = burst[i].field; \
+    outAgg.field = medianU16(arr, n); \
+  } while(0)
+
+  FILL_AND_MEDIAN(pm1_atm);
+  FILL_AND_MEDIAN(pm25_atm);
+  FILL_AND_MEDIAN(pm10_atm);
+  FILL_AND_MEDIAN(pm1_cf1);
+  FILL_AND_MEDIAN(pm25_cf1);
+  FILL_AND_MEDIAN(pm10_cf1);
+  FILL_AND_MEDIAN(gt03);
+  FILL_AND_MEDIAN(gt05);
+  FILL_AND_MEDIAN(gt10);
+  FILL_AND_MEDIAN(gt25);
+  FILL_AND_MEDIAN(gt50);
+  FILL_AND_MEDIAN(gt100);
+
+#undef FILL_AND_MEDIAN
+
+  outAgg.valid = true;
+  outAgg.lastMs = burst[n - 1].lastMs;
+  outAgg.seq    = burst[n - 1].seq;
+}
+
+/** Sampling wake → warmup → discard → burst → aggregate → sleep. Retourne true si burst complet. */
+static bool pmsSampleBurstBlocking(uint32_t warmupMs, uint32_t discardFrames, uint32_t burstFrames, PmsData& outAgg) {
+  if (burstFrames == 0 || burstFrames > (uint32_t)PMS_BURST_MAX) {
+    LOGW("PMS", "burst config invalid: burstFrames=%lu max=%d", (unsigned long)burstFrames, PMS_BURST_MAX);
+    return false;
   }
 
-  bool have = false;
-  if (gPmsMutex && xSemaphoreTake(gPmsMutex, 100/portTICK_PERIOD_MS) == pdTRUE){
-    if (gPms.valid && (millis() - gPms.lastMs) < 5000) { out = gPms; have = true; }
+  uint32_t seq0 = 0;
+  if (gPmsMutex && xSemaphoreTake(gPmsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    seq0 = gPms.seq;
     xSemaphoreGive(gPmsMutex);
   }
-  pmsSleep();
-  return have;
+
+  pmsWake();
+  while (PMS.available()) (void)PMS.read();
+  vTaskDelay(pdMS_TO_TICKS(warmupMs));
+
+  PmsData discard = {};
+  for (uint32_t d = 0; d < discardFrames; d++) {
+    if (!waitForFreshFrame(seq0, PMS_FRESH_AGE_MAX_MS, PMS_WAIT_FRAME_TIMEOUT_MS, discard)) {
+      LOGW("PMS", "discard phase timeout at frame %lu", (unsigned long)d);
+      if (!pmsAlwaysOn) pmsSleep();
+      return false;
+    }
+    seq0 = discard.seq;
+  }
+
+  PmsData burst[PMS_BURST_MAX];
+  int nCollected = 0;
+  for (uint32_t b = 0; b < burstFrames; b++) {
+    if (!waitForFreshFrame(seq0, PMS_FRESH_AGE_MAX_MS, PMS_WAIT_FRAME_TIMEOUT_MS, burst[nCollected])) {
+      LOGW("PMS", "burst incomplete: %d/%lu (no reset pin, abort)", nCollected, (unsigned long)burstFrames);
+      if (!pmsAlwaysOn) pmsSleep();
+      return false;
+    }
+    seq0 = burst[nCollected].seq;
+    nCollected++;
+  }
+
+  pmsAggregateBurst(burst, nCollected, outAgg);
+
+  if (!pmsAlwaysOn) {
+    pmsSleep();
+  }
+
+  return true;
+}
+
+// API publique : délègue au sampling burst (discard=2, burst=6). warmupMs=0 → PMS_WARMUP_MS_DEFAULT.
+bool pmsSampleBlocking(uint32_t warmupMs, PmsData& out){
+  const uint32_t wu = (warmupMs == 0) ? PMS_WARMUP_MS_DEFAULT : warmupMs;
+  return pmsSampleBurstBlocking(wu, PMS_DISCARD_FRAMES_DEFAULT, PMS_BURST_FRAMES_DEFAULT, out);
 }
 
 // =======================================================================

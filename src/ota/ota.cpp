@@ -148,15 +148,35 @@ void otaOnBootValidate(){
   bool     pending = p.getBool("pending", false);
   uint16_t fail    = p.getUShort("fail", 0);
   uint16_t bootcnt = p.getUShort("bootcnt", 0);
+  uint32_t pendingPartAddr = p.getUInt("pending_part_addr", 0);
   p.end();
 
-  LOGI("OTA", "BootValidate: pending=%d fail=%u bootcnt=%u", (int)pending, (unsigned)fail, (unsigned)bootcnt);
+  const esp_partition_t* run = esp_ota_get_running_partition();
+  uint32_t runAddr = run ? (uint32_t)run->address : 0;
+  LOGI("OTA", "BootValidate: pending=%d fail=%u bootcnt=%u run_addr=0x%lx pending_addr=0x%lx",
+      (int)pending, (unsigned)fail, (unsigned)bootcnt, (unsigned long)runAddr, (unsigned long)pendingPartAddr);
   logPartitions();
   LOGD("OTA", "boot heap=%u", (unsigned)esp_get_free_heap_size());
 
   const uint16_t MAX_FAILS = 3;
 
   if (pending){
+    // Coupure entre pending=true et set_boot_partition : on tourne encore sur l’ancienne partition
+    if (pendingPartAddr != 0 && runAddr != pendingPartAddr){
+      LOGI("OTA", "Pending set but still running old partition (run 0x%lx != pending 0x%lx) -> clear pending", (unsigned long)runAddr, (unsigned long)pendingPartAddr);
+      Preferences c; c.begin("ota", false);
+      c.putBool("pending", false);
+      c.putUShort("fail", 0);
+      c.putUShort("bootcnt", 0);
+      c.remove("pending_part_addr");
+      c.remove("pending_part_label");
+      c.remove("from_ver");
+      c.remove("success_ver");
+      c.remove("pending_ver");
+      c.end();
+      return;
+    }
+
     if (fail >= MAX_FAILS){
       // We are the partition that was rolled back TO (the good one). Clear pending and mark valid; do not rollback again.
       Preferences r; r.begin("ota", false);
@@ -196,18 +216,41 @@ void otaOnBootValidate(){
       ESP.restart();
     }
 #endif
+    // pending=true et fail < MAX_FAILS : on ne marque pas VALID ici, l’app le fera via otaMarkAppValidIfPending()
+    return;
   }
 
+  // pending=false : ne pas appeler mark_app_valid (validation explicite par l’app uniquement)
+}
+
+bool otaIsPendingUpdate(){
+  Preferences p; p.begin("ota", true);
+  bool pending = p.getBool("pending", false);
+  p.end();
+  return pending;
+}
+
+void otaMarkAppValidIfPending(){
+  Preferences p; p.begin("ota", false);
+  bool pending = p.getBool("pending", false);
+  p.end();
+  if (!pending) return;
 #if ESP_IDF_VERSION_MAJOR >= 4
   esp_ota_mark_app_valid_cancel_rollback();
 #endif
-  Preferences r; r.begin("ota", false);
-  r.putBool("pending", false);
-  r.putUShort("fail", 0);
-  r.putUShort("bootcnt", 0);
-  r.putString("rolled_back_ver", "");  // clear so future OTAs to newer versions are allowed
-  r.end();
-  LOGI("OTA", "App marked VALID");
+  Preferences c; c.begin("ota", false);
+  c.putBool("pending", false);
+  c.putUShort("fail", 0);
+  c.putUShort("bootcnt", 0);
+  c.remove("pending_ver");
+  c.remove("from_ver");
+  c.remove("success_ver");
+  c.remove("pending_part_addr");
+  c.remove("pending_part_label");
+  c.remove("pending_set_at_ms");
+  c.putString("rolled_back_ver", "");  // allow future OTAs after successful boot
+  c.end();
+  LOGI("OTA", "App marked VALID (explicit)");
 }
 
 // ===================== Manifest signature (ECDSA P-256) =====================
@@ -566,11 +609,36 @@ static bool downloadAndFlashWithHTTPClientInner(const String& binUrl,
     return false;
   }
 
-  // On sélectionne la nouvelle partition comme partition de boot
+  // --- OTA atomique : écrire prefs AVANT set_boot_partition pour survivre à une coupure ---
+  {
+    Preferences p;
+    p.begin("ota", false);
+    p.putBool("pending", true);
+    p.putUShort("fail", 0);
+    p.putUShort("bootcnt", 0);
+    p.putString("from_ver", CURRENT_FIRMWARE_VERSION);
+    String pendingVer = p.getString("pending_ver", "");
+    if (pendingVer.length()) {
+      p.putString("success_ver", pendingVer);
+    }
+    p.putUInt("pending_set_at_ms", (uint32_t)millis());
+    p.putUInt("pending_part_addr", (uint32_t)nextPart->address);
+    p.putString("pending_part_label", nextPart->label);
+    p.end();
+    delay(35);
+    esp_task_wdt_reset();
+    LOGI("OTA", "Pending prepared: target addr=0x%lx label=%s", (unsigned long)nextPart->address, nextPart->label);
+  }
+
   err = esp_ota_set_boot_partition(nextPart);
   if (err != ESP_OK) {
     LOGI("OTA", "esp_ota_set_boot_partition FAIL err=%d (%s)",
             (int)err, esp_err_to_name(err));
+    Preferences rollback; rollback.begin("ota", false);
+    rollback.putBool("pending", false);
+    rollback.putUShort("fail", 0);
+    rollback.putUShort("bootcnt", 0);
+    rollback.end();
     g_otaInProgress = false;
     updateLedState(LED_BAD);
     return false;
@@ -578,17 +646,6 @@ static bool downloadAndFlashWithHTTPClientInner(const String& binUrl,
 
   LOGI("OTA", "OK (%u bytes), boot partition set to %s",
           (unsigned)written, nextPart->label);
-
-  Preferences p; p.begin("ota", false);
-  p.putBool("pending", true);
-  p.putUShort("fail", 0);
-  String pendingVer = p.getString("pending_ver", "");
-  if (pendingVer.length()) {
-    p.putString("from_ver", CURRENT_FIRMWARE_VERSION);
-    p.putString("success_ver", pendingVer);
-    p.remove("pending_ver");
-  }
-  p.end();
 
   g_otaInProgress = false;
   delay(250);

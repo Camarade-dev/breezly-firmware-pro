@@ -620,7 +620,7 @@ static bool mqtt_do_connect() {
     breezly_on_mqtt_hello_ok();
     maybe_fire_connected_final();
     ledOnConnectedOk();
-
+    otaMarkAppValidIfPending();
   }
 
   // 2) S’abonner au topic status pour capter “registered”
