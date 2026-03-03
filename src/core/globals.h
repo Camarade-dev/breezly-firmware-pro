@@ -68,7 +68,7 @@ bool connectToWiFiEnterprise();     // EAP-PEAP/MSCHAPv2 + CA
 void startSNTPAfterConnected();     // SNTP après Wi-Fi connecté
 
 // ==== Helpers capteurs (déjà existants chez toi) ====
-bool safeSensorRead(float& t, float& h);
+bool safeSensorRead(float& t, float& h, float* outRawT = nullptr, float* outRawH = nullptr);
 void sensorsReadEns160(int& aqi,int& tvoc,int& eco2,float t,float h);
 
 // (updateLedState est ailleurs chez toi)

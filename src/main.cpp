@@ -485,11 +485,12 @@ void loop(){
       doPms = (long)(nowMs - lastPms) >= (long)PMS_PERIOD;
     }
 
-    float t,h; int aqi=0,tvoc=0,eco2=0;
+    float t,h, t_raw, h_raw;
+    int aqi=0,tvoc=0,eco2=0;
     PmsData p = {}; bool havePms = false;
 
     if (doEns){
-      if (safeSensorRead(t,h)){
+      if (safeSensorRead(t, h, &t_raw, &h_raw)){
         sensorsReadEns160(aqi,tvoc,eco2,t,h);
         lastEns = nowMs;
       } else {
@@ -521,7 +522,7 @@ void loop(){
         // 2) Publis structurées (toujours envoyées ; sanity_ok pour le backend)
         StaticJsonDocument<512> j;
         if (doEns){
-          j["temperature"]=t; j["humidity"]=h; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
+          j["temperature"]=t_raw; j["humidity"]=h_raw; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
           j["sanity_ok"] = sanityOk;
           if (!sanityOk && sanityFailBuf[0]) j["sanity_fail"] = sanityFailBuf;
         }
@@ -559,7 +560,7 @@ void loop(){
         // cas sans PMS dispo : on envoie ENS uniquement (toujours envoyé ; sanity_ok pour le backend)
         StaticJsonDocument<512> j;
         if (doEns){
-          j["temperature"]=t; j["humidity"]=h; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
+          j["temperature"]=t_raw; j["humidity"]=h_raw; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
           j["sanity_ok"] = sanityOk;
           if (!sanityOk && sanityFailBuf[0]) j["sanity_fail"] = sanityFailBuf;
         }
