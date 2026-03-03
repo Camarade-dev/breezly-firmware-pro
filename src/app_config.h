@@ -1,6 +1,6 @@
 #pragma once
 
-#define CURRENT_FIRMWARE_VERSION "1.0.24"
+#define CURRENT_FIRMWARE_VERSION "1.0.30"
 #define BUILD_ID __DATE__ " " __TIME__
 
 // Canal manifest OTA selon build : backend Render uniquement (BREEZLY_DEV → dev, sinon prod).

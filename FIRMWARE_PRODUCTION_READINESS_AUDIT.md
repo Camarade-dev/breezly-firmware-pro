@@ -18,23 +18,25 @@
 
 ## 1.1 Modules / fichiers (rôle)
 
-| Fichier | Rôle |
-|--------|------|
-| `src/main.cpp` | Point d’entrée: `setup()` (init, prefs, BLE, WiFi, pas de MQTT/sensors au boot), `loop()` (OTA boot/tick, provisioning, publish capteurs, démarrage sensors+MQTT après fenêtre OTA, WDT feed). |
-| `src/core/globals.cpp`, `globals.h` | État global: WiFi, prefs, MQTT client, AHT/ENS160/PMS, LED, `otaInProgress` (doublon avec `ota.cpp`). |
-| `src/core/devkey_runtime.cpp`, `devkey.h` | Clé device (NVS ou `DEVICE_KEY_B64` build); `loadOrInitDevKey()` appelé en `setup()`. |
-| `src/ble/provisioning.cpp` | NimBLE, GATT (credentials + status), claim HMAC, watchdog session, phases provisioning. |
-| `src/net/wifi_connect.cpp` | PSK + EAP; timeout 15 s par tentative; backoff exponentiel (core/backoff), retry dans loop si creds valides. |
-| `src/net/wifi_enterprise.cpp` | WPA2-Enterprise PEAP/MSCHAPv2, CA Rezoleo embarqué. |
-| `src/net/mqtt_bus.cpp` | Tâche FreeRTOS MQTT (queue 24 msgs), TLS, backoff exponentiel (core/backoff), LWT, commandes set_wifi / forget_wifi / factory_reset / update. |
-| `src/net/sntp_utils.cpp` | SNTP + fallback HTTP Date pour horloge TLS. |
-| `src/ota/ota.cpp` | Manifest signé ECDSA P-256, rollback après 3 boots en pending, GitHub Pages + fallback backend; TLS vérifié (CA_BUNDLE_PEM, P0-2). |
-| `src/sensors/sensors.cpp` | AHT21, ENS160, PMS (UART), fusion/lissage PM, `safeSensorRead`, `pmsSampleBlocking`. |
-| `src/sensors/calibration.cpp` | NVS namespace `cal`, temp/hum, `calCompose`/`calInit`. |
-| `src/led/led_status.cpp` | Tâche LED (modes, score qualité d’air, pulse). |
-| `src/power/sleep.h`, `power_config.h` | Modem sleep, `lightNapMs`, `deepSleepForMs` (si `USE_DEEP_SLEEP`). |
-| `src/app_config.h` | Version, URLs manifest, LED, OTA interval, **paramètres backoff** (Wi‑Fi: min/max/factor/jitter/auth_fail_min; MQTT: min/max/factor/jitter). |
-| `src/core/backoff.h`, `backoff.cpp` | Module backoff exponentiel générique (reset, onFailure, shouldAttempt, getState); policies Wi‑Fi (auth_fail 30s) et MQTT; simulation sous `BACKOFF_SIM_TEST`. |
+
+| Fichier                                   | Rôle                                                                                                                                                                                           |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/main.cpp`                            | Point d’entrée: `setup()` (init, prefs, BLE, WiFi, pas de MQTT/sensors au boot), `loop()` (OTA boot/tick, provisioning, publish capteurs, démarrage sensors+MQTT après fenêtre OTA, WDT feed). |
+| `src/core/globals.cpp`, `globals.h`       | État global: WiFi, prefs, MQTT client, AHT/ENS160/PMS, LED, `otaInProgress` (doublon avec `ota.cpp`).                                                                                          |
+| `src/core/devkey_runtime.cpp`, `devkey.h` | Clé device (NVS ou `DEVICE_KEY_B64` build); `loadOrInitDevKey()` appelé en `setup()`.                                                                                                          |
+| `src/ble/provisioning.cpp`                | NimBLE, GATT (credentials + status), claim HMAC, watchdog session, phases provisioning.                                                                                                        |
+| `src/net/wifi_connect.cpp`                | PSK + EAP; timeout 15 s par tentative; backoff exponentiel (core/backoff), retry dans loop si creds valides.                                                                                   |
+| `src/net/wifi_enterprise.cpp`             | WPA2-Enterprise PEAP/MSCHAPv2, CA Rezoleo embarqué.                                                                                                                                            |
+| `src/net/mqtt_bus.cpp`                    | Tâche FreeRTOS MQTT (queue 24 msgs), TLS, backoff exponentiel (core/backoff), LWT, commandes set_wifi / forget_wifi / factory_reset / update.                                                  |
+| `src/net/sntp_utils.cpp`                  | SNTP + fallback HTTP Date pour horloge TLS.                                                                                                                                                    |
+| `src/ota/ota.cpp`                         | Manifest signé ECDSA P-256, rollback après 3 boots en pending, GitHub Pages + fallback backend; TLS vérifié (CA_BUNDLE_PEM, P0-2).                                                             |
+| `src/sensors/sensors.cpp`                 | AHT21, ENS160, PMS (UART), fusion/lissage PM, `safeSensorRead`, `pmsSampleBlocking`.                                                                                                           |
+| `src/sensors/calibration.cpp`             | NVS namespace `cal`, temp/hum, `calCompose`/`calInit`.                                                                                                                                         |
+| `src/led/led_status.cpp`                  | Tâche LED (modes, score qualité d’air, pulse).                                                                                                                                                 |
+| `src/power/sleep.h`, `power_config.h`     | Modem sleep, `lightNapMs`, `deepSleepForMs` (si `USE_DEEP_SLEEP`).                                                                                                                             |
+| `src/app_config.h`                        | Version, URLs manifest, LED, OTA interval, **paramètres backoff** (Wi‑Fi: min/max/factor/jitter/auth_fail_min; MQTT: min/max/factor/jitter).                                                   |
+| `src/core/backoff.h`, `backoff.cpp`       | Module backoff exponentiel générique (reset, onFailure, shouldAttempt, getState); policies Wi‑Fi (auth_fail 30s) et MQTT; simulation sous `BACKOFF_SIM_TEST`.                                  |
+
 
 ## 1.2 Flux principaux
 
@@ -55,33 +57,35 @@
 
 # 2. Checklist Production Readiness
 
-| Catégorie | Item | Status | Evidence | Risk | Fix proposé |
-|-----------|------|--------|----------|------|-------------|
-| **Sécurité & identité** | Device key hors firmware | OK | P0-1: `platformio.ini` sans valeur; `secrets.ini` (gitignore) ou env `DEVICE_KEY_B64`; `pre_build_devkey.py` lit option/env → `devkey.h` (gitignore) | — | — |
-| | Factory token hors firmware | OK | P0-1: idem via `custom_factory_token` / `FACTORY_TOKEN`; `post_upload_register.py` lit option/env | — | — |
-| | Pas de secrets MQTT en dur | OK | P0-1: `mqtt_bus.cpp` L31-32 utilise `MQTT_SECRET_USER`/`MQTT_SECRET_PASS`; `pre_build_mqtt_secrets.py` → `mqtt_secrets.h` (gitignore) | — | — |
-| **Provisioning & UX** | BLE provisioning opérationnel | OK | `provisioning.cpp`: NimBLE, claim HMAC, phases, watchdog session | — | — |
-| | Reconnexion après nouveaux creds | OK | `needToConnectWiFi` → `connectToWiFi()` dans loop | — | — |
-| **Réseau** | Backoff exponentiel Wi‑Fi | OK | `core/backoff.h` + `wifi_connect.cpp`: min 1s, max 5 min, facteur 2, jitter ±10%; auth_fail min 30s; reset à la connexion stable | — | — |
-| | Backoff MQTT | OK | `mqtt_bus.cpp`: même module Backoff, min 2s, max 5 min; reset à session établie; suspendu si Wi‑Fi down / OTA | — | — |
-| | Offline / queue | PARTIAL | Queue 24 messages, `mqtt_flush(timeout)`; pas de politique "last known good" documentée | Perte de trames si déco longue | Conserver last payload status; doc perte acceptable |
-| **Capteurs** | Timeouts / erreurs | PARTIAL | `safeSensorRead` retourne false si NaN; `pmsSampleBlocking(warmup)` avec timeout implicite; pas de timeout I2C explicite | Bus I2C bloqué possible | Timeout I2C (ex. 500 ms), reset bus après N échecs |
-| | Valeurs aberrantes | PARTIAL | Calibration temp/hum; PMS checksum trame; pas de plafond explicite AQI/TVOC/eCO2 | Valeurs extrêmes publiées | Sanity checks (min/max) avant publish |
-| **OTA** | Mécanisme présent | OK | `ota.cpp`: manifest signé, SHA256, rollback 3 boots | — | — |
-| | Pas de setInsecure en prod | OK | `ota.cpp`: TLS via `setCACert(CA_BUNDLE_PEM)` pour manifest et .bin (setInsecure supprimé, P0-2) | — | — |
-| | Rollback | OK | `otaOnBootValidate()`, `esp_ota_mark_app_invalid_rollback_and_reboot` (IDF 4+) | — | — |
-| **Watchdog / crash** | WDT actif | OK | `main.cpp` L54-76: Task WDT 120 s, feed dans loop | — | — |
-| | Reset reason loggé | MISSING | Pas d’appel `esp_reset_reason()` / télémétrie | Difficile de diagnostiquer reboots | Logger reset reason au boot, optionnel publish status |
-| **Logging** | Niveaux / désactivation prod | PARTIAL | `CORE_DEBUG_LEVEL=0` (platformio.ini); `OTA_DEBUG` dans ota.cpp; beaucoup de `Serial.printf` en dur | Logs verbeux en prod si OTA_DEBUG élevé | Macro log niveau (INFO/WARN/ERR), désactivables par build |
-| | Pas de console.log debug | PARTIAL | Plusieurs `Serial.println(s)` (ex. main L412, 424) pour payload | Bruit et possible fuite de données | Remplacer par logs conditionnels niveau |
-| **Performance** | Heap / fragmentation | PARTIAL | OTA utilise `heap_caps_malloc`; pas de métrique heap min exposée | OOM en OTA ou long run | Exposer heap min (NVS ou status MQTT) |
-| **Stockage** | NVS layout défini | PARTIAL | `myApp` (wifi, sensorId, userId, devKey, etc.), `ota`, `cal`; pas de doc layout | Risque d’écrasement / migration | Doc NVS (noms, tailles), version namespace si besoin |
-| **Conso / thermique** | Modem sleep | OK | `sleep.h` `enterModemSleep`, `lightNapMs` après publish | — | — |
-| **Conformité commerciale** | Safe defaults | PARTIAL | `FACTORY_RESET_ON_FLASH=0`; pas de dev key en dur si option désactivée en prod | — | Prod: pas de FORCE_DEVKEY_FROM_BUILD sans injection sécurisée |
-| | Pas de secrets en dur | OK | secrets.ini (gitignore), mqtt_secrets.h généré par pre-build, platformio.ini sans valeurs (P0-1) | — | — |
-| **Build / release** | Reproductible | PARTIAL | `pre_build_flashsig.py` timestamp; `FLASH_BUILD_SIG` pour reset WiFi par flash | Build non reproductible (sig change à chaque fois) | Option build reproductible (SOURCEDATE_EPOCH ou tag) |
-| | Version / artefacts | PARTIAL | `CURRENT_FIRMWARE_VERSION` dans app_config; pas de script release / tag | Traçabilité release faible | Script: tag git, binaire nommé, manifest généré |
-| **Factory** | Flash usine documenté | PARTIAL | `post_upload_register.py` enregistre device; pas de doc procédure | Erreurs en usine | Doc + checklist EOL (voir §7) |
+
+| Catégorie                  | Item                             | Status  | Evidence                                                                                                                                             | Risk                                               | Fix proposé                                                   |
+| -------------------------- | -------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------- |
+| **Sécurité & identité**    | Device key hors firmware         | OK      | P0-1: `platformio.ini` sans valeur; `secrets.ini` (gitignore) ou env `DEVICE_KEY_B64`; `pre_build_devkey.py` lit option/env → `devkey.h` (gitignore) | —                                                  | —                                                             |
+|                            | Factory token hors firmware      | OK      | P0-1: idem via `custom_factory_token` / `FACTORY_TOKEN`; `post_upload_register.py` lit option/env                                                    | —                                                  | —                                                             |
+|                            | Pas de secrets MQTT en dur       | OK      | P0-1: `mqtt_bus.cpp` L31-32 utilise `MQTT_SECRET_USER`/`MQTT_SECRET_PASS`; `pre_build_mqtt_secrets.py` → `mqtt_secrets.h` (gitignore)                | —                                                  | —                                                             |
+| **Provisioning & UX**      | BLE provisioning opérationnel    | OK      | `provisioning.cpp`: NimBLE, claim HMAC, phases, watchdog session                                                                                     | —                                                  | —                                                             |
+|                            | Reconnexion après nouveaux creds | OK      | `needToConnectWiFi` → `connectToWiFi()` dans loop                                                                                                    | —                                                  | —                                                             |
+| **Réseau**                 | Backoff exponentiel Wi‑Fi        | OK      | `core/backoff.h` + `wifi_connect.cpp`: min 1s, max 5 min, facteur 2, jitter ±10%; auth_fail min 30s; reset à la connexion stable                     | —                                                  | —                                                             |
+|                            | Backoff MQTT                     | OK      | `mqtt_bus.cpp`: même module Backoff, min 2s, max 5 min; reset à session établie; suspendu si Wi‑Fi down / OTA                                        | —                                                  | —                                                             |
+|                            | Offline / queue                  | PARTIAL | Queue 24 messages, `mqtt_flush(timeout)`; pas de politique "last known good" documentée                                                              | Perte de trames si déco longue                     | Conserver last payload status; doc perte acceptable           |
+| **Capteurs**               | Timeouts / erreurs               | PARTIAL | `safeSensorRead` retourne false si NaN; `pmsSampleBlocking(warmup)` avec timeout implicite; pas de timeout I2C explicite                             | Bus I2C bloqué possible                            | Timeout I2C (ex. 500 ms), reset bus après N échecs            |
+|                            | Valeurs aberrantes               | PARTIAL | Calibration temp/hum; PMS checksum trame; pas de plafond explicite AQI/TVOC/eCO2                                                                     | Valeurs extrêmes publiées                          | Sanity checks (min/max) avant publish                         |
+| **OTA**                    | Mécanisme présent                | OK      | `ota.cpp`: manifest signé, SHA256, rollback 3 boots                                                                                                  | —                                                  | —                                                             |
+|                            | Pas de setInsecure en prod       | OK      | `ota.cpp`: TLS via `setCACert(CA_BUNDLE_PEM)` pour manifest et .bin (setInsecure supprimé, P0-2)                                                     | —                                                  | —                                                             |
+|                            | Rollback                         | OK      | `otaOnBootValidate()`, `esp_ota_mark_app_invalid_rollback_and_reboot` (IDF 4+)                                                                       | —                                                  | —                                                             |
+| **Watchdog / crash**       | WDT actif                        | OK      | `main.cpp` L54-76: Task WDT 120 s, feed dans loop                                                                                                    | —                                                  | —                                                             |
+|                            | Reset reason loggé               | MISSING | Pas d’appel `esp_reset_reason()` / télémétrie                                                                                                        | Difficile de diagnostiquer reboots                 | Logger reset reason au boot, optionnel publish status         |
+| **Logging**                | Niveaux / désactivation prod     | PARTIAL | `CORE_DEBUG_LEVEL=0` (platformio.ini); `OTA_DEBUG` dans ota.cpp; beaucoup de `Serial.printf` en dur                                                  | Logs verbeux en prod si OTA_DEBUG élevé            | Macro log niveau (INFO/WARN/ERR), désactivables par build     |
+|                            | Pas de console.log debug         | PARTIAL | Plusieurs `Serial.println(s)` (ex. main L412, 424) pour payload                                                                                      | Bruit et possible fuite de données                 | Remplacer par logs conditionnels niveau                       |
+| **Performance**            | Heap / fragmentation             | PARTIAL | OTA utilise `heap_caps_malloc`; pas de métrique heap min exposée                                                                                     | OOM en OTA ou long run                             | Exposer heap min (NVS ou status MQTT)                         |
+| **Stockage**               | NVS layout défini                | PARTIAL | `myApp` (wifi, sensorId, userId, devKey, etc.), `ota`, `cal`; pas de doc layout                                                                      | Risque d’écrasement / migration                    | Doc NVS (noms, tailles), version namespace si besoin          |
+| **Conso / thermique**      | Modem sleep                      | OK      | `sleep.h` `enterModemSleep`, `lightNapMs` après publish                                                                                              | —                                                  | —                                                             |
+| **Conformité commerciale** | Safe defaults                    | PARTIAL | `FACTORY_RESET_ON_FLASH=0`; pas de dev key en dur si option désactivée en prod                                                                       | —                                                  | Prod: pas de FORCE_DEVKEY_FROM_BUILD sans injection sécurisée |
+|                            | Pas de secrets en dur            | OK      | secrets.ini (gitignore), mqtt_secrets.h généré par pre-build, platformio.ini sans valeurs (P0-1)                                                     | —                                                  | —                                                             |
+| **Build / release**        | Reproductible                    | PARTIAL | `pre_build_flashsig.py` timestamp; `FLASH_BUILD_SIG` pour reset WiFi par flash                                                                       | Build non reproductible (sig change à chaque fois) | Option build reproductible (SOURCEDATE_EPOCH ou tag)          |
+|                            | Version / artefacts              | PARTIAL | `CURRENT_FIRMWARE_VERSION` dans app_config; pas de script release / tag                                                                              | Traçabilité release faible                         | Script: tag git, binaire nommé, manifest généré               |
+| **Factory**                | Flash usine documenté            | PARTIAL | `post_upload_register.py` enregistre device; pas de doc procédure                                                                                    | Erreurs en usine                                   | Doc + checklist EOL (voir §7)                                 |
+
 
 ---
 
@@ -253,30 +257,36 @@
 
 ## P0 (bloquant avant shipping)
 
-| Action | Effort | Risque réduit | Fichiers | Definition of done |
-|--------|--------|----------------|----------|--------------------|
-| Retirer tous les secrets du code versionné (MQTT, device key, factory token) | M | Fuite secrets, conformité | platformio.ini, mqtt_bus.cpp, secrets.ini (créer), pre_build | secrets.ini gitignore; build OK via env / secrets.ini; aucun secret en clair dans repo |
-| Supprimer setInsecure() OTA pour GitHub | S | MITM firmware | ota.cpp | CA ou pinning pour l’hébergeur OTA; build + OTA testés |
-| Vérifier que le bloc "Start sensors + MQTT after OTA" est bien dans loop() | S | Device ne publie jamais | main.cpp | Déjà corrigé; un cycle loop exécute le bloc quand conditions remplies |
+
+| Action                                                                       | Effort | Risque réduit             | Fichiers                                                     | Definition of done                                                                     |
+| ---------------------------------------------------------------------------- | ------ | ------------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
+| Retirer tous les secrets du code versionné (MQTT, device key, factory token) | M      | Fuite secrets, conformité | platformio.ini, mqtt_bus.cpp, secrets.ini (créer), pre_build | secrets.ini gitignore; build OK via env / secrets.ini; aucun secret en clair dans repo |
+| Supprimer setInsecure() OTA pour GitHub                                      | S      | MITM firmware             | ota.cpp                                                      | CA ou pinning pour l’hébergeur OTA; build + OTA testés                                 |
+| Vérifier que le bloc "Start sensors + MQTT after OTA" est bien dans loop()   | S      | Device ne publie jamais   | main.cpp                                                     | Déjà corrigé; un cycle loop exécute le bloc quand conditions remplies                  |
+
 
 ## P1 (fortement recommandé)
 
-| Action | Effort | Risque réduit | Fichiers | Definition of done |
-|--------|--------|----------------|----------|--------------------|
-| Backoff exponentiel + jitter Wi‑Fi et MQTT | M | Blacklist AP, charge serveur | wifi_connect.cpp, mqtt_bus.cpp, main.cpp | Délai max 5–10 min; jitter; test déco/reco |
-| Unifier état OTA (otaIsInProgress() partout) | S | Comportement OTA incorrect | main.cpp, sleep.h | Aucune référence à `otaInProgress` global; tout via otaIsInProgress() |
-| Log reset reason + heap au boot (optionnel status) | S | Diagnostic terrain | main.cpp, évent. mqtt_bus (status) | Serial + optionnel champ MQTT status |
-| Procédure factory + EOL documentée | M | Erreurs usine | FACTORY_E2E_CHECKLIST.md, README ou doc | Checklist exécutable + temps estimé |
+
+| Action                                             | Effort | Risque réduit                | Fichiers                                 | Definition of done                                                    |
+| -------------------------------------------------- | ------ | ---------------------------- | ---------------------------------------- | --------------------------------------------------------------------- |
+| Backoff exponentiel + jitter Wi‑Fi et MQTT         | M      | Blacklist AP, charge serveur | wifi_connect.cpp, mqtt_bus.cpp, main.cpp | Délai max 5–10 min; jitter; test déco/reco                            |
+| Unifier état OTA (otaIsInProgress() partout)       | S      | Comportement OTA incorrect   | main.cpp, sleep.h                        | Aucune référence à `otaInProgress` global; tout via otaIsInProgress() |
+| Log reset reason + heap au boot (optionnel status) | S      | Diagnostic terrain           | main.cpp, évent. mqtt_bus (status)       | Serial + optionnel champ MQTT status                                  |
+| Procédure factory + EOL documentée                 | M      | Erreurs usine                | FACTORY_E2E_CHECKLIST.md, README ou doc  | Checklist exécutable + temps estimé                                   |
+
 
 ## P2 (amélioration)
 
-| Action | Effort | Risque réduit | Fichiers | Definition of done |
-|--------|--------|----------------|----------|--------------------|
-| Macro logs par niveau (INFO/WARN/ERR), désactivables en prod | M | Bruit, fuite données | Log macro central, main, ota, mqtt_bus, sensors | Build prod sans logs payload; niveaux configurables |
-| Timeout I2C + reset bus après N échecs | S | Bus bloqué | sensors.cpp | Timeout 500 ms; après 3 échecs Wire end/begin |
-| Sanity checks AQI/TVOC/eCO2 avant publish | S | Valeurs aberrantes | main.cpp ou sensors | Plafonds définis, valeurs clampées |
-| Build reproductible (SOURCEDATE_EPOCH / tag) | S | Traçabilité binaire | pre_build_flashsig.py, CI | Même tag → même binaire (hors sig si souhaité) |
-| NVS layout documenté (namespace, clés) | S | Migrations futures | Doc / annexe | Table clé/usage par namespace |
+
+| Action                                                       | Effort | Risque réduit        | Fichiers                                        | Definition of done                                  |
+| ------------------------------------------------------------ | ------ | -------------------- | ----------------------------------------------- | --------------------------------------------------- |
+| Macro logs par niveau (INFO/WARN/ERR), désactivables en prod | M      | Bruit, fuite données | Log macro central, main, ota, mqtt_bus, sensors | Build prod sans logs payload; niveaux configurables |
+| Timeout I2C + reset bus après N échecs                       | S      | Bus bloqué           | sensors.cpp                                     | Timeout 500 ms; après 3 échecs Wire end/begin       |
+| Sanity checks AQI/TVOC/eCO2 avant publish                    | S      | Valeurs aberrantes   | main.cpp ou sensors                             | Plafonds définis, valeurs clampées                  |
+| Build reproductible (SOURCEDATE_EPOCH / tag)                 | S      | Traçabilité binaire  | pre_build_flashsig.py, CI                       | Même tag → même binaire (hors sig si souhaité)      |
+| NVS layout documenté (namespace, clés)                       | S      | Migrations futures   | Doc / annexe                                    | Table clé/usage par namespace                       |
+
 
 ---
 
@@ -309,3 +319,4 @@
 - **PMS:** Particulate Matter Sensor (UART).  
 - **ENS160:** Capteur qualité d’air (I2C).  
 - **AHT:** Temp/humidity (AHT21, I2C).
+

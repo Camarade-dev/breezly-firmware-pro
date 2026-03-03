@@ -3,7 +3,8 @@
 #include "../core/globals.h"
 
 bool sensorsInit();
-bool safeSensorRead(float& tempC, float& humidity);
+/** Lit T et HR ; remplit tempC/humidity (calibrés). Si outRawTempC/outRawHumidity non null, y met les valeurs brutes (sans calibration). */
+bool safeSensorRead(float& tempC, float& humidity, float* outRawTempC, float* outRawHumidity);
 void sensorsReadEns160(int& aqi, int& tvoc, int& eco2, float tempC, float humidity);
 
 /** Sanity check AQI/TVOC/eCO2 (seuils dans app_config.h). Ne bloque jamais l'envoi.

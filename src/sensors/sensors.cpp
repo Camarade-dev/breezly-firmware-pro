@@ -440,7 +440,7 @@ static inline float rhTempCompensate(float RH_raw, float T_raw, float T_corr){
   return RH;
 }
 
-bool safeSensorRead(float& tempC, float& humidity){
+bool safeSensorRead(float& tempC, float& humidity, float* outRawTempC, float* outRawHumidity){
   sensors_event_t eventHum, eventTemp;
   aht.getEvent(&eventHum, &eventTemp);
   if (isnan(eventTemp.temperature) || isnan(eventHum.relative_humidity)){
@@ -455,6 +455,9 @@ bool safeSensorRead(float& tempC, float& humidity){
 
   const float T_raw = eventTemp.temperature;
   const float RH_raw = eventHum.relative_humidity;
+
+  if (outRawTempC)    *outRawTempC = T_raw;
+  if (outRawHumidity) *outRawHumidity = RH_raw;
 
   const float T_corr = calApplyTemp(T_raw);
   float RH_tc = rhTempCompensate(RH_raw, T_raw, T_corr);
