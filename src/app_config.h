@@ -2,6 +2,7 @@
 
 #define CURRENT_FIRMWARE_VERSION "1.0.30"
 #define BUILD_ID __DATE__ " " __TIME__
+#define FIRMWARE_VARIANT "BREEZLY_PRO"
 
 // Canal manifest OTA selon build : backend Render uniquement (BREEZLY_DEV → dev, sinon prod).
 #if defined(BREEZLY_DEV)
