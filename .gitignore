@@ -4,11 +4,13 @@
 .vscode/launch.json
 .vscode/ipch
 
-; Secrets et fichiers générés par pre-build (ne jamais committer)
+# Secrets et fichiers générés par pre-build (ne jamais committer)
 secrets.ini
 src/core/devkey.h
 src/net/mqtt_secrets.h
+.cache/
 .last_build_sig
+build/
 
-; Journal EOL rempli par flash_fleet.py (données de production, ne pas committer)
+# Journal EOL rempli par flash_fleet.py (données de production, ne pas committer)
 docs/EOL_LOG.csv
