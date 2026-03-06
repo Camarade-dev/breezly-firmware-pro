@@ -18,3 +18,11 @@ void  pmsSleep();                 // SET=LOW
 void  pmsWake();                  // SET=HIGH
 bool  pmsSampleBlocking(uint32_t warmupMs, PmsData& out); // wake->attend->lit->sleep
 void pmsPostProcess(const PmsData& in, float& pm1, float& pm25, float& pm10);
+
+// BMP581 (pression + température)
+bool bmp581Init(void);
+bool bmp581Read(float& pressurePa, float& tempC);
+
+// SCD41 (CO2 NDIR réel + T + HR)
+bool scd41Init(void);
+bool scd41Read(uint16_t& co2Ppm, float& tempC, float& humidity);

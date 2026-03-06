@@ -1,5 +1,7 @@
 // src/sensors/sensors.cpp
 #include "sensors.h"
+#include "bmp581.h"
+#include "scd41.h"
 #include <Wire.h>
 #include <cstring>
 #include "../app_config.h"
@@ -404,6 +406,8 @@ static void i2cBusReset(){
   (void)aht.begin();
   (void)ens160.begin();
   ens160.setMode(ENS160_OPMODE_STD);
+  (void)bmp581Init();
+  (void)scd41Init();
   LOGI("I2C", "bus reset after %d failures, sensors re-init", (int)I2C_BUS_RESET_AFTER_FAILURES);
 }
 
@@ -419,6 +423,12 @@ bool sensorsInit(){
 
   if (!ens160.begin()) LOGW("I2C", "ENS160 init failed");
   else { LOGD("I2C", "ENS160 initialisé avec succès"); ens160.setMode(ENS160_OPMODE_STD); }
+
+  if (!bmp581Init()) LOGW("I2C", "BMP581 init failed");
+  else LOGD("I2C", "BMP581 initialisé avec succès");
+
+  if (!scd41Init()) LOGW("I2C", "SCD41 init failed");
+  else LOGD("I2C", "SCD41 initialisé avec succès");
 
   s_i2cConsecutiveFailures = 0;
   if (!gPmsMutex) gPmsMutex = xSemaphoreCreateMutex();
