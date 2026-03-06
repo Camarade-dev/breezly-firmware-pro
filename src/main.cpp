@@ -488,10 +488,17 @@ void loop(){
     float t,h, t_raw, h_raw;
     int aqi=0,tvoc=0,eco2=0;
     PmsData p = {}; bool havePms = false;
+    float pressurePa = NAN, tempBmp = NAN;
+    bool haveBmp = false;
+    uint16_t co2NdirPpm = 0;
+    float tempScd41 = NAN, humidityScd41 = NAN;
+    bool haveScd41 = false;
 
     if (doEns){
       if (safeSensorRead(t, h, &t_raw, &h_raw)){
         sensorsReadEns160(aqi,tvoc,eco2,t,h);
+        haveBmp = bmp581Read(pressurePa, tempBmp);
+        haveScd41 = scd41Read(co2NdirPpm, tempScd41, humidityScd41);
         lastEns = nowMs;
       } else {
         doEns = false; // on annule si la lecture a foiré
@@ -523,6 +530,9 @@ void loop(){
         StaticJsonDocument<512> j;
         if (doEns){
           j["temperature"]=t_raw; j["humidity"]=h_raw; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
+          if (haveBmp && isfinite(pressurePa)) j["pressure_pa"] = (float)pressurePa;
+          if (haveBmp && isfinite(tempBmp))     j["temperature_bmp"] = (float)tempBmp;
+          if (haveScd41) { j["co2_ndir_ppm"] = co2NdirPpm; if (isfinite(tempScd41)) j["temperature_scd41"] = (float)tempScd41; if (isfinite(humidityScd41)) j["humidity_scd41"] = (float)humidityScd41; }
           j["sanity_ok"] = sanityOk;
           if (!sanityOk && sanityFailBuf[0]) j["sanity_fail"] = sanityFailBuf;
         }
@@ -561,6 +571,9 @@ void loop(){
         StaticJsonDocument<512> j;
         if (doEns){
           j["temperature"]=t_raw; j["humidity"]=h_raw; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
+          if (haveBmp && isfinite(pressurePa)) j["pressure_pa"] = (float)pressurePa;
+          if (haveBmp && isfinite(tempBmp))     j["temperature_bmp"] = (float)tempBmp;
+          if (haveScd41) { j["co2_ndir_ppm"] = co2NdirPpm; if (isfinite(tempScd41)) j["temperature_scd41"] = (float)tempScd41; if (isfinite(humidityScd41)) j["humidity_scd41"] = (float)humidityScd41; }
           j["sanity_ok"] = sanityOk;
           if (!sanityOk && sanityFailBuf[0]) j["sanity_fail"] = sanityFailBuf;
         }
