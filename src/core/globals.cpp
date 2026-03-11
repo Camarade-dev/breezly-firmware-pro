@@ -31,8 +31,8 @@ unsigned long lastPublish = 0;
 
 uint16_t be16(const uint8_t *b){ return (uint16_t)b[0]<<8 | b[1]; }
 WifiAuthType wifiAuthType = WIFI_CONN_PSK;  // défaut: PSK
-
 String eapIdentity = "";
 String eapUsername = "";
 String eapPassword = "";
 String eapAnon     = "ano@rezoleo.fr";
+bool   eapInsecure = false;

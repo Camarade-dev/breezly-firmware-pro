@@ -61,11 +61,13 @@ extern String eapIdentity;   // inner identity (souvent = username) (optionnel)
 extern String eapUsername;   // inner username (MSCHAPv2)
 extern String eapPassword;   // inner password
 extern String eapAnon;       // outer anonymous identity (ex: "ano@rezoleo.fr")
+extern bool   eapInsecure;   // true = mode EAP sans CA (setInsecure côté infra)
 
 // ==== API réseau ====
 bool connectToWiFi();               // route PSK/EAP
 bool connectToWiFiEnterprise();     // EAP-PEAP/MSCHAPv2 + CA
 void startSNTPAfterConnected();     // SNTP après Wi-Fi connecté
+void wifi_enterprise_detach_disc_handler(); // stop log EAP en mode provisioning pur
 
 // ==== Helpers capteurs (déjà existants chez toi) ====
 bool safeSensorRead(float& t, float& h, float* outRawT = nullptr, float* outRawH = nullptr);
