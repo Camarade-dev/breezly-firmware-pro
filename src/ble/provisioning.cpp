@@ -364,7 +364,8 @@ static void credWorker(void*){
         String passS = doc["password"]  | "";
         String idS   = doc["identity"]  | userS;
         String anonS = doc["anonymous"] | "";
-        bool   insecure = doc["insecure"] | false;  // optionnel: mode EAP sans CA
+        // App peut envoyer "insecure" ou "eap_insecure" (rétrocompat)
+        bool   insecure = doc["insecure"].as<bool>() || doc["eap_insecure"].as<bool>();
         if (ssidS.isEmpty() || userS.isEmpty() || passS.isEmpty()){
           provisioningSetStatus("{\"status\":\"missing_fields\"}");
           continue;
@@ -372,6 +373,8 @@ static void credWorker(void*){
         wifiSSID=ssidS; wifiAuthType=WIFI_CONN_EAP_PEAP_MSCHAPV2;
         eapUsername=userS; eapPassword=passS; eapIdentity=idS; eapAnon=anonS;
         eapInsecure = insecure;
+        eapInsecure = insecure;
+LOGI("BLE", "parsed insecure=%d eapInsecure=%d", (int)insecure, (int)eapInsecure);
       } else {
         String pwdS = doc["password"] | "";
         if (ssidS.isEmpty() || pwdS.isEmpty()){
