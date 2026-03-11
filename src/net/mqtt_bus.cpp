@@ -120,6 +120,7 @@ static void forgetWifiPrefs_All(bool alsoForgetUser){
   eapUsername  = prefs.getString("eapUsername", "");
   eapPassword  = prefs.getString("eapPassword", "");
   eapAnon      = prefs.getString("eapAnon", "");
+  eapInsecure  = prefs.getBool  ("eapInsecure", false);
   if (alsoForgetUser) {
     userId = prefs.getString("userId", "");
   }
@@ -225,6 +226,7 @@ static bool applyWifiPrefsFromJson(const JsonDocument& j, String& errMsg) {
   const char* eapPass = j["eap"]["password"] | "";
   const char* eapId   = j["eap"]["identity"] | "";
   const char* eapAnon = j["eap"]["anon"] | "";
+  bool        eapInsec = j["eap"]["insecure"] | false;
 
   if (newAuth == WIFI_CONN_PSK) {
     if (!ssid[0] || !pwd[0]) { errMsg="missing_ssid_or_pwd"; p.end(); return false; }
@@ -241,11 +243,13 @@ static bool applyWifiPrefsFromJson(const JsonDocument& j, String& errMsg) {
     p.putString("eapPassword", eapPass ? eapPass : "");
     p.putString("eapIdentity", eapId   ? eapId   : "");
     p.putString("eapAnon",     eapAnon ? eapAnon : "anon@domain");
+    p.putBool  ("eapInsecure", eapInsec);
   } else {
     p.putString("eapUsername", "");
     p.putString("eapPassword", "");
     p.putString("eapIdentity", "");
     p.putString("eapAnon",     "");
+    p.putBool  ("eapInsecure", false);
   }
   p.end();
   return true;

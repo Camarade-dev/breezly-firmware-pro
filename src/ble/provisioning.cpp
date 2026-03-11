@@ -286,6 +286,7 @@ static void credWorker(void*){
       prefs.remove("eapPassword");
       prefs.remove("eapIdentity");
       prefs.remove("eapAnon");
+      prefs.remove("eapInsecure");
       prefs.remove("checksum");
       prefs.end();
       provisioningSetStatus("{\"status\":\"erased\"}");
@@ -363,12 +364,14 @@ static void credWorker(void*){
         String passS = doc["password"]  | "";
         String idS   = doc["identity"]  | userS;
         String anonS = doc["anonymous"] | "";
+        bool   insecure = doc["insecure"] | false;  // optionnel: mode EAP sans CA
         if (ssidS.isEmpty() || userS.isEmpty() || passS.isEmpty()){
           provisioningSetStatus("{\"status\":\"missing_fields\"}");
           continue;
         }
         wifiSSID=ssidS; wifiAuthType=WIFI_CONN_EAP_PEAP_MSCHAPV2;
         eapUsername=userS; eapPassword=passS; eapIdentity=idS; eapAnon=anonS;
+        eapInsecure = insecure;
       } else {
         String pwdS = doc["password"] | "";
         if (ssidS.isEmpty() || pwdS.isEmpty()){
@@ -390,6 +393,7 @@ static void credWorker(void*){
         prefs.putString("eapPassword", eapPassword);
         prefs.putString("eapIdentity", eapIdentity);
         prefs.putString("eapAnon",     eapAnon);
+        prefs.putBool  ("eapInsecure", eapInsecure);
       }
       prefs.putString("sensorId",     sensorId);
       prefs.putString("userId",       userId);

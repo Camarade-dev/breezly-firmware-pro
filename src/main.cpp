@@ -231,6 +231,7 @@ if (p.begin("myApp", false)) {
   p.putString("eapPassword", "");
   p.putString("eapIdentity", "");
   p.putString("eapAnon", "");
+  p.putBool  ("eapInsecure", false);
   p.end();
 }
 
@@ -301,6 +302,7 @@ void setup(){
   eapUsername  = prefs.getString("eapUsername", "");
   eapPassword  = prefs.getString("eapPassword", "");
   eapAnon      = prefs.getString("eapAnon", "ano@rezoleo.fr");
+  eapInsecure  = prefs.getBool  ("eapInsecure", false);
   prefs.end();
 
   // --- Vérifs d’identifiants selon le mode sélectionné ---
@@ -430,6 +432,14 @@ void loop(){
     twdtResetSafe();
     if (wifiConnected) {
       mqtt_request_connect();
+    } else {
+      // En phase de provisioning BLE : si la tentative échoue,
+      // on repasse en mode "besoin de provisioning" et on arrête
+      // les retries automatiques avec backoff, et on coupe le handler
+      // EAP pour éviter les logs STA_DISCONNECTED en boucle.
+      s_needProv = true;
+      wifiBackoffReset();
+      wifi_enterprise_detach_disc_handler();
     }
   }
 

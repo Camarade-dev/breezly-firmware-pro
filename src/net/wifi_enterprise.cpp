@@ -11,41 +11,69 @@
 extern "C" {
   #include "esp_wifi.h"
   #include "esp_event.h"
-  #include "esp_eap_client.h"   // API Enterprise moderne (ESP-IDF 5.x)
+  #include "esp_eap_client.h"
 }
-#include "esp_wifi.h"
 extern bool bleInited;
 extern void restartBLEAdvertising();
 
-static volatile int s_lastDiscReasonEap = -1;
+static volatile int  s_lastDiscReasonEap = -1;
+static volatile bool s_connectingEap     = false;   // vrai pendant la fenêtre de connexion
 static esp_event_handler_instance_t s_discInstEap = nullptr;
 
+// ─────────────────────────── Handler STA_DISCONNECTED
+// N'agit QUE si on est en train de connecter ou déjà connecté.
+// Évite le spam de logs/actions lors des retries automatiques au boot.
 static void onStaDiscEap(void*, esp_event_base_t, int32_t, void* data) {
   auto* ev = (wifi_event_sta_disconnected_t*)data;
-  s_lastDiscReasonEap = ev ? ev->reason : -1;
-  LOGD("EAP", "STA_DISCONNECTED reason=%d", s_lastDiscReasonEap);
-  wifiConnected = false;
-  mqtt_bus_reset_backoff_on_wifi_lost();
-  updateLedState(LED_BAD);  // rouge clignotant dès la perte de lien
+  int reason = ev ? (int)ev->reason : -1;
+
+  if (!s_connectingEap && !wifiConnected) {
+    // Retry automatique du stack Arduino en dehors d'une tentative explicite → ignorer
+    LOGD("EAP", "STA_DISCONNECTED reason=%d (ignoré, pas de connexion active)", reason);
+    return;
+  }
+
+  s_lastDiscReasonEap = reason;
+  LOGD("EAP", "STA_DISCONNECTED reason=%d", reason);
+
+  if (wifiConnected) {
+    // Perte de connexion en cours d'utilisation
+    wifiConnected = false;
+    mqtt_bus_reset_backoff_on_wifi_lost();
+    updateLedState(LED_BAD);
+  }
 }
 
-// ─────────────────────────── Hooks no-op (si tu veux pauser d’autres stacks)
-static inline void pauseOtherNetWork() {}
-static inline void resumeOtherNetWork() {}
-
-// ─────────────────────────── Log de déconnexion (diag)
-static void onStaDisc(void*, esp_event_base_t, int32_t, void* data) {
-  auto* ev = (wifi_event_sta_disconnected_t*)data;
-  LOGD("EAP", "STA_DISCONNECTED reason=%d", ev->reason);
+// ─────────────────────────── Détachement du handler (mode BLE pur)
+void wifi_enterprise_detach_disc_handler() {
+  if (s_discInstEap) {
+    esp_event_handler_instance_unregister(
+      WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, s_discInstEap);
+    s_discInstEap = nullptr;
+  }
 }
-static esp_event_handler_instance_t s_discInst = nullptr;
 
 // ─────────────────────────── Certificat CA embarqué
-//   Fichier PEM à placer dans: src/certs/ca_rezoleo.pem
-//   Et ajouter à platformio.ini:
-//     board_build.embed_txtfiles = src/certs/ca_rezoleo.pem
 extern const uint8_t _binary_src_certs_ca_rezoleo_pem_start[];
 extern const uint8_t _binary_src_certs_ca_rezoleo_pem_end[];
+
+// ─────────────────────────── Helper : "anonymous@domaine" depuis username
+static String outerFromUsername(const String& username) {
+  int at = username.indexOf('@');
+  if (at >= 0) return "anonymous" + username.substring(at);
+  return "anonymous";
+}
+
+// ─────────────────────────── Reset propre du stack WiFi
+static void wifiHardReset() {
+  WiFi.setAutoReconnect(false);   // ← stoppe les retries automatiques
+  WiFi.disconnect(true, true);    // true,true = déconnecte + efface creds NVS
+  WiFi.mode(WIFI_OFF);
+  vTaskDelay(300 / portTICK_PERIOD_MS);
+  WiFi.mode(WIFI_STA);
+  vTaskDelay(100 / portTICK_PERIOD_MS);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+}
 
 // ─────────────────────────── Connexion WPA2-Enterprise (PEAP/MSCHAPv2)
 bool connectToWiFiEnterprise() {
@@ -55,51 +83,58 @@ bool connectToWiFiEnterprise() {
     return false;
   }
 
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(false, true);
-  esp_wifi_set_ps(WIFI_PS_NONE);
+  // ── 1. Reset propre du stack ────────────────────────────────────────────
+  s_connectingEap     = false;
+  s_lastDiscReasonEap = -1;
+  wifiHardReset();
 
-  // handler (1 fois)
+  // ── 2. Handler STA_DISCONNECTED (enregistré une seule fois) ────────────
   if (!s_discInstEap) {
-    ESP_ERROR_CHECK( esp_event_handler_instance_register(
-      WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &onStaDiscEap, nullptr, &s_discInstEap) );
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+      WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
+      &onStaDiscEap, nullptr, &s_discInstEap));
   }
 
-  // Nettoyage EAP
+  // ── 3. Nettoyage EAP ───────────────────────────────────────────────────
   esp_wifi_sta_enterprise_disable();
-  #ifdef esp_eap_client_clear_identity
-    esp_eap_client_clear_identity();
-  #endif
-  #ifdef esp_eap_client_clear_username
-    esp_eap_client_clear_username();
-  #endif
-  #ifdef esp_eap_client_clear_password
-    esp_eap_client_clear_password();
-  #endif
-  #ifdef esp_eap_client_clear_new_password
-    esp_eap_client_clear_new_password();
-  #endif
-  #ifdef esp_eap_client_clear_ca_cert
-    esp_eap_client_clear_ca_cert();
-  #endif
-  #ifdef esp_eap_client_clear_cert_key
-    esp_eap_client_clear_cert_key();
-  #endif
+  esp_eap_client_clear_identity();
+  esp_eap_client_clear_username();
+  esp_eap_client_clear_password();
+  esp_eap_client_clear_new_password();
+  esp_eap_client_clear_ca_cert();
 
-  // Identités + MDP + CA (comme avant)
-  const String outer = eapAnon.length() ? eapAnon : "ano@rezoleo.fr";
-  ESP_ERROR_CHECK( esp_eap_client_set_identity((const uint8_t*)outer.c_str(), outer.length()) );
-  ESP_ERROR_CHECK( esp_eap_client_set_username((const uint8_t*)eapUsername.c_str(), eapUsername.length()) );
-  ESP_ERROR_CHECK( esp_eap_client_set_password((const uint8_t*)eapPassword.c_str(), eapPassword.length()) );
+  // ── 4. Outer identity ──────────────────────────────────────────────────
+  // Priorité : eapAnon explicite > dérivé du username
+  // Mode insecure : outer = inner (skip la dérivation anonyme)
+  String outer;
+  if (eapInsecure) {
+    outer = eapIdentity.length() ? eapIdentity : eapUsername;
+  } else {
+    outer = eapAnon.length() ? eapAnon : outerFromUsername(eapUsername);
+  }
+
+  LOGI("EAP", "outer='%s' inner='%s' insecure=%d",
+       outer.c_str(), eapUsername.c_str(), (int)eapInsecure);
+
+  ESP_ERROR_CHECK(esp_eap_client_set_identity(
+      (const uint8_t*)outer.c_str(), outer.length()));
+  ESP_ERROR_CHECK(esp_eap_client_set_username(
+      (const uint8_t*)eapUsername.c_str(), eapUsername.length()));
+  ESP_ERROR_CHECK(esp_eap_client_set_password(
+      (const uint8_t*)eapPassword.c_str(), eapPassword.length()));
+
+  // Ignore la validité temporelle du certificat (NTP pas encore sync)
   esp_eap_client_set_disable_time_check(true);
 
-  extern const uint8_t _binary_src_certs_ca_rezoleo_pem_start[];
-  extern const uint8_t _binary_src_certs_ca_rezoleo_pem_end[];
-  ESP_ERROR_CHECK( esp_eap_client_set_ca_cert(
+  // ── 5. Certificat CA (mode sécurisé uniquement) ────────────────────────
+  if (!eapInsecure) {
+    ESP_ERROR_CHECK(esp_eap_client_set_ca_cert(
       (const unsigned char*)_binary_src_certs_ca_rezoleo_pem_start,
-      (int)(_binary_src_certs_ca_rezoleo_pem_end - _binary_src_certs_ca_rezoleo_pem_start)
-  ) );
+      (int)(_binary_src_certs_ca_rezoleo_pem_end
+            - _binary_src_certs_ca_rezoleo_pem_start)));
+  }
 
+  // ── 6. Activer Enterprise ──────────────────────────────────────────────
   esp_err_t er = esp_wifi_sta_enterprise_enable();
   if (er == ESP_ERR_WIFI_NOT_INIT) {
     WiFi.mode(WIFI_STA);
@@ -107,34 +142,39 @@ bool connectToWiFiEnterprise() {
   }
   ESP_ERROR_CHECK(er);
 
+  // ── 7. Lancer la connexion ─────────────────────────────────────────────
   LOGI("EAP", "Connexion à '%s'…", wifiSSID.c_str());
   provSet("status", "connecting");
 
+  s_lastDiscReasonEap = -1;
+  s_connectingEap     = true;   // autorise le handler à réagir dès maintenant
+
   WiFi.begin(wifiSSID.c_str());
 
-  // Attente ~20 s
+  // ── 8. Attente ~20 s (80 × 250 ms) ────────────────────────────────────
   bool ok = false;
   for (int i = 0; i < 80; ++i) {
     if (WiFi.status() == WL_CONNECTED) { ok = true; break; }
     esp_task_wdt_reset();
     vTaskDelay(250 / portTICK_PERIOD_MS);
 #if BREEZLY_LOG_LEVEL >= BREEZLY_LOG_LEVEL_DEBUG
-    if ((i % 2) == 0) Serial.print(".");
+    if ((i % 4) == 0) Serial.print(".");
 #endif
   }
 #if BREEZLY_LOG_LEVEL >= BREEZLY_LOG_LEVEL_DEBUG
   Serial.println();
 #endif
 
-      if (ok) {
+  s_connectingEap = false;  // fin de la fenêtre de connexion
+
+  // ── 9. Succès ──────────────────────────────────────────────────────────
+  if (ok) {
     wifiConnected = true;
     breezly_on_wifi_ok();
-    LOGI("EAP", "OK IP=%s RSSI=%d", WiFi.localIP().toString().c_str(), WiFi.RSSI());
-
-    // 1) Wi-Fi OK
+    LOGI("EAP", "OK IP=%s RSSI=%d",
+         WiFi.localIP().toString().c_str(), WiFi.RSSI());
     provSet("status", "wifi_ok");
 
-    // 2) Internet ?
     bool inet = checkInternetReachable();
     if (!inet) {
       LOGW("EAP", "Internet unreachable");
@@ -143,37 +183,29 @@ bool connectToWiFiEnterprise() {
     }
     breezly_on_inet_ok();
     provSet("status", "inet_ok");
-    // 3) Final
     provisioningNotifyConnected();
     startSNTPAfterConnected();
 
-    // 🎯 NEW : libérer les buffers EAP (identité / mdp / CA) devenus inutiles
-    // → ça rend quelques kB de heap, utile avant l’OTA.
-    // en fait ça fait crash la co mqtt après 30min / 1h d’uptime (fuite mémoire ?)
-     /* esp_eap_client_clear_identity();
-      esp_eap_client_clear_username();
-      esp_eap_client_clear_password();
-      esp_eap_client_clear_new_password();
-      esp_eap_client_clear_ca_cert(); 
-    */
-    //esp_wifi_sta_enterprise_disable(); test si ça nique la requete
+    // Note: ne PAS appeler esp_eap_client_clear_* ici.
+    // Les buffers EAP sont nécessaires pour la reconnexion automatique.
+    // Les libérer provoque des crashes MQTT après ~30-60 min d'uptime.
 
     return true;
   }
 
-
-
-  // Échec : préciser la cause
+  // ── 10. Échec ──────────────────────────────────────────────────────────
   wifiConnected = false;
-  const char* st = mapDiscReasonToStatus(s_lastDiscReasonEap);
-  provSet("status", st);
+  LOGW("EAP", "Échec connexion, reason=%d", s_lastDiscReasonEap);
+  provSet("status", mapDiscReasonToStatus(s_lastDiscReasonEap));
+
   if (s_lastDiscReasonEap == WIFI_REASON_802_1X_AUTH_FAILED) {
     breezly_on_wifi_auth_failed();
-  } else if (s_lastDiscReasonEap == WIFI_REASON_NO_AP_FOUND ||
-            s_lastDiscReasonEap == WIFI_REASON_ASSOC_EXPIRE ||
-            s_lastDiscReasonEap == WIFI_REASON_HANDSHAKE_TIMEOUT) {
+  } else if (s_lastDiscReasonEap == WIFI_REASON_NO_AP_FOUND  ||
+             s_lastDiscReasonEap == WIFI_REASON_ASSOC_EXPIRE ||
+             s_lastDiscReasonEap == WIFI_REASON_HANDSHAKE_TIMEOUT) {
     breezly_on_wifi_assoc_timeout();
   }
+
   if (bleInited) restartBLEAdvertising();
   return false;
 }
