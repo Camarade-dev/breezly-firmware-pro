@@ -231,7 +231,6 @@ if (p.begin("myApp", false)) {
   p.putString("eapPassword", "");
   p.putString("eapIdentity", "");
   p.putString("eapAnon", "");
-  p.putBool  ("eapInsecure", false);
   p.end();
 }
 
@@ -301,7 +300,7 @@ void setup(){
   eapIdentity  = prefs.getString("eapIdentity", "");
   eapUsername  = prefs.getString("eapUsername", "");
   eapPassword  = prefs.getString("eapPassword", "");
-  eapAnon      = prefs.getString("eapAnon", "ano@rezoleo.fr");
+  eapAnon      = prefs.getString("eapAnon", "");
   eapInsecure  = prefs.getBool  ("eapInsecure", false);
   prefs.end();
 

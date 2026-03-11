@@ -74,7 +74,6 @@ static void wifiHardReset() {
   vTaskDelay(100 / portTICK_PERIOD_MS);
   esp_wifi_set_ps(WIFI_PS_NONE);
 }
-
 // ─────────────────────────── Connexion WPA2-Enterprise (PEAP/MSCHAPv2)
 bool connectToWiFiEnterprise() {
   if (wifiSSID.isEmpty() || eapUsername.isEmpty() || eapPassword.isEmpty()) {
