@@ -2,28 +2,95 @@
 # -*- coding: utf-8 -*-
 """
 Flash en parallèle une flotte d'ESP32 (hub USB multi-ports) et remplit automatiquement
-le journal EOL (traçabilité commerciale). Une seule commande : brancher les PCBs, lancer le script.
+le journal EOL (traçabilité commerciale). Orchestration explicite : build → flash → MAC → provision → EOL.
+
+Architecture robuste : pas de dépendance au parsing stdout pour les infos critiques ;
+timeouts, retries et résultat structuré par port.
 """
 
 import argparse
+import configparser
 import csv
 import json
 import os
 import re
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 DEFAULT_PIO_EXE = r"C:\Users\stris\.platformio\penv\Scripts\platformio.exe"
 EOL_LOG_DEFAULT = "docs/EOL_LOG.csv"
 APP_CONFIG_PATH = "src/app_config.h"
+SECRETS_INI = "secrets.ini"
 
-def now():
+# Timeouts (secondes)
+UPLOAD_TIMEOUT_SEC = 120
+MAC_READ_TIMEOUT_SEC = 15
+PROVISION_TIMEOUT_SEC = 30
+
+# Retries par étape
+UPLOAD_RETRIES = 2
+MAC_READ_RETRIES = 3
+PROVISION_RETRIES = 2
+
+# Délai après upload avant lecture MAC (stabilisation port COM)
+POST_UPLOAD_DELAY_SEC = 2
+
+# Jobs parallèles par défaut (conservateur pour Windows / CP210x)
+DEFAULT_JOBS = 2
+
+# URL backend par défaut (prod)
+DEFAULT_API_URL = "https://breezly-backend.onrender.com"
+
+
+def now() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
-def get_fw_version(cwd):
+
+# ---------------------------------------------------------------------------
+# Résultat structuré par port
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PortResult:
+    port: str
+    flash_ok: bool
+    flash_attempts: int
+    mac: Optional[str] = None
+    external_id: Optional[str] = None
+    provision_ok: bool = False
+    fw_version: str = ""
+    variant: str = ""
+    error_stage: Optional[str] = None
+    remarks: str = ""
+
+    def to_dict(self):
+        return {
+            "port": self.port,
+            "flash_ok": self.flash_ok,
+            "flash_attempts": self.flash_attempts,
+            "mac": self.mac,
+            "external_id": self.external_id,
+            "provision_ok": self.provision_ok,
+            "fw_version": self.fw_version,
+            "variant": self.variant,
+            "error_stage": self.error_stage,
+            "remarks": self.remarks,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Version firmware
+# ---------------------------------------------------------------------------
+
+def get_fw_version(cwd: str) -> str:
     """Lit CURRENT_FIRMWARE_VERSION depuis src/app_config.h."""
     path = Path(cwd) / APP_CONFIG_PATH
     if not path.exists():
@@ -35,34 +102,50 @@ def get_fw_version(cwd):
     except Exception:
         return "unknown"
 
-def parse_external_id_from_upload_output(out):
+
+# ---------------------------------------------------------------------------
+# Secrets (secrets.ini + env)
+# ---------------------------------------------------------------------------
+
+def load_secrets(cwd: str) -> Tuple[str, str]:
     """
-    Extrait MAC (12 hex) et external_id (PROV_XXXXXXXXXXXX) de la sortie du post_upload_register.
-    Retourne (mac_with_colons, external_id) ou (None, None).
+    Charge factory_token et device_key_b64 depuis secrets.ini [env] ou variables d'environnement.
+    Retourne (factory_token, device_key_b64).
     """
-    if not out:
-        return None, None
-    m = re.search(r"external_id pour provision:\s*PROV_([0-9A-Fa-f]{12})", out)
-    if not m:
-        return None, None
-    hex12 = m.group(1).upper()
-    mac_colons = ":".join(hex12[i : i + 2] for i in range(0, 12, 2))
-    external_id = f"PROV_{hex12}"
-    return mac_colons, external_id
+    factory_token = os.environ.get("FACTORY_TOKEN", "")
+    device_key_b64 = os.environ.get("DEVICE_KEY_B64", "")
+
+    secrets_path = Path(cwd) / SECRETS_INI
+    if secrets_path.exists():
+        try:
+            cfg = configparser.ConfigParser()
+            cfg.read(secrets_path, encoding="utf-8")
+            if cfg.has_section("env"):
+                factory_token = cfg.get("env", "custom_factory_token", fallback=factory_token).strip()
+                device_key_b64 = cfg.get("env", "custom_device_key_b64", fallback=device_key_b64).strip()
+        except Exception:
+            pass
+
+    return factory_token, device_key_b64
+
+
+# ---------------------------------------------------------------------------
+# EOL log
+# ---------------------------------------------------------------------------
 
 EOL_HEADER = ["Date", "Heure", "MAC", "external_id", "Version_FW", "Variant", "Port", "EOL_resultat", "Operateur", "Remarques"]
 
-def ensure_eol_log_header(eol_log_path):
-    """Crée le fichier EOL avec en-tête CSV si absent ; migre l'ancien format (sans Variant/Port) vers le nouveau."""
-    path = Path(eol_log_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        with open(path, "r", newline="", encoding="utf-8") as f:
+
+def ensure_eol_log_header(eol_log_path: Path) -> None:
+    """Crée le fichier EOL avec en-tête CSV si absent ; migre l'ancien format vers le nouveau."""
+    eol_log_path = Path(eol_log_path)
+    eol_log_path.parent.mkdir(parents=True, exist_ok=True)
+    if eol_log_path.exists():
+        with open(eol_log_path, "r", newline="", encoding="utf-8") as f:
             all_rows = list(csv.reader(f))
         if all_rows and "Variant" in all_rows[0]:
-            return  # déjà nouveau format
-        # Ancien format (8 colonnes) : migrer en réécrivant avec colonnes Variant et Port vides
-        with open(path, "w", newline="", encoding="utf-8") as f:
+            return
+        with open(eol_log_path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(EOL_HEADER)
             for r in all_rows[1:]:
@@ -71,47 +154,89 @@ def ensure_eol_log_header(eol_log_path):
                 elif len(r) >= 6:
                     w.writerow([r[0], r[1], r[2], r[3], r[4], "", "", r[5], r[6] if len(r) > 6 else "", ""])
         return
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(EOL_HEADER)
+    with open(eol_log_path, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(EOL_HEADER)
 
-def append_eol_row(eol_log_path, date, time, mac, external_id, version_fw, variant, port, result, operator, remarks):
-    """Ajoute une ligne au journal EOL (append, thread-safe depuis le thread principal)."""
+
+def append_eol_row(
+    eol_log_path: Path,
+    date: str,
+    time_str: str,
+    mac: str,
+    external_id: str,
+    version_fw: str,
+    variant: str,
+    port: str,
+    result: str,
+    operator: str,
+    remarks: str,
+) -> None:
+    """Ajoute une ligne au journal EOL."""
     path = Path(eol_log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([date, time, mac or "", external_id or "", version_fw, variant or "", port or "", result, operator or "", remarks or ""])
+        csv.writer(f).writerow([
+            date, time_str, mac or "", external_id or "", version_fw, variant or "", port or "",
+            result, operator or "", remarks or "",
+        ])
 
-def run_cmd(cmd, cwd=None, env=None, capture=True):
-    """
-    Run command and return (returncode, stdout, stderr).
-    """
+
+def eol_result_and_remarks(res: PortResult) -> Tuple[str, str]:
+    """Dérive EOL_resultat et Remarques à partir du résultat structuré (pas de parsing stdout)."""
+    if not res.flash_ok:
+        return "KO", "upload_failed"
+    if res.mac is None or res.external_id is None:
+        return "KO", "mac_read_failed"
+    if res.remarks == "provision_skipped_no_secrets":
+        return "OK", res.remarks
+    if not res.provision_ok:
+        return "KO", res.remarks or "provision_failed"
+    return "OK", res.remarks or ""
+
+
+# ---------------------------------------------------------------------------
+# Subprocess avec timeout
+# ---------------------------------------------------------------------------
+
+def run_cmd(
+    cmd: list,
+    cwd: Optional[str] = None,
+    env: Optional[dict] = None,
+    capture: bool = True,
+    timeout_sec: Optional[int] = None,
+) -> Tuple[int, str, str]:
+    """Exécute une commande. Retourne (returncode, stdout, stderr)."""
+    kw = dict(cwd=cwd, env=env, shell=False)
+    if timeout_sec is not None:
+        kw["timeout"] = timeout_sec
     if capture:
         p = subprocess.run(
             cmd,
-            cwd=cwd,
-            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            shell=False,
+            **kw,
         )
-        return p.returncode, p.stdout, p.stderr
-    else:
-        p = subprocess.run(cmd, cwd=cwd, env=env, shell=False)
-        return p.returncode, "", ""
+        return p.returncode, p.stdout or "", p.stderr or ""
+    p = subprocess.run(cmd, **kw)
+    return (p.returncode, "", "")
 
-def ensure_platformio(pio_exe):
+
+# ---------------------------------------------------------------------------
+# PlatformIO
+# ---------------------------------------------------------------------------
+
+def ensure_platformio(pio_exe: str) -> None:
     if not Path(pio_exe).exists():
         raise FileNotFoundError(
             f"platformio.exe introuvable: {pio_exe}\n"
             "→ Mets le bon chemin via --pio-exe"
         )
 
-def list_ports_json(pio_exe, cwd):
+
+def list_ports_json(pio_exe: str, cwd: str) -> list:
     cmd = [pio_exe, "device", "list", "--json-output"]
-    code, out, err = run_cmd(cmd, cwd=cwd, capture=True)
+    code, out, err = run_cmd(cmd, cwd=cwd, capture=True, timeout_sec=30)
     if code != 0:
         raise RuntimeError(f"[device list] échec ({code})\n{err.strip()}")
     try:
@@ -119,52 +244,39 @@ def list_ports_json(pio_exe, cwd):
     except json.JSONDecodeError as e:
         raise RuntimeError(f"[device list] JSON invalide: {e}\nSortie:\n{out}")
 
-def normalize_port(p):
-    # On retourne le port tel que PlatformIO le veut (COMx sous Windows).
+
+def normalize_port(p: Optional[str]) -> str:
     return (p or "").strip()
 
-def pick_ports(devices, include=None, exclude=None):
-    """
-    devices: list of dict from platformio device list JSON
-    include/exclude: list of substrings filters applied to 'description' or 'hwid' or 'port'
-    """
+
+def pick_ports(
+    devices: list,
+    include: Optional[list] = None,
+    exclude: Optional[list] = None,
+) -> list:
+    """Filtre les ports selon include/exclude sur description, hwid, port."""
     include = include or []
     exclude = exclude or []
-
     ports = []
     for d in devices:
         port = normalize_port(d.get("port"))
         desc = (d.get("description") or "")
         hwid = (d.get("hwid") or "")
-
         hay = f"{port} {desc} {hwid}".lower()
-
-        if include:
-            ok = any(s.lower() in hay for s in include)
-            if not ok:
-                continue
-
-        if exclude:
-            bad = any(s.lower() in hay for s in exclude)
-            if bad:
-                continue
-
+        if include and not any(s.lower() in hay for s in include):
+            continue
+        if exclude and any(s.lower() in hay for s in exclude):
+            continue
         if port:
             ports.append(port)
-
-    # uniq stable
     seen = set()
-    uniq = []
-    for p in ports:
-        if p not in seen:
-            seen.add(p)
-            uniq.append(p)
-    return uniq
+    return [p for p in ports if p not in seen and not seen.add(p)]
 
-def pio_build(pio_exe, env_name, cwd):
+
+def pio_build(pio_exe: str, env_name: str, cwd: str) -> None:
     cmd = [pio_exe, "run", "--environment", env_name]
     print(f"[{now()}] Build: {env_name}")
-    code, out, err = run_cmd(cmd, cwd=cwd, capture=True)
+    code, out, err = run_cmd(cmd, cwd=cwd, capture=True, timeout_sec=300)
     if out.strip():
         print(out.rstrip())
     if code != 0:
@@ -173,102 +285,303 @@ def pio_build(pio_exe, env_name, cwd):
         raise RuntimeError(f"Build échoué ({code})")
     print(f"[{now()}] Build OK")
 
-def pio_upload_one(pio_exe, env_name, port, cwd, variant=None):
-    # 1. On prépare une copie de l'environnement actuel
-    my_env = os.environ.copy()
-    # 2. On active notre "Cheat Code" pour geler le timestamp
-    my_env["PIO_UPLOAD_ONLY"] = "1"
-    if variant:
-        # Transmet le variant au hook post_upload_register.py
-        my_env["DEVICE_VARIANT"] = variant
-    
-    cmd = [
-        pio_exe, 
-        "run", 
-        "--environment", env_name, 
-        "-t", "upload", 
-        # ON RETIRE "-t", "nobuild" ICI car PIO va détecter "Up-to-date" tout seul
-        "--upload-port", port
-    ]
-    
-    # On passe my_env à la commande
-    code, out, err = run_cmd(cmd, cwd=cwd, env=my_env, capture=True)
-    return code, out, err
 
-def main():
+def pio_upload_one(
+    pio_exe: str,
+    env_name: str,
+    port: str,
+    cwd: str,
+    variant: Optional[str],
+    timeout_sec: int = UPLOAD_TIMEOUT_SEC,
+) -> Tuple[int, str, str]:
+    """
+    Lance un upload PlatformIO sur le port donné.
+    BREEZLY_FLEET_FLASH=1 pour que le post-hook ne fasse pas le provision (fait par le script).
+    """
+    my_env = os.environ.copy()
+    my_env["PIO_UPLOAD_ONLY"] = "1"
+    my_env["BREEZLY_FLEET_FLASH"] = "1"
+    if variant:
+        my_env["DEVICE_VARIANT"] = variant
+    cmd = [
+        pio_exe,
+        "run",
+        "--environment", env_name,
+        "-t", "upload",
+        "--upload-port", port,
+    ]
+    return run_cmd(cmd, cwd=cwd, env=my_env, capture=True, timeout_sec=timeout_sec)
+
+
+# ---------------------------------------------------------------------------
+# Lecture MAC via esptool (dans le script, pas dans le hook)
+# ---------------------------------------------------------------------------
+
+def _find_esptool_from_platformio() -> Optional[List[str]]:
+    """Retourne [python, esptool.py] si trouvé dans les packages PlatformIO."""
+    for base in [
+        os.environ.get("PLATFORMIO_CORE_DIR"),
+        str(Path.home() / ".platformio"),
+    ]:
+        if not base:
+            continue
+        for name in ("esptool.py", "scripts/esptool.py"):
+            path = Path(base) / "packages" / "tool-esptoolpy" / name
+            if path.exists():
+                return [sys.executable, str(path)]
+    return None
+
+
+def get_esptool_cmd() -> list:
+    """Commande pour esptool : esptool des packages PlatformIO si présent, sinon python -m esptool."""
+    fallback = _find_esptool_from_platformio()
+    if fallback:
+        return fallback
+    return [sys.executable, "-m", "esptool"]
+
+
+def check_esptool_available() -> None:
+    """Vérifie que esptool est installé (pour lecture MAC). Sort en erreur sinon."""
+    try:
+        # --help retourne 0 et ne nécessite pas de port
+        code, _, err = run_cmd(get_esptool_cmd() + ["--help"], capture=True, timeout_sec=10)
+        if code != 0:
+            raise RuntimeError(err or "esptool a échoué")
+    except subprocess.TimeoutExpired:
+        raise SystemExit("esptool --help a expiré (timeout).")
+    except FileNotFoundError:
+        raise SystemExit(
+            "esptool introuvable. Installez-le avec: pip install esptool\n"
+            "Requis pour la lecture MAC après flash en mode flotte."
+        )
+    except Exception as e:
+        raise SystemExit(
+            f"esptool non disponible: {e}\n"
+            "Installez avec: pip install esptool"
+        )
+
+
+def read_mac_esptool(
+    port: str,
+    timeout_sec: int = MAC_READ_TIMEOUT_SEC,
+    retries: int = MAC_READ_RETRIES,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Lit le MAC via esptool read_mac. Retourne (mac_avec_colons, external_id) ou (None, None).
+    external_id = PROV_<MAC 12 hex sans ':'>, aligné firmware/backend.
+    """
+    base_cmd = get_esptool_cmd()
+    for attempt in range(1, retries + 1):
+        try:
+            cmd = base_cmd + ["read_mac", "--port", port]
+            code, out, err = run_cmd(cmd, capture=True, timeout_sec=timeout_sec)
+            if code != 0:
+                out = out or err or ""
+            text = (out + " " + err)
+            # MAC: AA:BB:CC:DD:EE:FF ou format similaire
+            m = re.search(r"MAC:\s*([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})", text)
+            if not m:
+                m = re.search(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})", text)
+            if m:
+                mac_colons = m.group(1)
+                mac_hex = mac_colons.replace(":", "").upper()
+                if len(mac_hex) == 12:
+                    external_id = f"PROV_{mac_hex}"
+                    return mac_colons, external_id
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception:
+            pass
+        if attempt < retries:
+            time.sleep(1)
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# Provisioning backend Breezly (même logique que post_upload_register)
+# ---------------------------------------------------------------------------
+
+def provision_backend(
+    api_url: str,
+    factory_token: str,
+    device_key_b64: str,
+    external_id: str,
+    variant: str,
+    timeout_sec: int = PROVISION_TIMEOUT_SEC,
+    retries: int = PROVISION_RETRIES,
+) -> bool:
+    """
+    POST /api/internal/provision-device. Payload compatible avec l'existant.
+    Retourne True si 2xx, False sinon.
+    """
+    url = api_url.rstrip("/") + "/api/internal/provision-device"
+    payload = {
+        "external_id": external_id,
+        "deviceKeyB64": device_key_b64,
+        "name": external_id,
+        "type": "temperature",
+        "location": "Bureau",
+    }
+    if variant:
+        payload["variant"] = variant
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "X-Factory-Token": factory_token,
+        },
+        method="POST",
+    )
+    for _ in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                return 200 <= resp.status < 300
+        except urllib.error.HTTPError as e:
+            if 200 <= e.code < 300:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Pipeline par port : flash → pause → MAC → provision → résultat
+# ---------------------------------------------------------------------------
+
+def process_one_port(
+    port: str,
+    pio_exe: str,
+    env_name: str,
+    cwd: str,
+    variant: Optional[str],
+    fw_version: str,
+    api_url: str,
+    factory_token: str,
+    device_key_b64: str,
+) -> PortResult:
+    """
+    Pour un port : upload (avec retries), lecture MAC, provisioning, construction du résultat.
+    Pas d'écriture EOL ici (faite en central après collecte).
+    """
+    res = PortResult(
+        port=port,
+        flash_ok=False,
+        flash_attempts=0,
+        fw_version=fw_version,
+        variant=variant or "",
+    )
+
+    # 1. Upload avec retries
+    for attempt in range(1, UPLOAD_RETRIES + 1):
+        res.flash_attempts = attempt
+        code, out, err = pio_upload_one(
+            pio_exe, env_name, port, cwd, variant,
+            timeout_sec=UPLOAD_TIMEOUT_SEC,
+        )
+        if code == 0:
+            res.flash_ok = True
+            break
+        if attempt < UPLOAD_RETRIES:
+            time.sleep(2)
+    if not res.flash_ok:
+        res.error_stage = "upload"
+        res.remarks = "upload_failed"
+        return res
+
+    # 2. Pause courte (stabilisation port COM)
+    time.sleep(POST_UPLOAD_DELAY_SEC)
+
+    # 3. Lecture MAC
+    mac_colons, external_id = read_mac_esptool(
+        port,
+        timeout_sec=MAC_READ_TIMEOUT_SEC,
+        retries=MAC_READ_RETRIES,
+    )
+    res.mac = mac_colons
+    res.external_id = external_id
+    if not external_id:
+        res.error_stage = "mac_read"
+        res.remarks = "mac_read_failed"
+        return res
+
+    # 4. Provisioning backend (seulement si factory_token et device_key fournis)
+    if factory_token and device_key_b64:
+        res.provision_ok = provision_backend(
+            api_url,
+            factory_token,
+            device_key_b64,
+            external_id,
+            res.variant,
+            timeout_sec=PROVISION_TIMEOUT_SEC,
+            retries=PROVISION_RETRIES,
+        )
+        if not res.provision_ok:
+            res.error_stage = "provision"
+            res.remarks = "provision_failed"
+    else:
+        res.remarks = "provision_skipped_no_secrets"
+
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Flash une flotte d'ESP32 via PlatformIO (build unique + uploads parallèles)."
+        description="Flash une flotte d'ESP32 (build unique + uploads parallèles). MAC et provision gérés dans le script.",
     )
-    parser.add_argument(
-        "--env",
-        required=True,
-        help="Nom de l'environnement PlatformIO (ex: esp32-wroom-32e-prod)",
-    )
-    parser.add_argument(
-        "--pio-exe",
-        default=DEFAULT_PIO_EXE,
-        help="Chemin complet vers platformio.exe",
-    )
+    parser.add_argument("--env", required=True, help="Environnement PlatformIO (ex: esp32-wroom-32e-prod)")
+    parser.add_argument("--pio-exe", default=DEFAULT_PIO_EXE, help="Chemin vers platformio.exe")
     parser.add_argument(
         "--jobs",
         type=int,
-        default=3,
-        help="Nombre d'uploads en parallèle (recommandé: 2-4)",
+        default=DEFAULT_JOBS,
+        help=f"Uploads en parallèle (défaut: {DEFAULT_JOBS})",
     )
     parser.add_argument(
         "--include",
         nargs="*",
         default=["cp210"],
-        help="Filtre: conserve seulement les devices dont (port/desc/hwid) contient un de ces mots (ex: CP210 CH340)",
+        help="Filtre devices (port/desc/hwid)",
     )
     parser.add_argument(
         "--variant",
         choices=["STD", "PREMIUM"],
-        help="Variant matériel des devices flashés dans cette flotte (STD ou PREMIUM). Transmis au backend pour la calibration température.",
+        help="Variant matériel (STD/PREMIUM) pour le backend",
     )
-
-    parser.add_argument(
-        "--exclude",
-        nargs="*",
-        default=[],
-        help="Filtre: exclut les devices dont (port/desc/hwid) contient un de ces mots",
-    )
-    parser.add_argument(
-        "--ports",
-        nargs="*",
-        default=[],
-        help="Si fourni, ignore l’auto-détection et utilise cette liste (ex: COM3 COM4 COM5)",
-    )
-    parser.add_argument(
-        "--no-build",
-        action="store_true",
-        help="Ne compile pas (upload direct). Utile si tu as déjà build.",
-    )
-    parser.add_argument(
-        "--eol-log",
-        default=EOL_LOG_DEFAULT,
-        help=f"Fichier journal EOL (CSV) à remplir automatiquement. Défaut: {EOL_LOG_DEFAULT}",
-    )
-    parser.add_argument(
-        "--no-eol",
-        action="store_true",
-        help="Désactive l'écriture du journal EOL (flash uniquement).",
-    )
+    parser.add_argument("--exclude", nargs="*", default=[], help="Exclure devices")
+    parser.add_argument("--ports", nargs="*", default=[], help="Liste de ports (ex: COM3 COM4)")
+    parser.add_argument("--no-build", action="store_true", help="Ne pas compiler")
+    parser.add_argument("--eol-log", default=EOL_LOG_DEFAULT, help=f"Fichier EOL CSV (défaut: {EOL_LOG_DEFAULT})")
+    parser.add_argument("--no-eol", action="store_true", help="Désactiver le journal EOL")
     parser.add_argument(
         "--operator",
         default=os.environ.get("EOL_OPERATOR", ""),
-        help="Nom de l'opérateur pour la traçabilité EOL (ou variable EOL_OPERATOR).",
+        help="Opérateur EOL (ou EOL_OPERATOR)",
+    )
+    parser.add_argument(
+        "--api-url",
+        default=os.environ.get("API_URL", DEFAULT_API_URL),
+        help="URL backend Breezly pour le provisioning",
     )
     args = parser.parse_args()
 
     cwd = os.getcwd()
     ensure_platformio(args.pio_exe)
 
-    # Build une seule fois
+    factory_token, device_key_b64 = load_secrets(cwd)
+    api_url = args.api_url or DEFAULT_API_URL
+    if not factory_token and not device_key_b64:
+        print(f"[{now()}] Attention: FACTORY_TOKEN / DEVICE_KEY_B64 absents → pas de provisioning backend.", file=sys.stderr)
+
     if not args.no_build:
         pio_build(args.pio_exe, args.env, cwd)
 
-    # Ports
     if args.ports:
         ports = [normalize_port(p) for p in args.ports if normalize_port(p)]
     else:
@@ -278,104 +591,91 @@ def main():
     if not ports:
         raise SystemExit(
             "Aucun port trouvé.\n"
-            "→ Vérifie que tes Breezly sont branchés.\n"
-            "→ Option: --ports COM3 COM4 ...\n"
-            "→ Option: --include CP210 CH340\n"
+            "→ Vérifie les devices branchés, --include/--exclude, ou --ports COMx ..."
         )
 
+    check_esptool_available()
+
     fw_version = get_fw_version(cwd)
-    eol_log_path = Path(args.eol_log) if not Path(args.eol_log).is_absolute() else Path(args.eol_log)
+    eol_log_path = Path(args.eol_log)
     if not eol_log_path.is_absolute():
         eol_log_path = Path(cwd) / eol_log_path
     if not args.no_eol:
-        ensure_eol_log_header(str(eol_log_path))
+        ensure_eol_log_header(eol_log_path)
         print(f"[{now()}] Journal EOL: {eol_log_path}")
 
-    print(f"[{now()}] Ports détectés ({len(ports)}): {', '.join(ports)}")
-    print(f"[{now()}] Upload parallèle: jobs={args.jobs} (FW {fw_version})")
+    print(f"[{now()}] Ports ({len(ports)}): {', '.join(ports)}")
+    print(f"[{now()}] Jobs={args.jobs}, FW={fw_version}")
 
-    results = {}
-    failed = []
+    results: List[PortResult] = []
+    failed_ports: list[str] = []
+
+    def run_one(port: str) -> PortResult:
+        return process_one_port(
+            port,
+            args.pio_exe,
+            args.env,
+            cwd,
+            args.variant,
+            fw_version,
+            api_url,
+            factory_token,
+            device_key_b64,
+        )
 
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        futs = {ex.submit(pio_upload_one, args.pio_exe, args.env, p, cwd, args.variant): p for p in ports}
-
+        futs = {ex.submit(run_one, p): p for p in ports}
         for fut in as_completed(futs):
             port = futs[fut]
             try:
-                code, out, err = fut.result()
+                res = fut.result()
             except Exception as e:
-                code, out, err = 1, "", f"Exception: {e}"
+                res = PortResult(
+                    port=port,
+                    flash_ok=False,
+                    flash_attempts=0,
+                    fw_version=fw_version,
+                    variant=args.variant or "",
+                    error_stage="exception",
+                    remarks=str(e),
+                )
+            results.append(res)
+            # Échec si flash KO ou si provision était attendue et a échoué
+            if not res.flash_ok:
+                failed_ports.append(port)
+            elif res.external_id and factory_token and device_key_b64 and not res.provision_ok:
+                failed_ports.append(port)
 
-            results[port] = (code, out, err)
-            dt = datetime.now()
-            date_str = dt.strftime("%Y-%m-%d")
-            time_str = dt.strftime("%H:%M:%S")
+            status = "✅" if res.flash_ok and (not res.external_id or res.provision_ok) else "❌"
+            print(f"[{now()}] {status} {res.port} flash={res.flash_ok} mac={bool(res.mac)} provision={res.provision_ok}")
+            if res.error_stage:
+                print(f"         → {res.error_stage}: {res.remarks}", file=sys.stderr)
 
-            variant_str = (args.variant or "").strip()
-            if code == 0:
-                print(f"[{now()}] ✅ {port} OK")
-                if not args.no_eol:
-                    mac_colons, external_id = parse_external_id_from_upload_output(out)
-                    if external_id:
-                        append_eol_row(
-                            str(eol_log_path),
-                            date_str,
-                            time_str,
-                            mac_colons or "",
-                            external_id,
-                            fw_version,
-                            variant_str,
-                            port,
-                            "OK",
-                            args.operator,
-                            "",
-                        )
-                    else:
-                        append_eol_row(
-                            str(eol_log_path),
-                            date_str,
-                            time_str,
-                            "",
-                            "",
-                            fw_version,
-                            variant_str,
-                            port,
-                            "KO",
-                            args.operator,
-                            "register_failed_or_no_external_id",
-                        )
-            else:
-                print(f"[{now()}] ❌ {port} FAIL ({code})", file=sys.stderr)
-                failed.append(port)
-                if not args.no_eol:
-                    append_eol_row(
-                        str(eol_log_path),
-                        date_str,
-                        time_str,
-                        "",
-                        "",
-                        fw_version,
-                        variant_str,
-                        port,
-                        "KO",
-                        args.operator,
-                        "upload_failed",
-                    )
+            if not args.no_eol:
+                dt = datetime.now()
+                eol_ok, eol_remarks = eol_result_and_remarks(res)
+                append_eol_row(
+                    eol_log_path,
+                    dt.strftime("%Y-%m-%d"),
+                    dt.strftime("%H:%M:%S"),
+                    res.mac or "",
+                    res.external_id or "",
+                    res.fw_version,
+                    res.variant,
+                    res.port,
+                    eol_ok,
+                    args.operator,
+                    eol_remarks,
+                )
 
-            # Optionnel: afficher un extrait utile si fail
-            if code != 0:
-                if out.strip():
-                    print(out.rstrip(), file=sys.stderr)
-                if err.strip():
-                    print(err.rstrip(), file=sys.stderr)
-
-    print(f"\n[{now()}] Terminé. OK={len(ports)-len(failed)} / FAIL={len(failed)}")
+    ok_count = len(ports) - len(failed_ports)
+    print(f"\n[{now()}] Terminé. OK={ok_count} / FAIL={len(failed_ports)}")
     if not args.no_eol:
-        print(f"[{now()}] Journal EOL mis à jour: {eol_log_path}")
-    if failed:
-        print(f"Ports en échec: {', '.join(failed)}", file=sys.stderr)
+        print(f"[{now()}] EOL: {eol_log_path}")
+    if failed_ports:
+        print(f"Ports en échec: {', '.join(failed_ports)}", file=sys.stderr)
         sys.exit(2)
+
 
 if __name__ == "__main__":
     main()
