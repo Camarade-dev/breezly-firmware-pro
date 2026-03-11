@@ -1,8 +1,11 @@
 # scripts/post_upload_register.py
 # Provisionne le device après upload via external_id dérivé du MAC (esptool read_mac).
+# En mode flotte (BREEZLY_FLEET_FLASH=1), le script flash_fleet.py gère MAC + provision + EOL ;
+# ce hook ne fait rien pour éviter doublon et surcharge en uploads parallèles.
 # --variant STD|PREMIUM
 Import("env")
 import os, re, sys, subprocess, json
+
 
 def reverse_pairs(mac_hex):
     """Inverse l'ordre des paires d'octets pour coller au format buildExternalId() du firmware."""
@@ -64,6 +67,9 @@ def read_mac(port):
         return None
 
 def after_upload(target, source, env):
+    if os.environ.get("BREEZLY_FLEET_FLASH") == "1":
+        print("[post-upload] fleet mode: provisioning géré par flash_fleet.py")
+        return
     print("[post-upload] hook loaded")
     port = get_upload_port()
     if port:
