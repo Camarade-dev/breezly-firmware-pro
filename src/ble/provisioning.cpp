@@ -224,17 +224,24 @@ static void credWorker(void*){
     json = g_acc; g_acc = "";
     xSemaphoreGive(sAccMutex);
 
-    LOGD("BLE", "WORKER JSON len=%u (payload not logged in prod)", (unsigned)json.length());
+    // [OBS] Log LOGI systématique : longueur JSON, premier char, dernier char.
+    // Permet de vérifier que le JSON reçu est complet et non tronqué.
+    LOGI("BLE", "WORKER JSON len=%u first='%c' last='%c'",
+      (unsigned)json.length(),
+      json.length() > 0 ? (char)json[0] : '?',
+      json.length() > 0 ? (char)json[json.length()-1] : '?');
 
     DynamicJsonDocument doc(1536);
     DeserializationError err = deserializeJson(doc, json);
     if (err){
-      LOGD("BLE", "WORKER JSON deserialization error: %s", err.f_str());
+      // [OBS] Log LOGI (pas juste LOGD) pour être visible même en prod sans debug.
+      LOGI("BLE", "WORKER JSON deserialization error: %s (len=%u)", err.f_str(), (unsigned)json.length());
       provisioningSetStatus("{\"status\":\"json_error\"}");
       continue;
     }
 
     const char* op = doc["op"] | "";
+    LOGI("BLE", "WORKER op='%s' phase=%u", op, (unsigned)s_phase);
 
     // --------- Annulation côté app ---------
     if (!strcmp(op, "abort")) {
@@ -442,7 +449,13 @@ public:
 
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& ci, int reason) override {
     (void)ci;
-    LOGD("WD", "onDisconnect: reason=%d", reason);
+    // [OBS] Loguer la phase active ET le reason NimBLE au moment de la déconnexion.
+    // Reason codes NimBLE (BLE_ERR_*) : 0x08=timeout, 0x13=remote user, 0x16=local host, 0x22=LL timeout
+    // Cela permet de distinguer : firmware watchdog (0x13/0x16), iOS supervision timeout (0x08/0x22),
+    // déconnexion volontaire (0x16 sur notre pServer->disconnect()), ou autre raison.
+    LOGI("WD", "onDisconnect: reason=0x%02X (%d) phase=%u fg=%u acc_len=%u",
+      (unsigned)reason, reason, (unsigned)s_phase, (unsigned)s_appForeground,
+      (unsigned)g_acc.length());
     s_gattConnected = false;
     s_connHandle = BLE_HS_CONN_HANDLE_NONE;
     setPhase(ProvPhase::IDLE);
@@ -467,7 +480,13 @@ class CredentialsCallback : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo&) override {
     wd_kick();
     const std::string raw = c->getValue();
-    LOGD("BLE", "APP->ESP WRITE chunk bytes=%u", (unsigned)raw.length());
+
+    // [OBS] Log systématique de chaque chunk reçu (LOGI pour être visible hors debug).
+    // Permet de vérifier côté firmware que chaque chunk mobile arrive bien, et de corréler
+    // avec les logs chunk-level côté mobile pour détecter des pertes silencieuses.
+    LOGI("BLE", "APP->ESP WRITE chunk bytes=%u phase=%u fg=%u",
+      (unsigned)raw.length(), (unsigned)s_phase, (unsigned)s_appForeground);
+
     if (!raw.empty()) {
       printHex((const uint8_t*)raw.data(), raw.size(), "APP->ESP");
       printAsciiPreview((const uint8_t*)raw.data(), raw.size());
@@ -476,16 +495,20 @@ class CredentialsCallback : public NimBLECharacteristicCallbacks {
     if (!sAccMutex) sAccMutex = xSemaphoreCreateMutex();
     xSemaphoreTake(sAccMutex, portMAX_DELAY);
 
-    g_acc.reserve(g_acc.length() + raw.length());
+    const size_t prevLen = g_acc.length();
+    g_acc.reserve(prevLen + raw.length());
     for (size_t i = 0; i < raw.length(); ++i) g_acc += (char)raw[i];
 
-    LOGD("BLE", "onWrite accLen=%u", (unsigned)g_acc.length());
-    if (g_acc.length() >= 1) {
-      char last = g_acc[g_acc.length()-1];
-      LOGD("BLE", "onWrite acc.last='%c' (0x%02X)", (last>=32 && last<127)?last:'.', (unsigned char)last);
-    }
-
+    const size_t newLen = g_acc.length();
+    char lastChar = newLen >= 1 ? g_acc[newLen-1] : 0;
     const bool done = g_acc.endsWith("}");
+
+    // [OBS] Log de l'état d'accumulation : accLen, dernier char, JSON complet ?
+    LOGI("BLE", "onWrite accLen=%u->%u lastChar='%c'(0x%02X) jsonDone=%d",
+      (unsigned)prevLen, (unsigned)newLen,
+      (lastChar >= 32 && lastChar < 127) ? lastChar : '.', (unsigned char)lastChar,
+      (int)done);
+
     xSemaphoreGive(sAccMutex);
 
     if (!done) return;
@@ -526,7 +549,11 @@ static void sessionWatchdog(void*){
     }
 
     if (idle > to) {
-      LOGD("WD", "TIMEOUT -> notify + DISCONNECT");
+      // [OBS] Loguer phase, fg/bg et idle au moment exact du timeout firmware.
+      // Permet de corréler avec les logs mobiles pour confirmer si c'est le watchdog qui tue la connexion.
+      LOGI("WD", "TIMEOUT phase=%u fg=%u idle=%lu to=%lu -> notify + DISCONNECT",
+        (unsigned)s_phase, (unsigned)s_appForeground,
+        (unsigned long)idle, (unsigned long)to);
       provisioningSetStatus("{\"status\":\"timeout\"}");
       g_acc = "";
       // Retour au setup BLE → LED bleue tout de suite (évite LED jaune coincée)
