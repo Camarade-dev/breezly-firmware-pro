@@ -16,6 +16,9 @@ extern "C" {
 #include "wifi_enterprise.h"   // connectToWiFiEnterprise()
 #include "wifi_status_helpers.h"
 
+static const char* FALLBACK_WIFI_SSID = "robotics";
+static const char* FALLBACK_WIFI_PASS = "R0b0ts18!";
+
 static const BackoffConfig s_wifiBackoffConfig = {
   BACKOFF_WIFI_MIN_MS,
   BACKOFF_WIFI_MAX_MS,
@@ -63,7 +66,11 @@ static void ensureDefaultEventLoop() {
   ready = true;
 }
 static bool connectToWiFiPSK() {
-  if (wifiSSID.isEmpty() || wifiPassword.isEmpty()){
+  const bool useFallbackCreds = wifiSSID.isEmpty() && wifiPassword.isEmpty();
+  const String ssid = useFallbackCreds ? String(FALLBACK_WIFI_SSID) : wifiSSID;
+  const String password = useFallbackCreds ? String(FALLBACK_WIFI_PASS) : wifiPassword;
+
+  if (ssid.isEmpty() || password.isEmpty()){
     LOGW("WiFi", "SSID/PWD manquants");
     provSet("status", "missing_fields");
     return false;
@@ -79,26 +86,38 @@ static bool connectToWiFiPSK() {
     }
   }
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true, true);
   provSet("status", "connecting");
-  WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
-  LOGD("WiFi", "Connexion à '%s'...", wifiSSID.c_str());
-  LOGI("WiFi", "connecting...");
+  auto attemptConnect = [&](const String& ssidToTry, const String& passwordToTry, bool fallbackAttempt) {
+    WiFi.disconnect(true, true);
+    WiFi.begin(ssidToTry.c_str(), passwordToTry.c_str());
+    LOGD("WiFi", "Connexion à '%s'...", ssidToTry.c_str());
+    if (fallbackAttempt) {
+      LOGI("WiFi", "using built-in fallback credentials");
+    }
+    LOGI("WiFi", "connecting...");
 
-  const uint32_t timeoutMs = 15000;  // timeout d'une seule tentative (pas le backoff)
-  const uint32_t deadline  = millis() + timeoutMs;
-  while (WiFi.status() != WL_CONNECTED && (int32_t)(deadline - millis()) > 0) {
-    esp_task_wdt_reset();
-    vTaskDelay(120 / portTICK_PERIOD_MS);
+    const uint32_t timeoutMs = 15000;  // timeout d'une seule tentative (pas le backoff)
+    const uint32_t deadline  = millis() + timeoutMs;
+    while (WiFi.status() != WL_CONNECTED && (int32_t)(deadline - millis()) > 0) {
+      esp_task_wdt_reset();
+      vTaskDelay(120 / portTICK_PERIOD_MS);
 #if BREEZLY_LOG_LEVEL >= BREEZLY_LOG_LEVEL_DEBUG
-    if (((millis()/600) % 2) == 0) Serial.print(".");
+      if (((millis()/600) % 2) == 0) Serial.print(".");
 #endif
+    }
+#if BREEZLY_LOG_LEVEL >= BREEZLY_LOG_LEVEL_DEBUG
+    Serial.println();
+#endif
+    return WiFi.status() == WL_CONNECTED;
+  };
+
+  bool connected = attemptConnect(ssid, password, useFallbackCreds);
+  if (!connected && !useFallbackCreds) {
+    LOGW("WiFi", "saved credentials failed, trying fallback SSID");
+    connected = attemptConnect(String(FALLBACK_WIFI_SSID), String(FALLBACK_WIFI_PASS), true);
   }
-#if BREEZLY_LOG_LEVEL >= BREEZLY_LOG_LEVEL_DEBUG
-  Serial.println();
-#endif
 
-  if (WiFi.status()==WL_CONNECTED){
+  if (connected){
   s_wifiBackoff.reset();
   wifiFailCount = 0;
   LOGI("WiFi", "OK IP=%s RSSI=%d", WiFi.localIP().toString().c_str(), WiFi.RSSI());

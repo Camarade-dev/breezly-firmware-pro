@@ -304,6 +304,15 @@ void setup(){
   eapInsecure  = prefs.getBool  ("eapInsecure", false);
   prefs.end();
 
+  if (sensorId.isEmpty()) {
+    uint64_t chipid = ESP.getEfuseMac();
+    char idBuffer[32];
+    snprintf(idBuffer, sizeof(idBuffer), "BREEZLY_TEST_%04X%08X",
+             (uint16_t)(chipid >> 32), (uint32_t)chipid);
+    sensorId = String(idBuffer);
+    LOGI("BOOT", "sensorId absent -> runtime fallback=%s", sensorId.c_str());
+  }
+
   // --- Vérifs d’identifiants selon le mode sélectionné ---
   const bool manquePSK = (wifiSSID.isEmpty() || wifiPassword.isEmpty());
   const bool manqueEAP = (wifiSSID.isEmpty() || eapUsername.isEmpty() || eapPassword.isEmpty());

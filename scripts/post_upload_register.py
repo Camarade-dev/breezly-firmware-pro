@@ -2,15 +2,37 @@
 # Provisionne le device après upload via external_id dérivé du MAC (esptool read_mac).
 # En mode flotte (BREEZLY_FLEET_FLASH=1), le script flash_fleet.py gère MAC + provision + EOL ;
 # ce hook ne fait rien pour éviter doublon et surcharge en uploads parallèles.
-# --variant STD|PREMIUM
-Import("env")
-import os, re, sys, subprocess, json
+# --variant STD|PREMIUM|B2B|B2B_PMS
+env = None
+try:
+    Import("env")  # type: ignore[name-defined]
+except NameError:
+    pass
+import os, sys, subprocess, json
 
+def _resolve_script_dir():
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        # En exécution SCons, __file__ peut être absent.
+        if env is not None:
+            try:
+                return os.path.join(env.subst("$PROJECT_DIR"), "scripts")
+            except Exception:
+                pass
+        return os.path.join(os.getcwd(), "scripts")
 
-def reverse_pairs(mac_hex):
-    """Inverse l'ordre des paires d'octets pour coller au format buildExternalId() du firmware."""
-    mac_hex = mac_hex.replace(":", "").upper()
-    return "".join([mac_hex[i:i+2] for i in range(0, 12, 2)][::-1])
+SCRIPT_DIR = _resolve_script_dir()
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from provision_common import (
+    external_id_from_mac,
+    normalize_variant,
+    parse_mac_from_text,
+    read_external_id_from_serial,
+)
+
 
 def get_esptool_path():
     try:
@@ -50,12 +72,9 @@ def read_mac(port):
     cmd += ["read_mac"]
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-        m = re.search(r"MAC:\s*([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})", out)
-        if m:
-            return m.group(1).replace(":", "").upper()
-        m = re.search(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})", out)
-        if m:
-            return m.group(1).replace(":", "").upper()
+        mac = parse_mac_from_text(out)
+        if mac:
+            return mac.replace(":", "").upper()
         print(f"[post-upload] read_mac: format inattendu: {out[:200]!r}")
         return None
     except subprocess.CalledProcessError as e:
@@ -93,18 +112,24 @@ def after_upload(target, source, env):
         variant = None
     if not variant:
         variant = os.environ.get("DEVICE_VARIANT", "")
+    variant = normalize_variant(variant) or ""
 
     if not factory:
         raise RuntimeError("FACTORY token manquant (custom_factory_token / FACTORY_TOKEN)")
     if not devkey:
         raise RuntimeError("DEVICE_KEY_B64 manquante (custom_device_key_b64 / DEVICE_KEY_B64)")
 
-    mac = read_mac(port)
-    if not mac:
-        raise RuntimeError("Impossible de lire le MAC (esptool)")
-    # On aligne strictement l'external_id sur le buildExternalId() du firmware :
-    # PROV_ + MAC dans l'ordre renvoyé par esptool/read_mac et esp_read_mac.
-    external_id = f"PROV_{mac}"
+    external_id, serial_diag = read_external_id_from_serial(port, timeout_sec=12)
+    if external_id:
+        print(f"[post-upload] external_id lu sur la serie ({port})")
+    else:
+        print(f"[post-upload] external_id serie indisponible: {serial_diag}")
+        mac = read_mac(port)
+        if not mac:
+            raise RuntimeError("Impossible de lire l'external_id en serie ni le MAC via esptool")
+        external_id = external_id_from_mac(mac)
+        if not external_id:
+            raise RuntimeError("Impossible de construire external_id a partir du MAC")
     print(f"[post-upload] external_id pour provision: {external_id}")
 
     payload = {

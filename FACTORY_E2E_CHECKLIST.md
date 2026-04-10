@@ -31,7 +31,7 @@ cd esp32_wroom_32e
 python scripts/flash_fleet.py --env esp32-wroom-32e-prod --jobs 5 --variant STD --operator "Nom Opérateur"
 ```
 
-*(Remplacer `STD` par `PREMIUM` si besoin ; `--variant` est recommandé pour remplir la colonne Variant du journal EOL.)*
+*(Remplacer `STD` par `PREMIUM`, `B2B` ou `B2B_PMS` selon le PCB ; `--variant` est recommandé pour remplir la colonne Variant du journal EOL.)*
 
 Sous Windows, si `python` pointe vers le bon interpréteur :
 
@@ -47,7 +47,7 @@ python scripts\flash_fleet.py --env esp32-wroom-32e-prod --jobs 5 --operator "No
 | 1 | **Build** une seule fois (firmware prod). |
 | 2 | **Détection des ports** : tous les devices USB (filtre par défaut : `cp210`, adaptatif CH340/CP210). |
 | 3 | **Upload en parallèle** sur chaque port (`--jobs` pour limiter le parallélisme, ex. 5 pour un hub 10 ports). |
-| 4 | Pour chaque port : après upload, **post_upload_register.py** (hook PlatformIO) enregistre le device sur l’API (`external_id = PROV_{MAC}`). |
+| 4 | Pour chaque port : après upload, **`flash_fleet.py`** résout l’identité du device via **logs série** (`BREEZLY_EXTERNAL_ID=PROV_xxx`) puis **fallback `esptool read_mac`**, avant d’appeler l’API backend. En mode mono-device, `post_upload_register.py` applique la même logique. |
 | 5 | **Journal EOL** : après chaque upload (succès ou échec), une ligne est **ajoutée automatiquement** dans `docs/EOL_LOG.csv` (ou fichier fourni par `--eol-log`). |
 
 ### 2.3 Options principales
@@ -62,7 +62,7 @@ python scripts\flash_fleet.py --env esp32-wroom-32e-prod --jobs 5 --operator "No
 | `--no-build` | Pas de build (upload uniquement, après un build précédent) | — |
 | `--include` | Filtre ports (ex. `cp210 ch340`) | `cp210` |
 | `--ports` | Liste explicite de ports (ex. `COM3 COM4 COM5`) | auto-détection |
-| `--variant` | **Recommandé.** Variant matériel : `STD` ou `PREMIUM` (écrit dans la colonne Variant du journal EOL + transmis au backend). | — |
+| `--variant` | **Recommandé.** Variant matériel : `STD`, `PREMIUM`, `B2B` ou `B2B_PMS` (écrit dans la colonne Variant du journal EOL + transmis au backend). | — |
 | `--pio-exe` | Chemin vers `platformio.exe` (Windows) | chemin par défaut dans le script |
 
 ### 2.4 Format du journal EOL (auto-rempli)
@@ -76,9 +76,9 @@ Le fichier `docs/EOL_LOG.csv` (ou celui donné par `--eol-log`) est créé avec 
 | MAC | Adresse MAC avec deux-points (ex. 80:BA:D0:21:57:88) |
 | external_id | PROV_{MAC 12 hex} (ex. PROV_80BAD0215788) |
 | Version_FW | Version lue depuis `src/app_config.h` (ex. 1.0.25) |
-| **Variant** | **STD ou PREMIUM** (valeur de `--variant` ; obligatoire en prod pour traçabilité) |
+| **Variant** | **STD / PREMIUM / B2B / B2B_PMS** (valeur de `--variant` ; obligatoire en prod pour traçabilité) |
 | **Port** | Port utilisé pour le flash (ex. COM8, /dev/ttyUSB0) — traçabilité hub USB |
-| EOL_resultat | OK (upload + enregistrement API OK) ou KO (upload_failed / register_failed_or_no_external_id) |
+| EOL_resultat | OK (upload + identité + enregistrement API OK) ou KO (`upload_failed`, `mac_read_failed`, `provision_failed`, etc.) |
 | Operateur | Valeur de `--operator` ou `EOL_OPERATOR` |
 | Remarques | Vide si OK ; sinon court motif d’échec |
 

@@ -15,6 +15,7 @@ static volatile float s_airScore01 = 0.0f;
 // 0.0 → 1.0 sur la durée d’une impulsion
 static float s_pulseT = 1.0f;          
 static const uint32_t PULSE_DURATION_MS = 1800;  // durée totale de la pulsation
+static constexpr bool AIR_QUALITY_LED_FEEDBACK_ENABLED = false;
 
 // --- Night mode (anti-éblouissement) : fenêtre 22:30 → 07:30 heure locale ;
 //     jour max 60/255, nuit max 4/255 ; si heure inconnue → mode nuit par défaut (safe sommeil).
@@ -142,6 +143,7 @@ void updateLedState(LedMode mode){
 // NEW : à appeler quand tu viens de publier les données capteur
 void ledNotifyPublish(){
   if (s_ledMuted) return;
+  if (!AIR_QUALITY_LED_FEEDBACK_ENABLED) return;
   if (isHighPriorityActive()) return;
   // simple flag : la tâche LED déclenche l’anim en temps réel
   s_pulseRequested = true;
@@ -190,6 +192,7 @@ void ledSetAirQualityScore(float score01){
   if (score01 < 0.0f) score01 = 0.0f;
   if (score01 > 1.0f) score01 = 1.0f;
   s_airScore01 = score01;
+  if (!AIR_QUALITY_LED_FEEDBACK_ENABLED) return;
   if (isHighPriorityActive()) return;
   if (!ledOverride) currentLedMode = LED_GOOD;
 }
@@ -237,6 +240,9 @@ static void baseColorForMode(LedMode mode, uint8_t &r, uint8_t &g, uint8_t &b){
       r = 220; g = 180; b = 0;    break;
 
     case LED_GOOD: {
+      if (!AIR_QUALITY_LED_FEEDBACK_ENABLED) {
+        r = 0; g = 0; b = 0; break;
+      }
       // Ici : "GOOD" = affichage continu de la qualité d’air
       float s = s_airScore01;                // 0 = vert, 1 = rouge
       if (s < 0.0f) s = 0.0f;
@@ -261,7 +267,12 @@ static void baseColorForMode(LedMode mode, uint8_t &r, uint8_t &g, uint8_t &b){
     }
 
     case LED_MODERATE:  // si tu l’utilises encore ailleurs : ambré
-      r = 220; g = 140; b = 20;   break;
+      if (!AIR_QUALITY_LED_FEEDBACK_ENABLED) {
+        r = 0; g = 0; b = 0;
+      } else {
+        r = 220; g = 140; b = 20;
+      }
+      break;
 
     case LED_BAD:       // rouge "classe"
       r = 230; g = 40;  b = 40;   break;

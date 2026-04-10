@@ -25,6 +25,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from provision_common import (
+    DEVICE_VARIANTS,
+    external_id_from_mac,
+    mac_colons_from_external_id,
+    normalize_variant,
+    parse_mac_from_text,
+    read_external_id_from_serial,
+)
+
 DEFAULT_PIO_EXE = r"C:\Users\stris\.platformio\penv\Scripts\platformio.exe"
 EOL_LOG_DEFAULT = "docs/EOL_LOG.csv"
 APP_CONFIG_PATH = "src/app_config.h"
@@ -34,6 +47,7 @@ SECRETS_INI = "secrets.ini"
 UPLOAD_TIMEOUT_SEC = 120
 MAC_READ_TIMEOUT_SEC = 15
 PROVISION_TIMEOUT_SEC = 30
+SERIAL_EXTERNAL_ID_TIMEOUT_SEC = 12
 
 # Retries par étape
 UPLOAD_RETRIES = 2
@@ -65,6 +79,7 @@ class PortResult:
     flash_attempts: int
     mac: Optional[str] = None
     external_id: Optional[str] = None
+    identity_source: str = ""
     provision_ok: bool = False
     fw_version: str = ""
     variant: str = ""
@@ -78,6 +93,7 @@ class PortResult:
             "flash_attempts": self.flash_attempts,
             "mac": self.mac,
             "external_id": self.external_id,
+            "identity_source": self.identity_source,
             "provision_ok": self.provision_ok,
             "fw_version": self.fw_version,
             "variant": self.variant,
@@ -373,20 +389,13 @@ def read_mac_esptool(
     base_cmd = get_esptool_cmd()
     for attempt in range(1, retries + 1):
         try:
-            cmd = base_cmd + ["read_mac", "--port", port]
+            cmd = base_cmd + ["--port", port, "read_mac"]
             code, out, err = run_cmd(cmd, capture=True, timeout_sec=timeout_sec)
-            if code != 0:
-                out = out or err or ""
             text = (out + " " + err)
-            # MAC: AA:BB:CC:DD:EE:FF ou format similaire
-            m = re.search(r"MAC:\s*([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})", text)
-            if not m:
-                m = re.search(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})", text)
-            if m:
-                mac_colons = m.group(1)
-                mac_hex = mac_colons.replace(":", "").upper()
-                if len(mac_hex) == 12:
-                    external_id = f"PROV_{mac_hex}"
+            mac_colons = parse_mac_from_text(text)
+            if code == 0 and mac_colons:
+                external_id = external_id_from_mac(mac_colons)
+                if external_id:
                     return mac_colons, external_id
         except subprocess.TimeoutExpired:
             pass
@@ -409,10 +418,10 @@ def provision_backend(
     variant: str,
     timeout_sec: int = PROVISION_TIMEOUT_SEC,
     retries: int = PROVISION_RETRIES,
-) -> bool:
+) -> Tuple[bool, str]:
     """
     POST /api/internal/provision-device. Payload compatible avec l'existant.
-    Retourne True si 2xx, False sinon.
+    Retourne (ok, diagnostic).
     """
     url = api_url.rstrip("/") + "/api/internal/provision-device"
     payload = {
@@ -434,17 +443,64 @@ def provision_backend(
         },
         method="POST",
     )
+    last_error = "provision_failed"
     for _ in range(retries):
         try:
             with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-                return 200 <= resp.status < 300
+                return (200 <= resp.status < 300), ""
         except urllib.error.HTTPError as e:
             if 200 <= e.code < 300:
-                return True
-        except Exception:
-            pass
+                return True, ""
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="ignore").strip()
+            except Exception:
+                body = ""
+            suffix = f": {body[:160]}" if body else ""
+            last_error = f"backend_http_{e.code}{suffix}"
+        except urllib.error.URLError as e:
+            last_error = f"backend_url_error: {e.reason}"
+        except Exception as e:
+            last_error = f"backend_error: {e.__class__.__name__}"
         time.sleep(0.5)
-    return False
+    return False, last_error
+
+
+def read_identity(
+    port: str,
+    serial_timeout_sec: int = SERIAL_EXTERNAL_ID_TIMEOUT_SEC,
+    mac_timeout_sec: int = MAC_READ_TIMEOUT_SEC,
+    mac_retries: int = MAC_READ_RETRIES,
+) -> Tuple[Optional[str], Optional[str], str, str]:
+    """
+    Retourne (mac, external_id, source, diagnostic).
+
+    Source prioritaire :
+    1. logs serie du firmware (external_id exact du device boote)
+    2. esptool read_mac en fallback
+    """
+    external_id, serial_diag = read_external_id_from_serial(port, timeout_sec=serial_timeout_sec)
+    if external_id:
+        mac = mac_colons_from_external_id(external_id)
+        if mac:
+            return mac, external_id, "serial", "serial_external_id_ok"
+        return None, external_id, "serial", "serial_external_id_invalid"
+
+    mac, external_id = read_mac_esptool(port, timeout_sec=mac_timeout_sec, retries=mac_retries)
+    if mac and external_id:
+        return mac, external_id, "esptool", "esptool_mac_ok"
+
+    return None, None, "", f"{serial_diag};esptool_mac_failed"
+
+
+def port_result_is_success(res: PortResult, provisioning_enabled: bool) -> bool:
+    if not res.flash_ok:
+        return False
+    if not res.mac or not res.external_id:
+        return False
+    if provisioning_enabled and not res.provision_ok:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -494,22 +550,24 @@ def process_one_port(
     # 2. Pause courte (stabilisation port COM)
     time.sleep(POST_UPLOAD_DELAY_SEC)
 
-    # 3. Lecture MAC
-    mac_colons, external_id = read_mac_esptool(
+    # 3. Résolution d'identité device (logs série d'abord, puis esptool)
+    mac_colons, external_id, identity_source, identity_diag = read_identity(
         port,
-        timeout_sec=MAC_READ_TIMEOUT_SEC,
-        retries=MAC_READ_RETRIES,
+        serial_timeout_sec=SERIAL_EXTERNAL_ID_TIMEOUT_SEC,
+        mac_timeout_sec=MAC_READ_TIMEOUT_SEC,
+        mac_retries=MAC_READ_RETRIES,
     )
     res.mac = mac_colons
     res.external_id = external_id
+    res.identity_source = identity_source
     if not external_id:
         res.error_stage = "mac_read"
-        res.remarks = "mac_read_failed"
+        res.remarks = identity_diag
         return res
 
     # 4. Provisioning backend (seulement si factory_token et device_key fournis)
     if factory_token and device_key_b64:
-        res.provision_ok = provision_backend(
+        res.provision_ok, provision_diag = provision_backend(
             api_url,
             factory_token,
             device_key_b64,
@@ -520,7 +578,7 @@ def process_one_port(
         )
         if not res.provision_ok:
             res.error_stage = "provision"
-            res.remarks = "provision_failed"
+            res.remarks = provision_diag or "provision_failed"
     else:
         res.remarks = "provision_skipped_no_secrets"
 
@@ -551,8 +609,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--variant",
-        choices=["STD", "PREMIUM"],
-        help="Variant matériel (STD/PREMIUM) pour le backend",
+        type=str.upper,
+        choices=list(DEVICE_VARIANTS),
+        help="Variant matériel (STD/PREMIUM/B2B/B2B_PMS) pour le backend",
     )
     parser.add_argument("--exclude", nargs="*", default=[], help="Exclure devices")
     parser.add_argument("--ports", nargs="*", default=[], help="Liste de ports (ex: COM3 COM4)")
@@ -570,14 +629,19 @@ def main() -> None:
         help="URL backend Breezly pour le provisioning",
     )
     args = parser.parse_args()
+    args.variant = normalize_variant(args.variant)
 
     cwd = os.getcwd()
     ensure_platformio(args.pio_exe)
 
     factory_token, device_key_b64 = load_secrets(cwd)
+    provisioning_enabled = bool(factory_token and device_key_b64)
     api_url = args.api_url or DEFAULT_API_URL
-    if not factory_token and not device_key_b64:
-        print(f"[{now()}] Attention: FACTORY_TOKEN / DEVICE_KEY_B64 absents → pas de provisioning backend.", file=sys.stderr)
+    if not provisioning_enabled:
+        print(
+            f"[{now()}] Attention: FACTORY_TOKEN ou DEVICE_KEY_B64 absent → pas de provisioning backend.",
+            file=sys.stderr,
+        )
 
     if not args.no_build:
         pio_build(args.pio_exe, args.env, cwd)
@@ -640,14 +704,14 @@ def main() -> None:
                     remarks=str(e),
                 )
             results.append(res)
-            # Échec si flash KO ou si provision était attendue et a échoué
-            if not res.flash_ok:
-                failed_ports.append(port)
-            elif res.external_id and factory_token and device_key_b64 and not res.provision_ok:
+            if not port_result_is_success(res, provisioning_enabled):
                 failed_ports.append(port)
 
-            status = "✅" if res.flash_ok and (not res.external_id or res.provision_ok) else "❌"
-            print(f"[{now()}] {status} {res.port} flash={res.flash_ok} mac={bool(res.mac)} provision={res.provision_ok}")
+            status = "✅" if port_result_is_success(res, provisioning_enabled) else "❌"
+            print(
+                f"[{now()}] {status} {res.port} flash={res.flash_ok} mac={bool(res.mac)} "
+                f"id={bool(res.external_id)} via={res.identity_source or '-'} provision={res.provision_ok}"
+            )
             if res.error_stage:
                 print(f"         → {res.error_stage}: {res.remarks}", file=sys.stderr)
 

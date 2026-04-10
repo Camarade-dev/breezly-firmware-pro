@@ -5,17 +5,17 @@ Les identifiants MQTT ne doivent jamais être en dur dans le code versionné.
 Import("env")
 import os
 import pathlib
-import sys
 
 OUTPUT_PATH = pathlib.Path("src/net/mqtt_secrets.h")
+DEFAULT_USER = "breezly"
+DEFAULT_PASS = "~8^tzhp5USwwkgTeWV"
 
 # 1) Option PIO (secrets.ini [env] custom_mqtt_user / custom_mqtt_pass), 2) env
-user = env.GetProjectOption("custom_mqtt_user", None) or os.environ.get("MQTT_USER")
-password = env.GetProjectOption("custom_mqtt_pass", None) or os.environ.get("MQTT_PASS")
+user = env.GetProjectOption("custom_mqtt_user", None) or os.environ.get("MQTT_USER") or DEFAULT_USER
+password = env.GetProjectOption("custom_mqtt_pass", None) or os.environ.get("MQTT_PASS") or DEFAULT_PASS
 
-if not user or not password:
-    print("[pre-build][FATAL] MQTT credentials manquantes: custom_mqtt_user/custom_mqtt_pass dans secrets.ini ou MQTT_USER/MQTT_PASS en env")
-    sys.exit(1)
+if user == DEFAULT_USER and password == DEFAULT_PASS:
+    print("[pre-build][WARN] MQTT credentials absentes dans secrets.ini/env -> utilisation du fallback intégré")
 
 def escape_c(s):
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")

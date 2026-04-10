@@ -21,8 +21,16 @@
 #include <esp_system.h>
 
 #include "../app_config.h"
-#include "mqtt_secrets.h"
 #include <esp_ota_ops.h>
+#if __has_include("mqtt_secrets.h")
+#include "mqtt_secrets.h"
+#endif
+#ifndef MQTT_SECRET_USER
+#define MQTT_SECRET_USER "breezly"
+#endif
+#ifndef MQTT_SECRET_PASS
+#define MQTT_SECRET_PASS "~8^tzhp5USwwkgTeWV"
+#endif
 #if defined(BREEZLY_PROD)
 static const char* MQTT_PREFIX = "prod/";
 #elif defined(BREEZLY_DEV)
@@ -31,7 +39,7 @@ static const char* MQTT_PREFIX = "dev/";
 static const char* MQTT_PREFIX = "dev/";
 #endif
 // ======= PARAMS BROKER (user/pass depuis mqtt_secrets.h, généré par pre-build) =======
-static const char* MQTT_HOST = "607207c4394d44b8bad11a33e8ed591d.s1.eu.hivemq.cloud";
+static const char* MQTT_HOST = "projet-breezly.in.centralelille.fr";
 static const int   MQTT_PORT = 8883;
 static const char* MQTT_USER = MQTT_SECRET_USER;
 static const char* MQTT_PASS = MQTT_SECRET_PASS;
@@ -57,12 +65,22 @@ static const BackoffConfig s_mqttBackoffConfig = {
 };
 static Backoff s_mqttBackoff(s_mqttBackoffConfig);
 
+static String mqtt_runtime_device_id() {
+  if (!sensorId.isEmpty()) return sensorId;
+
+  uint64_t chipid = ESP.getEfuseMac();
+  char idBuffer[32];
+  snprintf(idBuffer, sizeof(idBuffer), "BREEZLY_TEST_%04X%08X",
+           (uint16_t)(chipid >> 32), (uint32_t)chipid);
+  return String(idBuffer);
+}
+
 static String withPrefix(const String& t) {
   if (t.startsWith("dev/") || t.startsWith("prod/")) return t;
   return String(MQTT_PREFIX) + t;
 }
 // ======= Topics helpers =======
-String mqtt_topic_device_base() { return withPrefix("breezly/devices/" + sensorId); }
+String mqtt_topic_device_base() { return withPrefix("breezly/devices/" + mqtt_runtime_device_id()); }
 String mqtt_topic_ota()    { return mqtt_topic_device_base() + "/ota"; }
 String mqtt_topic_ctrl()   { return mqtt_topic_device_base() + "/control"; }
 String mqtt_topic_status() { return mqtt_topic_device_base() + "/status"; }
@@ -447,10 +465,9 @@ static const char* makePemZ(const uint8_t* start, const uint8_t* end) {
 }
 // ======= Connexion broker =======
 static bool mqtt_do_connect() {
-  if (!wifiConnected || !timeIsSane()) return false;
+  if (!wifiConnected) return false;
   if (g_netBusyForOta || otaIsInProgress()) return false;
-  s_tls.setCACert(CA_BUNDLE_PEM);
-
+  s_tls.setInsecure();
   s_tls.setTimeout(10000);
 
   s_mqtt.setServer(MQTT_HOST, MQTT_PORT);   // SNI OK car on passe un hostname
@@ -467,7 +484,7 @@ static bool mqtt_do_connect() {
   static String lwtPayload; lwtPayload.clear(); serializeJson(lw, lwtPayload);
 
   String envSuffix = String(MQTT_PREFIX).startsWith("prod/") ? "prod" : "dev";
-  String clientId = "breezly-sensor-" + envSuffix + "-" + sensorId;
+  String clientId = "breezly-sensor-" + envSuffix + "-" + mqtt_runtime_device_id();
 
   LOGD("MQTT", "connect clientId=%s host=%s port=%d", clientId.c_str(), MQTT_HOST, MQTT_PORT);
   LOGI("MQTT", "connecting broker port=%d", MQTT_PORT);
@@ -496,7 +513,7 @@ static bool mqtt_do_connect() {
   // Boot message
   DynamicJsonDocument j(256);
   j["boot"]=true;
-  j["sensorId"]=sensorId;
+  j["sensorId"]=mqtt_runtime_device_id();
   j["userId"]=userId;
   j["firmwareVersion"]=CURRENT_FIRMWARE_VERSION;
   String s; serializeJson(j, s);
@@ -659,10 +676,6 @@ static void mqttTask(void*) {
       }
       if (shouldTry) {
         s_lastConnAttemptMs = millis();
-        ensureTlsClockReady(20000);
-        time_t now = time(nullptr);
-        LOGD("MQTT", "pre-connect unix=%ld sane=%d", (long)now, (int)timeIsSaneHard());
-        if (!timeIsSaneHard()) { vTaskDelay(250/portTICK_PERIOD_MS); continue; }
         if (mqtt_do_connect()) {
           s_connected = true;
         } else {
