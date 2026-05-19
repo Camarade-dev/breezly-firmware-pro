@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(findstr /R \"src/ lib/ include/\")",
+      "Bash(findstr /V \"__pycache__\")",
+      "Bash(pio run *)",
+      "Bash(~/.platformio/penv/Scripts/pio run *)"
+    ]
+  }
+}

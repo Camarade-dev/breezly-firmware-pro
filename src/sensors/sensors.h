@@ -19,10 +19,27 @@ void  pmsWake();                  // SET=HIGH
 bool  pmsSampleBlocking(uint32_t warmupMs, PmsData& out); // wake->attend->lit->sleep
 void pmsPostProcess(const PmsData& in, float& pm1, float& pm25, float& pm10);
 
-// BMP581 (pression + température)
+// Diagnostics PMS (lecture seule, pour télémétrie / logs).
+struct PmsDiag {
+  uint32_t framesOk = 0;
+  uint32_t checksumErrors = 0;
+  uint32_t badFrames = 0;       // longueur/format invalide
+  uint32_t frameTimeouts = 0;   // burst/discard sans trame fraîche
+  bool     taskRunning = false;
+};
+void pmsGetDiag(PmsDiag& out);
+
+// Log diagnostic compact (1 ligne INFO). À appeler throttlé (pas en boucle).
+void sensorsLogDiagnostics();
+
+// BMP581 (pression + température) — déclarations complètes dans bmp581.h
 bool bmp581Init(void);
+bool bmp581EnsureInitialized(void);
 bool bmp581Read(float& pressurePa, float& tempC);
+bool bmp581IsInitialized(void);
 
 // SCD41 (CO2 NDIR réel + T + HR)
 bool scd41Init(void);
+bool scd41EnsureInitialized(void);
 bool scd41Read(uint16_t& co2Ppm, float& tempC, float& humidity);
+bool scd41IsInitialized(void);

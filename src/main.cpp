@@ -346,11 +346,11 @@ void setup(){
   ledTaskStart(); 
   // sensorsInit();
   // calInit();
-  // calCompose(); 
+  // calCompose();
   // gPmsMutex = xSemaphoreCreateMutex();
-  // pmsTaskStart(16, 17);
-  // pmsInitPins(15); // SET=15
-  // pmsSleep();
+  // pmsInitPins(PMS_SET_PIN);              // SET avant tout
+  // pmsSleep();                            // état sommeil connu
+  // pmsTaskStart(PMS_RX_PIN, PMS_TX_PIN);  // UART begin() puis tâche
   // 2) Tenter la connexion Wi-Fi immédiate si on a des identifiants
   //    (en cas d’échec, connectToWiFi() s’occupe de relancer l’advertising BLE)
   if (!missingCreds) {
@@ -503,23 +503,31 @@ void loop(){
       doPms = (long)(nowMs - lastPms) >= (long)PMS_PERIOD;
     }
 
-    float t,h, t_raw, h_raw;
+    float t=NAN,h=NAN, t_raw=NAN, h_raw=NAN;
     int aqi=0,tvoc=0,eco2=0;
     PmsData p = {}; bool havePms = false;
     float pressurePa = NAN, tempBmp = NAN;
     bool haveBmp = false;
+    bool haveAht = false;
     uint16_t co2NdirPpm = 0;
     float tempScd41 = NAN, humidityScd41 = NAN;
     bool haveScd41 = false;
 
     if (doEns){
-      if (safeSensorRead(t, h, &t_raw, &h_raw)){
+      // Chemins de santé SÉPARÉS : une panne AHT21 ne doit pas masquer
+      // BMP581 ni SCD41 (capteurs indépendants, bus/IO distincts). Chaque
+      // capteur est lu et jugé sur sa propre santé.
+      haveAht = safeSensorRead(t, h, &t_raw, &h_raw);
+      if (haveAht){
         sensorsReadEns160(aqi,tvoc,eco2,t,h);
-        haveBmp = bmp581Read(pressurePa, tempBmp);
-        haveScd41 = scd41Read(co2NdirPpm, tempScd41, humidityScd41);
-        lastEns = nowMs;
+      }
+      haveBmp   = bmp581Read(pressurePa, tempBmp);           // self-heal interne
+      haveScd41 = scd41Read(co2NdirPpm, tempScd41, humidityScd41);
+
+      if (haveAht || haveBmp || haveScd41){
+        lastEns = nowMs; // au moins un capteur a répondu → on tient la cadence
       } else {
-        doEns = false; // on annule si la lecture a foiré
+        doEns = false;   // rien du tout → on réessaiera au prochain tick
       }
     }
 
@@ -532,7 +540,7 @@ void loop(){
       float pm1f = NAN, pm25f = NAN, pm10f = NAN;
       bool sanityOk = true;
       char sanityFailBuf[32] = {};
-      if (doEns){
+      if (doEns && haveAht){
         sanityOk = sensorSanityCheck(aqi, tvoc, eco2, sanityFailBuf, sizeof(sanityFailBuf));
       }
 
@@ -547,12 +555,14 @@ void loop(){
         // 2) Publis structurées (toujours envoyées ; sanity_ok pour le backend)
         StaticJsonDocument<512> j;
         if (doEns){
-          j["temperature"]=t_raw; j["humidity"]=h_raw; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
+          if (haveAht){
+            j["temperature"]=t_raw; j["humidity"]=h_raw; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
+            j["sanity_ok"] = sanityOk;
+            if (!sanityOk && sanityFailBuf[0]) j["sanity_fail"] = sanityFailBuf;
+          }
           if (haveBmp && isfinite(pressurePa)) j["pressure_pa"] = (float)pressurePa;
           if (haveBmp && isfinite(tempBmp))     j["temperature_bmp"] = (float)tempBmp;
           if (haveScd41) { j["co2_ndir_ppm"] = co2NdirPpm; if (isfinite(tempScd41)) j["temperature_scd41"] = (float)tempScd41; if (isfinite(humidityScd41)) j["humidity_scd41"] = (float)humidityScd41; }
-          j["sanity_ok"] = sanityOk;
-          if (!sanityOk && sanityFailBuf[0]) j["sanity_fail"] = sanityFailBuf;
         }
 
         // --- ux : valeurs fusionnées/lissées (pour l’app & le backend)
@@ -588,12 +598,14 @@ void loop(){
         // cas sans PMS dispo : on envoie ENS uniquement (toujours envoyé ; sanity_ok pour le backend)
         StaticJsonDocument<512> j;
         if (doEns){
-          j["temperature"]=t_raw; j["humidity"]=h_raw; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
+          if (haveAht){
+            j["temperature"]=t_raw; j["humidity"]=h_raw; j["AQI"]=aqi; j["TVOC"]=tvoc; j["eCO2"]=eco2;
+            j["sanity_ok"] = sanityOk;
+            if (!sanityOk && sanityFailBuf[0]) j["sanity_fail"] = sanityFailBuf;
+          }
           if (haveBmp && isfinite(pressurePa)) j["pressure_pa"] = (float)pressurePa;
           if (haveBmp && isfinite(tempBmp))     j["temperature_bmp"] = (float)tempBmp;
           if (haveScd41) { j["co2_ndir_ppm"] = co2NdirPpm; if (isfinite(tempScd41)) j["temperature_scd41"] = (float)tempScd41; if (isfinite(humidityScd41)) j["humidity_scd41"] = (float)humidityScd41; }
-          j["sanity_ok"] = sanityOk;
-          if (!sanityOk && sanityFailBuf[0]) j["sanity_fail"] = sanityFailBuf;
         }
         j["sensorId"]=sensorId; j["userId"]=userId;
         String s; serializeJson(j,s);
@@ -603,10 +615,22 @@ void loop(){
       }
 
       // === Score qualité d’air continu → LED ===
-      if (doEns){
+      // Le score dépend de T/HR/AQI (AHT/ENS) : ne le calculer que si AHT OK
+      // (sinon valeurs non initialisées). BMP/SCD restent publiés par ailleurs.
+      if (doEns && haveAht){
         float pm25ForScore = isfinite(pm25f) ? pm25f : 0.0f;
         float airScore = computeAirQualityScore(t, h, aqi, tvoc, eco2, pm25ForScore);
         ledSetAirQualityScore(airScore);
+      }
+
+      // Diagnostic capteurs throttlé (~10 min, jamais en boucle serrée)
+      {
+        static unsigned long lastDiagMs = 0;
+        unsigned long dnow = millis();
+        if (lastDiagMs == 0 || (long)(dnow - lastDiagMs) >= (long)(10UL*60UL*1000UL)) {
+          lastDiagMs = dnow;
+          sensorsLogDiagnostics();
+        }
       }
 
       ledNotifyPublish();
@@ -636,9 +660,11 @@ void loop(){
     calInit();
     calCompose();
 
-    pmsTaskStart(16, 17);
-    pmsInitPins(15);
-    pmsSleep();
+    // Ordre strict : pin SET (strapping GPIO) configurée AVANT tout, état
+    // sommeil connu, PUIS UART begin() + tâche (faits dans pmsTaskStart).
+    pmsInitPins(PMS_SET_PIN);              // 1) SET configurée avant tout
+    pmsSleep();                            // 2) état sommeil connu (SET=LOW)
+    pmsTaskStart(PMS_RX_PIN, PMS_TX_PIN);  // 3) Serial2.begin() puis tâche
 
     // ======= MQTT =======
     mqtt_bus_start_task();

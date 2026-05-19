@@ -17,6 +17,17 @@ static const char* FW_MANIFEST_URL =
 #define LED_COUNT 1
 #define PMS_ALWAYS_ON   false
 
+// ---------- PMS5003 (UART2) — câblage ----------
+#ifndef PMS_SET_PIN
+#define PMS_SET_PIN   15   // SET/sleep (GPIO strapping : configurer tôt)
+#endif
+#ifndef PMS_RX_PIN
+#define PMS_RX_PIN    16   // ESP RX  <- PMS TX
+#endif
+#ifndef PMS_TX_PIN
+#define PMS_TX_PIN    17   // ESP TX  -> PMS RX
+#endif
+
 // ---------- I2C bus (capteurs AHT21 / ENS160) — robustesse ----------
 #ifndef I2C_BUS_TIMEOUT_MS
 #define I2C_BUS_TIMEOUT_MS         (500UL)   // Timeout par transaction Wire (évite blocage)

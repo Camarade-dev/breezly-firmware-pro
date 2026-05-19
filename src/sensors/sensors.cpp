@@ -8,6 +8,7 @@
 #include "../core/log.h"
 #include "calibration.h"
 #include <math.h>
+#include <esp_system.h>
 // 1 = affiche les rafales PMS (dev only, désactivé en prod via BREEZLY_LOG_LEVEL)
 #ifndef PMS_LOG_BURST
 #define PMS_LOG_BURST (BREEZLY_LOG_LEVEL >= BREEZLY_LOG_LEVEL_DEBUG)
@@ -197,11 +198,35 @@ void pmsPostProcess(const PmsData& in, float& pm1, float& pm25, float& pm10){
 // =======================================================================
 // ========================== Gestion du PMS (IO) ========================
 // =======================================================================
+//
+// ARCHITECTURE — propriétaire UNIQUE de Serial2 :
+//   pmsTask est le SEUL code qui lit Serial2 (readPmsFrame). Il maintient
+//   une mesure en cache dans gPms (protégée par gPmsMutex).
+//   pmsSampleBurstBlocking() NE lit/vide PLUS jamais Serial2 : il consomme
+//   uniquement le cache via waitForFreshFrame(). Deux drains concurrents
+//   sur deux cores désynchronisaient les trames (checksums/timeouts).
+//   => Ne jamais appeler PMS.read()/readPmsFrame() hors de pmsTask.
 
 static bool pmsStarted = false;
 static int s_pmsSetPin = -1;
 static bool pmsAlwaysOn = PMS_ALWAYS_ON;
 static volatile bool s_pmsAwake = false;
+
+// --- Compteurs diagnostic PMS (lecture seule pour télémétrie) ---
+// checksumErrors/badFrames : écrits uniquement par pmsTask (core 0).
+// frameTimeouts : écrit uniquement par le contexte loop (sample burst).
+static volatile uint32_t s_pmsChecksumErrors = 0;
+static volatile uint32_t s_pmsBadFrames      = 0;
+static volatile uint32_t s_pmsFrameTimeouts  = 0;
+static volatile uint32_t s_pmsFramesOk       = 0;
+
+void pmsGetDiag(PmsDiag& out) {
+  out.checksumErrors = s_pmsChecksumErrors;
+  out.badFrames      = s_pmsBadFrames;
+  out.frameTimeouts  = s_pmsFrameTimeouts;
+  out.framesOk       = s_pmsFramesOk;
+  out.taskRunning    = pmsStarted;
+}
 
 void pmsInitPins(int setPin){
   s_pmsSetPin = setPin;
@@ -220,11 +245,11 @@ static bool readPmsFrame(HardwareSerial &ser, PmsData &out) {
     if (ser.available() < 2) return false;
     uint8_t b0=ser.read(), b1=ser.read(); if (b0!=0x42 || b1!=0x4D) continue;
 
-    uint8_t payload[30]; if (ser.readBytes(payload,30)!=30) return false;
+    uint8_t payload[30]; if (ser.readBytes(payload,30)!=30) { s_pmsBadFrames++; return false; }
     uint32_t sum = b0 + b1; for (int i=0;i<28;i++) sum += payload[i];
-    uint16_t chk = be16(&payload[28]); if ((sum & 0xFFFF)!=chk) return false;
+    uint16_t chk = be16(&payload[28]); if ((sum & 0xFFFF)!=chk) { s_pmsChecksumErrors++; return false; }
 
-    uint16_t fl = be16(&payload[0]); if (fl!=28) return false;
+    uint16_t fl = be16(&payload[0]); if (fl!=28) { s_pmsBadFrames++; return false; }
 
     out.pm1_cf1  = be16(&payload[2]);  out.pm25_cf1 = be16(&payload[4]);  out.pm10_cf1 = be16(&payload[6]);
     out.pm1_atm  = be16(&payload[8]);  out.pm25_atm = be16(&payload[10]); out.pm10_atm = be16(&payload[12]);
@@ -236,13 +261,14 @@ static bool readPmsFrame(HardwareSerial &ser, PmsData &out) {
              out.pm1_atm, out.pm25_atm, out.pm10_atm,
              out.gt03, out.gt05, out.gt10, out.gt25, out.gt50, out.gt100);
     #endif
-    out.valid=true; out.lastMs=millis(); return true;
+    out.valid=true; out.lastMs=millis(); s_pmsFramesOk++; return true;
   }
   return false;
 }
 
 static void pmsTask(void *){
-  PMS.begin(9600, SERIAL_8N1, 16, 17);
+  // UART2 déjà initialisé dans pmsTaskStart() AVANT la création de la tâche
+  // (et SET configuré avant) : la tâche ne fait jamais PMS.begin().
   uint32_t t0=millis(); while (millis()-t0<5000) vTaskDelay(100/portTICK_PERIOD_MS);
   PmsData tmp; static uint32_t seq=0;
   for(;;){
@@ -257,8 +283,11 @@ static void pmsTask(void *){
 }
 
 void pmsTaskStart(int rx, int tx){
-  (void)rx; (void)tx; // câblés en dur
   if (pmsStarted) return;
+  // UART initialisé ICI, après config des pins (cf. ordre dans main.cpp),
+  // et AVANT la création de la tâche : la tâche ne peut jamais tourner
+  // tant que Serial2 / la pin SET ne sont pas prêts.
+  PMS.begin(9600, SERIAL_8N1, rx, tx);
   xTaskCreatePinnedToCore(pmsTask, "PMS", 4096, 0, 1, 0, 0);
   pmsStarted = true;
 }
@@ -342,19 +371,24 @@ static bool pmsSampleBurstBlocking(uint32_t warmupMs, uint32_t discardFrames, ui
     return false;
   }
 
+  pmsWake();
+
+  // pmsTask est l'UNIQUE lecteur de Serial2 : on NE vide PLUS le buffer ici
+  // (deux drains concurrents sur deux cores désynchronisaient les trames).
+  // On attend le warmup, PUIS on se cale sur le seq courant : seules les
+  // trames produites APRÈS le warmup seront retenues (discard + burst).
+  vTaskDelay(pdMS_TO_TICKS(warmupMs));
+
   uint32_t seq0 = 0;
   if (gPmsMutex && xSemaphoreTake(gPmsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     seq0 = gPms.seq;
     xSemaphoreGive(gPmsMutex);
   }
 
-  pmsWake();
-  while (PMS.available()) (void)PMS.read();
-  vTaskDelay(pdMS_TO_TICKS(warmupMs));
-
   PmsData discard = {};
   for (uint32_t d = 0; d < discardFrames; d++) {
     if (!waitForFreshFrame(seq0, PMS_FRESH_AGE_MAX_MS, PMS_WAIT_FRAME_TIMEOUT_MS, discard)) {
+      s_pmsFrameTimeouts++;
       LOGW("PMS", "discard phase timeout at frame %lu", (unsigned long)d);
       if (!pmsAlwaysOn) pmsSleep();
       return false;
@@ -366,6 +400,7 @@ static bool pmsSampleBurstBlocking(uint32_t warmupMs, uint32_t discardFrames, ui
   int nCollected = 0;
   for (uint32_t b = 0; b < burstFrames; b++) {
     if (!waitForFreshFrame(seq0, PMS_FRESH_AGE_MAX_MS, PMS_WAIT_FRAME_TIMEOUT_MS, burst[nCollected])) {
+      s_pmsFrameTimeouts++;
       LOGW("PMS", "burst incomplete: %d/%lu (no reset pin, abort)", nCollected, (unsigned long)burstFrames);
       if (!pmsAlwaysOn) pmsSleep();
       return false;
@@ -513,4 +548,47 @@ bool sensorSanityCheck(int aqi, int tvoc, int eco2, char* failOut, size_t failOu
   if (!okTvoc) append("tvoc");
   if (!okEco2) append("eco2");
   return false;
+}
+
+// =======================================================================
+// ============================ Diagnostics ==============================
+// =======================================================================
+
+static const char* resetReasonStr(){
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "power_on";
+    case ESP_RST_EXT:       return "external";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "int_wdt";
+    case ESP_RST_TASK_WDT:  return "task_wdt";
+    case ESP_RST_WDT:       return "wdt";
+    case ESP_RST_DEEPSLEEP: return "deep_sleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_SDIO:      return "sdio";
+    default:                return "unknown";
+  }
+}
+
+// Une seule ligne INFO compacte. Appelée throttlée depuis le loop (pas en
+// boucle serrée) : santé par capteur + compteurs PMS + recovery BMP.
+void sensorsLogDiagnostics(){
+  Bmp581Diag b; bmp581GetDiag(b);
+  Scd41Diag sc; scd41GetDiag(sc);
+  PmsDiag pm; pmsGetDiag(pm);
+  LOGI("DIAG",
+       "reset=%s | ENS=%d BMP=%d(rc=%d sr=%lu lastSR=%d rdFail=%lu) "
+       "SCD41=%d(err=%u stop=%lu lastSR=%d rdFail=%lu) "
+       "| PMS task=%d ok=%lu chkErr=%lu bad=%lu timeout=%lu",
+       resetReasonStr(),
+       (int)ens160.available(),
+       (int)b.initialized, b.lastInitRc,
+       (unsigned long)b.softResetCount, (int)b.lastUsedSoftReset,
+       (unsigned long)b.readFailures,
+       (int)sc.initialized, (unsigned)sc.lastInitErr,
+       (unsigned long)sc.stopRecoveryCount, (int)sc.lastUsedStopRecovery,
+       (unsigned long)sc.readFailures,
+       (int)pm.taskRunning,
+       (unsigned long)pm.framesOk, (unsigned long)pm.checksumErrors,
+       (unsigned long)pm.badFrames, (unsigned long)pm.frameTimeouts);
 }
